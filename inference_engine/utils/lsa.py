@@ -1,8 +1,9 @@
 import torch
 import numpy as np
 
-from .depth import segment_depth_felzenszwalb_rag, match_segmentation_seq, assign_overlap_window_depth_scale
+from .depth import match_segmentation_seq, assign_overlap_window_depth_scale
 from .batch_threading import batched_image_op_wrapper
+from .layer_atomic_geometry import segment_point_map_layer_atomic
 
 
 def refine_depth_segments(
@@ -38,7 +39,7 @@ def refine_depth_segments(
 
 
 def make_sp_graph(
-        depth,
+        point_maps,
         depth_merge_thresh=0.1,
         conf_map=None,
         top_conf_percentile=None,
@@ -48,8 +49,8 @@ def make_sp_graph(
     # conf_depth = depth[conf_mask]
     # merge_thresh = depth_merge_thresh * (np.max(conf_depth) - np.min(conf_depth))
     labels = batched_image_op_wrapper(
-        depth,
-        segment_depth_felzenszwalb_rag,
+        point_maps,
+        segment_point_map_layer_atomic,
         depth_merge_thresh=depth_merge_thresh,
         conf_map=conf_map,
         top_conf_percentile=top_conf_percentile

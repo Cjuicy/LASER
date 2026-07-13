@@ -141,8 +141,8 @@ def register_extrinsic_windows(
     anchor_sp_graph = None
     if depth_refine:
         anchor_sp_graph = make_sp_graph(
-            pcd_windows[0][..., -1].cpu().numpy(),
-            mask_windows[0].cpu().numpy()
+            pcd_windows[0].cpu().numpy(),
+            conf_map=mask_windows[0].cpu().numpy()
         )
 
     for i in range(1, len(cam_windows)):
@@ -166,8 +166,8 @@ def register_extrinsic_windows(
         if depth_refine:
             tgt_pcd = tgt_pcd.cpu().numpy()
             tgt_sp_graph = make_sp_graph(
-                tgt_pcd[..., -1],
-                mask_windows[i].cpu().numpy()
+                tgt_pcd,
+                conf_map=mask_windows[i].cpu().numpy()
             )
 
             tgt_pcd_scaled = refine_depth_segments(

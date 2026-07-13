@@ -246,7 +246,7 @@ class StreamingWindowEngine(VanillaEngine):
                 if self.depth_refine:
                     tgt_pcd = working_window['local_points'].cpu().numpy()
                     tgt_sp_graph = make_sp_graph(
-                        tgt_pcd[..., -1],
+                        tgt_pcd,
                         conf_map=working_window['conf'].cpu().numpy(),
                         top_conf_percentile=self.top_conf_percentile
                     )
@@ -271,7 +271,7 @@ class StreamingWindowEngine(VanillaEngine):
                 # 3️⃣ 创建首窗口分割图
                 if self.depth_refine:
                     tgt_sp_graph = make_sp_graph(
-                        working_window['local_points'][..., -1].cpu().numpy(),
+                        working_window['local_points'].cpu().numpy(),
                         conf_map=working_window['conf'].cpu().numpy(),
                         top_conf_percentile=self.top_conf_percentile
                     )
