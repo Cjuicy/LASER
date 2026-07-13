@@ -86,8 +86,13 @@ def merge_layer_atoms(
         del distances
 
     scales = np.zeros(n_atoms, dtype=np.float64)
-    valid_scales = scale_counts > 0
-    scales[valid_scales] = scale_sums[valid_scales] / scale_counts[valid_scales]
+    np.divide(
+        scale_sums,
+        scale_counts,
+        out=scales,
+        where=scale_counts > 0,
+    )
+    valid_scales = (scale_counts > 0) & np.isfinite(scales) & (scales > 0)
 
     if boundary_codes:
         all_codes = np.concatenate(boundary_codes)
@@ -109,15 +114,24 @@ def merge_layer_atoms(
         atom_coarse[atom_ids] = coarse_labels.reshape(-1)[first_indices]
 
         denominator = np.sqrt(scales[pair_left]) * np.sqrt(scales[pair_right])
-        denominator = np.maximum(denominator, np.finfo(np.float64).eps)
-        normalized_gap = pair_gaps / denominator
-        same_coarse = atom_coarse[pair_left] == atom_coarse[pair_right]
-        limits = np.where(same_coarse, 1.0 + depth_merge_thresh, 1.0)
-        should_merge = (
+        valid_pair = (
             valid_scales[pair_left]
             & valid_scales[pair_right]
-            & (normalized_gap <= limits)
+            & np.isfinite(pair_gaps)
+            & np.isfinite(denominator)
+            & (denominator > 0)
         )
+        normalized_gap = np.full(pair_gaps.shape, np.inf, dtype=np.float64)
+        with np.errstate(invalid="ignore", over="ignore"):
+            np.divide(
+                pair_gaps,
+                denominator,
+                out=normalized_gap,
+                where=valid_pair,
+            )
+        same_coarse = atom_coarse[pair_left] == atom_coarse[pair_right]
+        limits = np.where(same_coarse, 1.0 + depth_merge_thresh, 1.0)
+        should_merge = valid_pair & (normalized_gap <= limits)
 
         for left, right in zip(pair_left[should_merge], pair_right[should_merge], strict=True):
             dsu.union(int(left), int(right))

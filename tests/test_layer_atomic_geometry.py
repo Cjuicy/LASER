@@ -59,6 +59,18 @@ def test_real_3d_gap_splits_atoms_inside_the_same_coarse_layer():
     )
 
 
+def test_small_scale_real_3d_gap_still_splits_same_coarse_layer():
+    labels = _merge(
+        [(x, 0.0, 0.0) for x in (0.0, 1.0, 4.0, 5.0)],
+        scale=1e-20,
+    )
+
+    np.testing.assert_array_equal(
+        labels,
+        np.tile(np.asarray([0, 0, 1, 1]), (2, 1)),
+    )
+
+
 def test_continuous_atoms_can_remerge_across_coarse_layers():
     labels = _merge(
         [(x, 0.0, 0.0) for x in (0.0, 1.0, 2.0, 3.0)],
@@ -108,6 +120,29 @@ def test_degenerate_atoms_do_not_merge_or_break_scale_invariance(global_scale):
         depth_merge_thresh=0.1,
     )
 
+    np.testing.assert_array_equal(
+        labels,
+        np.tile(np.asarray([0, 0, 1, 1]), (2, 1)),
+    )
+
+
+@pytest.mark.parametrize("invalid_value", [np.nan, np.inf], ids=["nan", "inf"])
+def test_invalid_boundary_does_not_merge_or_drop_pixels(invalid_value):
+    point_map = _two_atom_map(
+        [(x, 0.0, 0.0) for x in (0.0, 1.0, 2.0, 3.0)]
+    )
+    point_map[:, 2, 0] = invalid_value
+    initial, coarse = _two_atom_labels(same_coarse=True)
+
+    labels = merge_layer_atoms(
+        point_map,
+        initial,
+        coarse,
+        depth_merge_thresh=0.1,
+    )
+
+    assert labels.shape == initial.shape
+    np.testing.assert_array_equal(np.unique(labels), np.asarray([0, 1]))
     np.testing.assert_array_equal(
         labels,
         np.tile(np.asarray([0, 0, 1, 1]), (2, 1)),
