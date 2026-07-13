@@ -68,6 +68,13 @@ def test_stages_preserve_legacy_coarse_labels_and_threshold():
     assert threshold == np.float64(0.1 * (depth.max() - depth.min()))
 ```
 
+The test must also build an independent oracle by calling the existing
+`felzenszwalb(...)` and Cython `merge_regions(...)` directly, then compare
+`initial`, `coarse`, `merge_threshold`, and the legacy wrapper with that
+oracle. Parameterize it for both the no-confidence path and the
+`conf_map + batch_idx` path; comparing two wrappers that share the same new
+implementation is not sufficient regression coverage.
+
 - [ ] **Step 2: Run the test and verify RED**
 
 Run: `pytest -q tests/test_depth_segmentation_stages.py`
@@ -148,6 +155,7 @@ def test_real_3d_gap_splits_atoms_inside_the_same_coarse_layer(): ...
 def test_continuous_atoms_can_remerge_across_coarse_layers(): ...
 def test_weak_layer_prior_accepts_only_same_layer_small_excess_gap(): ...
 def test_result_is_invariant_to_global_point_scale(): ...
+def test_degenerate_atoms_do_not_merge_or_break_scale_invariance(): ...
 def test_result_is_compact_full_coverage_and_only_unions_atoms(): ...
 def test_result_is_deterministic(): ...
 ```
@@ -168,7 +176,7 @@ Implement a private compact-label conversion with `np.unique(..., return_inverse
 
 For right and bottom neighbors, compute Euclidean point differences. Reject only non-finite edge distances from statistics; never remove their pixels or atom labels.
 
-For internal edges (`label_a == label_b`), compute `s_A` with `np.bincount(weights=distance)` divided by counts. Fill atoms without a valid internal edge with the global finite internal-edge mean; if no finite internal edge exists, use `1.0`.
+For internal edges (`label_a == label_b`), compute `s_A` with `np.bincount(weights=distance)` divided by counts. Internal scale samples must be finite and strictly positive. Mark atoms without any valid positive internal edge as geometrically invalid; do not merge a boundary involving an invalid-scale atom. Never use an absolute fallback such as `1.0`, because that breaks global point-scale invariance. Clamp only the final positive denominator with machine epsilon to prevent numerical warnings.
 
 For boundary edges (`label_a != label_b`), encode the ordered pair as `min_label * n_atoms + max_label`, call `np.unique(..., return_inverse=True)`, and compute each `d_AB` using weighted/count `np.bincount`. This keeps memory proportional to boundary edges rather than constructing per-region pixel masks.
 
@@ -284,17 +292,23 @@ Expected: build succeeds, all tests pass, compileall exits zero, and diff-check 
 
 - [ ] **Step 2: Measure segmentation runtime**
 
-Generate deterministic smooth `(376, 1241, 3)` point maps with several depth discontinuities. Warm up both functions, then record the median of at least five calls for:
+Generate deterministic smooth `(376, 1241, 3)` point maps with several depth discontinuities. Warm up both functions, then record the median and p95 of at least five calls for:
 
 - baseline `segment_depth_felzenszwalb_rag(point_map[..., -1], ...)`;
 - new `segment_point_map_layer_atomic(point_map, ...)`;
 - the geometry-only `merge_layer_atoms(...)` stage.
+- complete baseline and new `make_sp_graph(...)` paths, including mask creation and temporal graph matching.
 
 Report absolute milliseconds and `new / baseline`. The acceptance target is `<= 1.20`; `> 1.30` blocks the ATE experiment and requires profiling before any threshold tuning.
 
+Also report peak resident memory for the complete `make_sp_graph` call. The
+downstream code materializes one full-image boolean mask per final region and
+dense IoU arrays, so a large increase in final region count or peak RSS is a
+performance failure even when segmentation-only timing passes.
+
 - [ ] **Step 3: Verify segmentation invariants on the performance frame**
 
-Report baseline initial-atom count, coarse-layer count, final-region count, pixel coverage, minimum label, maximum label, and whether every final region is a union of complete initial atoms.
+Report baseline initial-atom count, coarse-layer count, final-region count, pixel coverage, minimum label, maximum label, and whether every final region is a union of complete initial atoms. Include a fragmented/checkerboard stress frame to expose boundary-pair sorting and downstream region-mask growth, but do not turn timing into a flaky pytest assertion.
 
 - [ ] **Step 4: Review the complete branch diff**
 
