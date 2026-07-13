@@ -13,7 +13,11 @@ from inference_engine.inference_utils import register_adjacent_windows
 from utils.image_paths import discover_images
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+dtype = (
+    torch.bfloat16
+    if device == "cuda" and torch.cuda.get_device_capability()[0] >= 8
+    else torch.float16 if device == "cuda" else torch.float32
+)
 
 
 def get_args_parser():

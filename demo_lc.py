@@ -27,14 +27,26 @@ from utils.image_paths import discover_images, natural_sort_key
 
 # 初始化与设备配置
 device = "cuda" if torch.cuda.is_available() else "cpu"
-# bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
-dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+
+def select_runtime_dtype(runtime_device):
+    if runtime_device != "cuda":
+        return torch.float32
+    return (
+        torch.bfloat16
+        if torch.cuda.get_device_capability()[0] >= 8
+        else torch.float16
+    )
+
+
+dtype = select_runtime_dtype(device)
 
 
 # 函数说明
 def get_args_parser():
     parser = argparse.ArgumentParser('Depth metric evaluation', add_help=False)
-    parser.add_argument('--config_path', default=None, type=str, help='loop closure config')
+    parser.add_argument('--config_path', default='configs/loop_config.yaml', type=str,
+                        help='loop closure config')
     parser.add_argument('--model_ckpt', default='weights/model.safetensors', type=str,
                         help='local checkpoint to load model')
     parser.add_argument('--data_path', type=str, help='sequence data path')
@@ -46,9 +58,88 @@ def get_args_parser():
     parser.add_argument('--sample_interval', default=1, type=int, help='sequence sample interval')
     parser.add_argument('--window_size', default=10, type=int, help='sliding window size')
     parser.add_argument('--overlap', default=5, type=int, help='sliding window overlap size')
-    parser.add_argument('--depth_refine', action='store_true', help='enable depth refine')
+    depth_refine_group = parser.add_mutually_exclusive_group()
+    depth_refine_group.add_argument(
+        '--depth-refine',
+        dest='depth_refine',
+        action='store_true',
+        help='enable layer-atomic depth refinement',
+    )
+    depth_refine_group.add_argument(
+        '--no-depth-refine',
+        dest='depth_refine',
+        action='store_false',
+        help='disable layer-atomic depth refinement',
+    )
+    parser.set_defaults(depth_refine=True)
 
     return parser
+
+
+def require_file(path_value, label):
+    path = Path(path_value)
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return path
+
+
+def load_and_validate_inputs(args):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required for demo_lc.py")
+    if args.overlap < 1 or args.window_size <= args.overlap:
+        raise ValueError(
+            "window_size must be greater than overlap, "
+            "and overlap must be at least 1"
+        )
+
+    require_file(args.model_ckpt, "Pi3 checkpoint")
+    config_path = require_file(args.config_path, "Loop config")
+    config = load_config(str(config_path))
+    if config.get("Model", {}).get("loop_enable") is not True:
+        raise ValueError("Model.loop_enable must be true for demo_lc.py")
+
+    weights = config.get("Weights", {})
+    require_file(weights.get("SALAD", ""), "SALAD checkpoint")
+    require_file(weights.get("DINO", ""), "DINO checkpoint")
+
+    image_paths = discover_images(args.data_path, args.sample_interval)
+    if len(image_paths) <= args.overlap:
+        raise ValueError(
+            "Image count must be greater than overlap: "
+            f"images={len(image_paths)}, overlap={args.overlap}"
+        )
+    return config, image_paths
+
+
+def require_complete_cache_files(cache_dir, expected_count):
+    cache_files = sorted(
+        Path(cache_dir).glob("window_cache_*.pt"),
+        key=lambda path: int(path.stem.rsplit("_", 1)[-1]),
+    )
+    if len(cache_files) != expected_count:
+        raise RuntimeError(
+            "Window cache count mismatch: "
+            f"expected={expected_count}, actual={len(cache_files)}, "
+            f"cache_dir={cache_dir}"
+        )
+    print(f"Completed cache windows: {len(cache_files)}/{expected_count}")
+    return cache_files
+
+
+def print_run_configuration(args, image_paths, expected_windows):
+    print("Loop closure: enabled")
+    depth_refine_state = "enabled" if args.depth_refine else "disabled"
+    print(f"Layer-atomic depth refinement: {depth_refine_state}")
+    print(f"Input directory: {args.data_path}")
+    print(
+        f"Frames: {len(image_paths)} "
+        f"(first={Path(image_paths[0]).name}, "
+        f"last={Path(image_paths[-1]).name})"
+    )
+    print(
+        f"Windows: {expected_windows} "
+        f"(window_size={args.window_size}, overlap={args.overlap})"
+    )
 
 
 # 加载模型
@@ -112,9 +203,7 @@ def sliding_window(lst, window_size, overlap):
 
 
 # 执行滑动窗口推理，并统计时间和显存
-def run_model(image_names):
-    image_name_windows = model.img_sliding_window(image_names)
-
+def run_model(image_name_windows):
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
     # 1️⃣ 初始化推理
@@ -151,28 +240,30 @@ def run_model(image_names):
     # save_cache_to_viser(model.cache_dir, scene_name, output_path, overlap)
 
 # 读取场景图像并调用模型推理
-def run_dynamic_scene(args):
-    data_path = args.data_path
-    scene_name = Path(data_path).name if args.scene_name is None else args.scene_name
-
-    # 获取图像文件并按编号自然排序，再按间隔采样
-    img_names = discover_images(data_path, args.sample_interval)
-    print(f'Found {len(img_names)} images.')
-    run_model(img_names)
-    return scene_name, img_names
+def run_dynamic_scene(args, image_names):
+    scene_name = (
+        Path(args.data_path).name
+        if args.scene_name is None
+        else args.scene_name
+    )
+    image_name_windows = model.img_sliding_window(image_names)
+    expected_windows = len(image_name_windows)
+    print_run_configuration(args, image_names, expected_windows)
+    run_model(image_name_windows)
+    return scene_name, expected_windows
 
 # 主程序解析
 if __name__ == "__main__":
     # 1️⃣ 解析参数并加载模型
     args = get_args_parser()
     args = args.parse_args()
+    config, image_names = load_and_validate_inputs(args)
     pi3_model, model = load_model(args)
 
     model.eval()
-    scene_name, image_names = run_dynamic_scene(args)
+    scene_name, expected_windows = run_dynamic_scene(args, image_names)
 
     # 📒2️⃣ 创建回环检测引擎
-    config = load_config(args.config_path)
     cache_path = Path(args.cache_path)
     cache_path_lc = cache_path.parent / f'{cache_path.name}_lc'
     lc_engine = build_loop_closure_engine(
@@ -184,9 +275,14 @@ if __name__ == "__main__":
     )
 
     # 3️⃣ 读取原始窗口缓存
-    cache_files = sorted(glob.glob(str(model.temp_cache_dir / 'window_cache_*.pt')),
-                         key=lambda p: int(p.split('_')[-1].split('.')[0]))
-    raw_predictions = [StreamingWindowEngineLC.parse_cache_file(cache_fname) for cache_fname in cache_files]
+    cache_files = require_complete_cache_files(
+        model.temp_cache_dir,
+        expected_windows,
+    )
+    raw_predictions = [
+        StreamingWindowEngineLC.parse_cache_file(cache_fname)
+        for cache_fname in cache_files
+    ]
 
     # 📒4️⃣ 执行回环修正（⚠️回环修正具体完成的部分）
     sim3_list_lc = lc_engine.run(raw_predictions)
@@ -215,3 +311,4 @@ if __name__ == "__main__":
             ret_dict[key] = ret_dict[key].cpu().numpy().squeeze(0)
 
     save_for_viser(ret_dict, scene_name, args.output_path, inverse_extrinsic=False)
+    print(f"Saved loop-closure result: {Path(args.output_path) / scene_name}")
