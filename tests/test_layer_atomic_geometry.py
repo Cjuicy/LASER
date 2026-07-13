@@ -9,6 +9,7 @@ inference_engine_module = sys.modules.get("inference_engine")
 if inference_engine_module is not None and not hasattr(inference_engine_module, "__path__"):
     del sys.modules["inference_engine"]
 
+from inference_engine.utils import layer_atomic_geometry
 from inference_engine.utils.layer_atomic_geometry import (
     merge_layer_atoms,
     segment_point_map_layer_atomic,
@@ -148,3 +149,70 @@ def test_result_is_deterministic():
 def test_segment_point_map_layer_atomic_validates_shape(shape):
     with pytest.raises(ValueError, match=r"\(H, W, 3\)"):
         segment_point_map_layer_atomic(np.zeros(shape), depth_merge_thresh=0.1)
+
+
+def test_segment_point_map_layer_atomic_forwards_stages_to_atom_merger(monkeypatch):
+    point_map = np.arange(24, dtype=np.float64).reshape(2, 4, 3)
+    conf_map = np.arange(8, dtype=np.float64).reshape(2, 4)
+    initial_labels = np.tile(np.asarray([10, 10, 30, 30]), (2, 1))
+    coarse_labels = np.tile(np.asarray([7, 7, 8, 8]), (2, 1))
+    baseline_output = np.full((2, 4), 99, dtype=np.int64)
+    merged_output = np.full((2, 4), 5, dtype=np.int64)
+    stage_calls = []
+    merger_calls = []
+
+    def fake_stages(*args):
+        stage_calls.append(args)
+        return initial_labels, coarse_labels, baseline_output
+
+    def fake_merger(*args):
+        merger_calls.append(args)
+        return merged_output
+
+    monkeypatch.setattr(
+        layer_atomic_geometry,
+        "segment_depth_felzenszwalb_rag_stages",
+        fake_stages,
+    )
+    monkeypatch.setattr(layer_atomic_geometry, "merge_layer_atoms", fake_merger)
+
+    result = segment_point_map_layer_atomic(
+        point_map,
+        depth_merge_thresh=0.123,
+        conf_map=conf_map,
+        top_conf_percentile=87.5,
+        seg_scale=411,
+        seg_sigma=0.75,
+        seg_min_size=23,
+        batch_idx=6,
+    )
+
+    assert len(stage_calls) == 1
+    (
+        received_depth,
+        received_depth_merge_thresh,
+        received_conf,
+        received_top_conf_percentile,
+        received_seg_scale,
+        received_seg_sigma,
+        received_seg_min_size,
+        received_batch_idx,
+    ) = stage_calls[0]
+    np.testing.assert_array_equal(received_depth, point_map[..., -1])
+    assert received_depth_merge_thresh == 0.123
+    assert received_conf is conf_map
+    assert received_top_conf_percentile == 87.5
+    assert received_seg_scale == 411
+    assert received_seg_sigma == 0.75
+    assert received_seg_min_size == 23
+    assert received_batch_idx == 6
+
+    assert len(merger_calls) == 1
+    received_points, received_initial, received_coarse, received_merge_thresh = (
+        merger_calls[0]
+    )
+    assert received_points is point_map
+    assert received_initial is initial_labels
+    assert received_coarse is coarse_labels
+    assert received_merge_thresh == 0.123
+    assert result is merged_output
