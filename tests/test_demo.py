@@ -28,6 +28,10 @@ save_func_module.save_for_viser = lambda *args, **kwargs: None
 sys.modules["eval.save_func"] = save_func_module
 
 import demo
+from utils.image_paths import (
+    discover_images as shared_discover_images,
+    natural_sort_key as shared_natural_sort_key,
+)
 
 
 def test_model_checkpoint_defaults_to_local_safetensors():
@@ -90,3 +94,8 @@ def test_discover_images_filters_sorts_then_samples(tmp_path):
         "frame1.jpeg",
         "frame3.jpg",
     ]
+
+
+def test_demo_reexports_shared_image_helpers():
+    assert demo.discover_images is shared_discover_images
+    assert demo.natural_sort_key is shared_natural_sort_key

@@ -39,6 +39,10 @@ sys.modules["loop_closure.utils.config_utils"] = config_utils_module
 torch.cuda.get_device_capability = lambda: (8, 0)
 
 import demo_lc
+from utils.image_paths import (
+    discover_images as shared_discover_images,
+    natural_sort_key as shared_natural_sort_key,
+)
 
 
 def test_model_checkpoint_defaults_to_local_safetensors():
@@ -101,3 +105,8 @@ def test_discover_images_filters_sorts_then_samples(tmp_path):
         "frame1.jpeg",
         "frame3.jpg",
     ]
+
+
+def test_demo_lc_reexports_shared_image_helpers():
+    assert demo_lc.discover_images is shared_discover_images
+    assert demo_lc.natural_sort_key is shared_natural_sort_key

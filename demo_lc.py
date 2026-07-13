@@ -18,11 +18,12 @@ from loop_closure.utils.config_utils import load_config
 
 import os
 import argparse
-import re
 from tqdm import tqdm
 import glob
 import shutil
 from pathlib import Path
+
+from utils.image_paths import discover_images, natural_sort_key
 
 # 初始化与设备配置
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -48,22 +49,6 @@ def get_args_parser():
     parser.add_argument('--depth_refine', action='store_true', help='enable depth refine')
 
     return parser
-
-
-def natural_sort_key(path):
-    """按文件名中的数字大小生成自然排序键。"""
-    parts = re.split(r'(\d+)', os.path.basename(path).lower())
-    return [(1, int(part)) if part.isdigit() else (0, part) for part in parts]
-
-
-def discover_images(data_path, sample_interval):
-    """筛选并自然排序图片，然后按指定间隔采样。"""
-    image_names = [
-        os.path.join(data_path, name)
-        for name in os.listdir(data_path)
-        if name.lower().endswith(('.png', '.jpg', '.jpeg'))
-    ]
-    return sorted(image_names, key=natural_sort_key)[::sample_interval]
 
 
 # 加载模型
