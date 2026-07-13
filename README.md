@@ -92,19 +92,19 @@ Loop-closure requires additional dependencies for package `faiss` can be install
 ```bash
 pip install faiss-gpu-cu12 numpy==1.26.4
 ```
-Run loop-closure inference for kilometer-scale sequence with the following command:
+Loop-closure mode now uses the layer-atomic depth refinement by default. Run KITTI 00 with:
 ```bash
 python demo_lc.py \
-    --config_path "configs/loop_config.yaml" \
-    --data_path DATA_PATH \
+    --data_path "data/00/image_2" \
+    --scene_name "kitti_00" \
     --output_path "./viser_results" \
-    --cache_path "./cache" \
-    --sample_interval SAMPLE_INTERVAL \
-    --window_size WINDOW_SIZE \
-    --overlap OVERLAP
-
-rm -r cache/
+    --cache_path "./inference_cache/kitti_00" \
+    --sample_interval 1 \
+    --window_size 10 \
+    --overlap 5
 ```
+
+Use `--no-depth-refine` only for a baseline comparison. See the [AutoDL loop-closure guide](docs/autodl-loop-closure.md) for branch checkout, smoke testing, full inference, and diagnostics.
 
 ### Visualization
 To visualize the interactive 4D results, you can use the following command:
