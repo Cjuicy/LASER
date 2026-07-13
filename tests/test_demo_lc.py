@@ -110,3 +110,31 @@ def test_discover_images_filters_sorts_then_samples(tmp_path):
 def test_demo_lc_reexports_shared_image_helpers():
     assert demo_lc.discover_images is shared_discover_images
     assert demo_lc.natural_sort_key is shared_natural_sort_key
+
+
+def test_build_loop_closure_engine_passes_canonical_manifest(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    def recording_engine(*args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(demo_lc, "LoopClosureEngine", recording_engine)
+    args = demo_lc.get_args_parser().parse_args([
+        "--data_path",
+        str(tmp_path),
+    ])
+    image_paths = [str(tmp_path / "frame1.png")]
+
+    demo_lc.build_loop_closure_engine(
+        {},
+        args,
+        object(),
+        image_paths,
+        tmp_path / "cache_lc",
+    )
+
+    assert calls[0][1]["image_paths"] is image_paths

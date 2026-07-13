@@ -77,6 +77,25 @@ def load_model(args):
         depth_refine=args.depth_refine
     )
 
+
+def build_loop_closure_engine(
+    config,
+    args,
+    pi3_model,
+    image_paths,
+    cache_path_lc,
+):
+    return LoopClosureEngine(
+        config,
+        args.data_path,
+        cache_path_lc,
+        pi3_model,
+        args.window_size,
+        args.overlap,
+        args.sample_interval,
+        image_paths=image_paths,
+    )
+
 # 手动将列表划分为多个重叠窗口
 def sliding_window(lst, window_size, overlap):
     step = window_size - overlap
@@ -134,13 +153,13 @@ def run_model(image_names):
 # 读取场景图像并调用模型推理
 def run_dynamic_scene(args):
     data_path = args.data_path
-    scene_name = data_path.split('/')[-2] if args.scene_name is None else args.scene_name
+    scene_name = Path(data_path).name if args.scene_name is None else args.scene_name
 
     # 获取图像文件并按编号自然排序，再按间隔采样
     img_names = discover_images(data_path, args.sample_interval)
     print(f'Found {len(img_names)} images.')
     run_model(img_names)
-    return scene_name
+    return scene_name, img_names
 
 # 主程序解析
 if __name__ == "__main__":
@@ -150,20 +169,18 @@ if __name__ == "__main__":
     pi3_model, model = load_model(args)
 
     model.eval()
-    scene_name = run_dynamic_scene(args)
+    scene_name, image_names = run_dynamic_scene(args)
 
     # 📒2️⃣ 创建回环检测引擎
     config = load_config(args.config_path)
     cache_path = Path(args.cache_path)
     cache_path_lc = cache_path.parent / f'{cache_path.name}_lc'
-    lc_engine = LoopClosureEngine(
+    lc_engine = build_loop_closure_engine(
         config,
-        args.data_path,
-        cache_path_lc,
+        args,
         pi3_model,
-        args.window_size,
-        args.overlap,
-        args.sample_interval
+        image_names,
+        cache_path_lc,
     )
 
     # 3️⃣ 读取原始窗口缓存

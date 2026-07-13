@@ -3,9 +3,9 @@ import argparse
 from PIL import Image
 import torchvision.transforms as T
 from tqdm import tqdm
-from pathlib import Path
 
 from .vpr_model import VPRModel
+from utils.image_paths import discover_images
 
 
 class LoopDetector:
@@ -15,7 +15,8 @@ class LoopDetector:
                  image_dir,
                  sample_interval=1,
                  output="loop_closures.txt",
-                 config=None):
+                 config=None,
+                 image_paths=None):
         """Initialize the loop detector
         
         Args:
@@ -37,7 +38,7 @@ class LoopDetector:
 
         self.model = None
         self.device = None
-        self.image_paths = None
+        self.image_paths = image_paths
         self.descriptors = None
         self.loop_closures = None
 
@@ -88,16 +89,12 @@ class LoopDetector:
 
     def get_image_paths(self):
         """Get paths of all image files in directory"""
-        image_extensions = [".jpg", ".jpeg", ".png"]
-        image_paths = []
-
-        for ext in image_extensions:
-            image_paths.extend(list(Path(self.image_dir).glob(f"*{ext}")))
-            image_paths.extend(list(Path(self.image_dir).glob(f"*{ext.upper()}")))
-
-        image_paths = sorted(image_paths)[::self.sample_interval]
-        self.image_paths = image_paths
-        return image_paths
+        if self.image_paths is None:
+            self.image_paths = discover_images(
+                self.image_dir,
+                sample_interval=self.sample_interval,
+            )
+        return self.image_paths
 
     def extract_descriptors(self):
         """Extract image feature descriptors"""
