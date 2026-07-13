@@ -42,6 +42,43 @@ def align_depth_irls(
     return s_d
 
 
+def segment_depth_felzenszwalb_rag_stages(
+        depth_map,
+        depth_merge_thresh,
+        conf_map=None,
+        top_conf_percentile=None,
+        seg_scale=300,
+        seg_sigma=1.1,
+        seg_min_size=500,
+        batch_idx=None
+):
+    initial_labels = felzenszwalb(
+        depth_map,
+        scale=seg_scale,
+        sigma=seg_sigma,
+        min_size=seg_min_size,
+    )
+    # depth_img = gray2rgb(depth_map)
+    # rag = graph.rag_mean_color(depth_img, seg_mask, mode='distance')
+    #
+    # seg_mask_merged = graph.cut_threshold(seg_mask, rag, merge_thresh)
+    if conf_map is not None and top_conf_percentile is not None:
+        frame_conf = conf_map[batch_idx]
+        conf_thresh = np.quantile(
+            frame_conf.reshape(-1),
+            top_conf_percentile,
+            method='nearest',
+        )
+        conf_depth = depth_map[frame_conf >= conf_thresh]
+    else:
+        conf_depth = depth_map
+    merge_threshold = depth_merge_thresh * (
+        np.max(conf_depth) - np.min(conf_depth)
+    )
+    coarse_labels = merge_regions(initial_labels, depth_map, merge_threshold)
+    return initial_labels, coarse_labels, merge_threshold
+
+
 def segment_depth_felzenszwalb_rag(
         depth_map,
         depth_merge_thresh,
@@ -52,21 +89,17 @@ def segment_depth_felzenszwalb_rag(
         seg_min_size=500,
         batch_idx=None
 ):
-    seg_mask = felzenszwalb(depth_map, scale=seg_scale, sigma=seg_sigma, min_size=seg_min_size)
-    # depth_img = gray2rgb(depth_map)
-    # rag = graph.rag_mean_color(depth_img, seg_mask, mode='distance')
-    #
-    # seg_mask_merged = graph.cut_threshold(seg_mask, rag, merge_thresh)
-    if conf_map is not None and top_conf_percentile is not None:
-        conf_map = conf_map[batch_idx]
-        conf_thresh = np.quantile(conf_map.reshape(-1), top_conf_percentile, method='nearest')
-        conf_depth = depth_map[conf_map >= conf_thresh]
-    else:
-        conf_depth = depth_map
-    merge_thresh = depth_merge_thresh * (np.max(conf_depth) - np.min(conf_depth))
-
-    seg_mask_merged = merge_regions(seg_mask, depth_map, merge_thresh)
-    return seg_mask_merged
+    _, coarse_labels, _ = segment_depth_felzenszwalb_rag_stages(
+        depth_map,
+        depth_merge_thresh,
+        conf_map,
+        top_conf_percentile,
+        seg_scale,
+        seg_sigma,
+        seg_min_size,
+        batch_idx,
+    )
+    return coarse_labels
 
 
 def segment_depth_graph_fast(
