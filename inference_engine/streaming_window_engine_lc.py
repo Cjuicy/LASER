@@ -9,7 +9,6 @@ from .inference_utils import (
     register_adjacent_windows,
     estimate_pseudo_depth_and_intrinsics,
     unproject_depth_to_local_points,
-    make_sp_graph,
     refine_depth_segments
 )
 from .utils.geometry import (
@@ -30,7 +29,10 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             window_size: int = 20,
             overlap: int = 5,
             depth_refine=False,
-            cache_root: str = './cache'
+            cache_root: str = './cache',
+            segment_mode: str = "depth",
+            normal_method: str = "cross",
+            geometry_seg_profile: str = "baseline_params",
     ):
         super().__init__(
             delegate=delegate.to(inference_device),
@@ -41,7 +43,10 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             window_size=window_size,
             overlap=overlap,
             depth_refine=depth_refine,
-            cache_root=cache_root
+            cache_root=cache_root,
+            segment_mode=segment_mode,
+            normal_method=normal_method,
+            geometry_seg_profile=geometry_seg_profile,
         )
 
     def _registration_worker(self):
@@ -94,10 +99,9 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
 
                 if self.depth_refine:
                     tgt_pcd = working_window['local_points'].cpu().numpy()
-                    tgt_sp_graph = make_sp_graph(
-                        tgt_pcd,
-                        conf_map=working_window['conf'].cpu().numpy(),
-                        top_conf_percentile=self.top_conf_percentile
+                    tgt_sp_graph = self._build_segment_graph(
+                        working_window['local_points'],
+                        working_window['conf'],
                     )
                     working_window['scale_mask'] = refine_depth_segments(
                         self.prev_window_cache['local_points'].cpu().numpy(),
@@ -120,10 +124,9 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                 )
 
                 if self.depth_refine:
-                    tgt_sp_graph = make_sp_graph(
-                        working_window['local_points'].cpu().numpy(),
-                        conf_map=working_window['conf'].cpu().numpy(),
-                        top_conf_percentile=self.top_conf_percentile
+                    tgt_sp_graph = self._build_segment_graph(
+                        working_window['local_points'],
+                        working_window['conf'],
                     )
 
             self._update_cache(working_window, tgt_sp_graph)

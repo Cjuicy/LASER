@@ -54,6 +54,12 @@ from .inference_utils import (
     sliding_window_l
 )
 from .utils.geometry import homogenize_points
+from .utils.lsa import (
+    GEOMETRY_SEGMENTATION_PROFILES,
+    NORMAL_METHODS,
+    SEGMENT_MODES,
+    get_felzenszwalb_params,
+)
 
 # 线程停止标志
 STOP_SIGNAL = object()
@@ -72,8 +78,31 @@ class StreamingWindowEngine(VanillaEngine):
             overlap: int = 5,
             depth_refine=True,
             cache_root: str = './cache',
-            benchmark_latency=True
+            benchmark_latency=True,
+            segment_mode: str = "depth",
+            normal_method: str = "cross",
+            geometry_seg_profile: str = "baseline_params",
     ):
+        if segment_mode not in SEGMENT_MODES:
+            raise ValueError(
+                f"Unknown segment_mode: {segment_mode!r}; expected one of {SEGMENT_MODES}."
+            )
+        if segment_mode != "depth" and not depth_refine:
+            raise ValueError(
+                f"segment_mode={segment_mode!r} requires depth_refine=True."
+            )
+        if segment_mode == "geometry":
+            if normal_method not in NORMAL_METHODS:
+                raise ValueError(
+                    f"Unknown normal_method: {normal_method!r}; expected one of {NORMAL_METHODS}."
+                )
+            if geometry_seg_profile not in GEOMETRY_SEGMENTATION_PROFILES:
+                raise ValueError(
+                    "Unknown geometry_seg_profile: "
+                    f"{geometry_seg_profile!r}; expected one of "
+                    f"{tuple(GEOMETRY_SEGMENTATION_PROFILES)}."
+                )
+
         # 1️⃣ 模型初始化
         super().__init__(
             delegate=delegate.to(inference_device)
@@ -91,6 +120,26 @@ class StreamingWindowEngine(VanillaEngine):
         self.dtype = dtype
         # 5️⃣ 深度细化
         self.depth_refine = depth_refine
+        self.segment_mode = segment_mode
+        self.normal_method = normal_method
+        self.geometry_seg_profile = geometry_seg_profile
+        self.felzenszwalb_params = get_felzenszwalb_params(
+            segment_mode,
+            geometry_seg_profile,
+        )
+
+        segmentation_details = f"mode={segment_mode}"
+        if segment_mode == "geometry":
+            segmentation_details += (
+                f", profile={geometry_seg_profile}, normal={normal_method}"
+            )
+        print(
+            "[segmentation] "
+            f"{segmentation_details}, "
+            f"scale={self.felzenszwalb_params['seg_scale']}, "
+            f"sigma={self.felzenszwalb_params['seg_sigma']}, "
+            f"min_size={self.felzenszwalb_params['seg_min_size']}"
+        )
 
         # 6️⃣ 缓存目录
         os.makedirs(cache_root, exist_ok=True)
@@ -128,6 +177,16 @@ class StreamingWindowEngine(VanillaEngine):
         if self.running:
             raise RuntimeError('Cannot change depth refinement mode while running')
         self.depth_refine = flag
+
+    def _build_segment_graph(self, local_points, conf):
+        return make_sp_graph(
+            local_points.cpu().numpy(),
+            conf_map=conf.cpu().numpy(),
+            top_conf_percentile=self.top_conf_percentile,
+            segment_mode=self.segment_mode,
+            normal_method=self.normal_method,
+            geometry_seg_profile=self.geometry_seg_profile,
+        )
 
     # 把当前已经完成配准的窗口写入磁盘
     def _save_cache(self):
@@ -245,10 +304,9 @@ class StreamingWindowEngine(VanillaEngine):
                 # 7️⃣ 可选深度细化
                 if self.depth_refine:
                     tgt_pcd = working_window['local_points'].cpu().numpy()
-                    tgt_sp_graph = make_sp_graph(
-                        tgt_pcd,
-                        conf_map=working_window['conf'].cpu().numpy(),
-                        top_conf_percentile=self.top_conf_percentile
+                    tgt_sp_graph = self._build_segment_graph(
+                        working_window['local_points'],
+                        working_window['conf'],
                     )
                     working_window['local_points'] = working_window['local_points'] * refine_depth_segments(
                         self.prev_window_cache['local_points'].cpu().numpy(),
@@ -270,10 +328,9 @@ class StreamingWindowEngine(VanillaEngine):
 
                 # 3️⃣ 创建首窗口分割图
                 if self.depth_refine:
-                    tgt_sp_graph = make_sp_graph(
-                        working_window['local_points'].cpu().numpy(),
-                        conf_map=working_window['conf'].cpu().numpy(),
-                        top_conf_percentile=self.top_conf_percentile
+                    tgt_sp_graph = self._build_segment_graph(
+                        working_window['local_points'],
+                        working_window['conf'],
                     )
 
             # ⚠️ 更新并保存窗口
