@@ -127,7 +127,7 @@ python demo.py \
 scale=300, sigma=1.1, min_size=500
 ```
 
-geometry 还应显示 `profile=baseline_params, normal_method=cross`。历史 geometry
+geometry 还应显示 `profile=baseline_params, normal=cross`。历史 geometry
 参数 `200 / 1.0 / 300` 仅用于复现旧实验，必须显式传入
 `--geometry_seg_profile legacy`，不应用于正式对比。
 
