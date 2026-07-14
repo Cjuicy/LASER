@@ -87,6 +87,33 @@ python demo.py \
 ```
 The results will be saved in the `viser_results/SEQ_NAME`directory for future visualization.
 
+### Unified segmentation methods
+
+The same streaming pipeline can select one of three validated segmentation methods:
+
+```bash
+python demo.py \
+    --model_ckpt weights/model.safetensors \
+    --data_path DATA_PATH \
+    --cache_path ./cache/depth \
+    --output_path ./viser_results/depth \
+    --sample_interval 1 \
+    --window_size 30 \
+    --overlap 10 \
+    --depth_refine \
+    --segment_mode depth
+```
+
+Set `--segment_mode` to `depth`, `geometry`, or `layer_atomic`. Geometry defaults to
+`--normal_method cross --geometry_seg_profile baseline_params`. The formal comparison
+profile aligns all three methods to Felzenszwalb `scale=300`, `sigma=1.1`, and
+`min_size=500`; the historical geometry settings are available only with
+`--geometry_seg_profile legacy`.
+
+See [docs/unified-segmentation-cloud-validation.md](docs/unified-segmentation-cloud-validation.md)
+for branch checkout, CPU smoke tests, full regression tests, and matched cloud commands
+for all three modes.
+
 ### Loop-closure inference
 Loop-closure requires additional dependencies for package `faiss` can be installed through:
 ```bash

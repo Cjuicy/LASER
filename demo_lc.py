@@ -46,6 +46,14 @@ def get_args_parser():
     parser.add_argument('--window_size', default=10, type=int, help='sliding window size')
     parser.add_argument('--overlap', default=5, type=int, help='sliding window overlap size')
     parser.add_argument('--depth_refine', action='store_true', help='enable depth refine')
+    parser.add_argument('--segment_mode', default='depth',
+                        choices=('depth', 'geometry', 'layer_atomic'),
+                        help='segmentation method used by depth refinement')
+    parser.add_argument('--normal_method', default='cross', choices=('cross', 'sobel'),
+                        help='surface-normal estimator for geometry segmentation')
+    parser.add_argument('--geometry_seg_profile', default='baseline_params',
+                        choices=('baseline_params', 'legacy'),
+                        help='Felzenszwalb profile for geometry segmentation')
 
     return parser
 
@@ -89,7 +97,10 @@ def load_model(args):
         window_size=args.window_size,
         overlap=args.overlap,
         cache_root=args.cache_path,
-        depth_refine=args.depth_refine
+        depth_refine=args.depth_refine,
+        segment_mode=args.segment_mode,
+        normal_method=args.normal_method,
+        geometry_seg_profile=args.geometry_seg_profile,
     )
 
 # 手动将列表划分为多个重叠窗口

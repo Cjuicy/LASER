@@ -56,6 +56,36 @@ def test_model_checkpoint_can_be_overridden():
     assert args.model_ckpt == "custom/model.pt"
 
 
+def test_segmentation_options_default_to_depth_baseline():
+    args = demo_lc.get_args_parser().parse_args([])
+
+    assert args.segment_mode == "depth"
+    assert args.normal_method == "cross"
+    assert args.geometry_seg_profile == "baseline_params"
+
+
+@pytest.mark.parametrize("segment_mode", ["depth", "geometry", "layer_atomic"])
+def test_parser_accepts_all_segmentation_modes(segment_mode):
+    args = demo_lc.get_args_parser().parse_args([
+        "--segment_mode",
+        segment_mode,
+    ])
+
+    assert args.segment_mode == segment_mode
+
+
+def test_parser_accepts_geometry_options():
+    args = demo_lc.get_args_parser().parse_args([
+        "--normal_method",
+        "sobel",
+        "--geometry_seg_profile",
+        "legacy",
+    ])
+
+    assert args.normal_method == "sobel"
+    assert args.geometry_seg_profile == "legacy"
+
+
 def test_load_model_rejects_missing_checkpoint_before_model_construction(
     tmp_path,
     monkeypatch,
@@ -73,6 +103,46 @@ def test_load_model_rejects_missing_checkpoint_before_model_construction(
 
     with pytest.raises(FileNotFoundError, match="missing.safetensors"):
         demo_lc.load_model(args)
+
+
+def test_load_model_forwards_segmentation_options(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.touch()
+    args = demo_lc.get_args_parser().parse_args([
+        "--model_ckpt",
+        str(checkpoint),
+        "--depth_refine",
+        "--segment_mode",
+        "geometry",
+        "--normal_method",
+        "sobel",
+        "--geometry_seg_profile",
+        "legacy",
+    ])
+    captured = {}
+
+    class FakeModel:
+        def to(self, device):
+            return self
+
+        def load_state_dict(self, checkpoint, strict):
+            return "loaded"
+
+    def fake_engine(model, **kwargs):
+        captured.update(kwargs)
+        return "engine"
+
+    monkeypatch.setattr(demo_lc, "Pi3", FakeModel)
+    monkeypatch.setattr(demo_lc.torch, "load", lambda *args, **kwargs: {})
+    monkeypatch.setattr(demo_lc, "StreamingWindowEngineLC", fake_engine)
+
+    model, engine = demo_lc.load_model(args)
+
+    assert isinstance(model, FakeModel)
+    assert engine == "engine"
+    assert captured["segment_mode"] == "geometry"
+    assert captured["normal_method"] == "sobel"
+    assert captured["geometry_seg_profile"] == "legacy"
 
 
 def test_natural_sort_key_orders_embedded_numbers_numerically():
