@@ -291,13 +291,17 @@ GEOMETRY_SEGMENTATION_PROFILES = {
 }
 ```
 
-Extend `make_sp_graph(...)` with defaults:
+Extend `make_sp_graph(...)` with an omitted-mode compatibility sentinel:
 
 ```python
-segment_mode="depth"
+segment_mode=None  # preserves the validated layer-atomic branch call shape
 normal_method="cross"
 geometry_seg_profile="baseline_params"
 ```
+
+Normalize `None` to the historical layer-atomic route without injecting new
+keyword arguments. Engines and CLIs always pass their explicit mode; their
+user-facing default remains `depth`.
 
 Branch only around `batched_image_op_wrapper(...)`, forward the exact profile parameters, and keep the existing single call to:
 
