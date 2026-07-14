@@ -165,7 +165,8 @@ def load_model(args):
         window_size=args.window_size,
         overlap=args.overlap,
         cache_root=args.cache_path,
-        depth_refine=args.depth_refine
+        depth_refine=args.depth_refine,
+        top_conf_percentile=0.3
     )
 
 
@@ -185,6 +186,7 @@ def build_loop_closure_engine(
         args.overlap,
         args.sample_interval,
         image_paths=image_paths,
+        top_conf_percentile=0.3,
     )
 
 # 手动将列表划分为多个重叠窗口
