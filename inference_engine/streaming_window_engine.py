@@ -38,6 +38,7 @@ import shutil
 import glob
 from collections import defaultdict
 import time
+import numpy as np
 
 # 项目内部依赖
 from . import VanillaEngine
@@ -82,7 +83,21 @@ class StreamingWindowEngine(VanillaEngine):
             segment_mode: str = "depth",
             normal_method: str = "cross",
             geometry_seg_profile: str = "baseline_params",
+            diagnostic_sink=None,
+            diagnostic_run_id: str | None = None,
+            diagnostic_sequence_id: str | None = None,
+            diagnostic_pass: int = 0,
+            cache_policy: str = "full",
     ):
+        if cache_policy not in ("full", "metrics-only"):
+            raise ValueError("cache_policy must be 'full' or 'metrics-only'")
+        if diagnostic_sink is not None:
+            if not diagnostic_run_id:
+                raise ValueError("diagnostic_run_id is required when diagnostics are enabled")
+            if not diagnostic_sequence_id:
+                raise ValueError("diagnostic_sequence_id is required when diagnostics are enabled")
+            if diagnostic_pass not in (1, 2):
+                raise ValueError("diagnostic_pass must be 1 or 2 when diagnostics are enabled")
         if segment_mode not in SEGMENT_MODES:
             raise ValueError(
                 f"Unknown segment_mode: {segment_mode!r}; expected one of {SEGMENT_MODES}."
@@ -127,6 +142,11 @@ class StreamingWindowEngine(VanillaEngine):
             segment_mode,
             geometry_seg_profile,
         )
+        self.diagnostic_sink = diagnostic_sink
+        self.diagnostic_run_id = diagnostic_run_id
+        self.diagnostic_sequence_id = diagnostic_sequence_id
+        self.diagnostic_pass = diagnostic_pass
+        self.cache_policy = cache_policy
 
         segmentation_details = f"mode={segment_mode}"
         if segment_mode == "geometry":
@@ -178,19 +198,68 @@ class StreamingWindowEngine(VanillaEngine):
             raise RuntimeError('Cannot change depth refinement mode while running')
         self.depth_refine = flag
 
-    def _build_segment_graph(self, local_points, conf):
-        return make_sp_graph(
-            local_points.cpu().numpy(),
-            conf_map=conf.cpu().numpy(),
-            top_conf_percentile=self.top_conf_percentile,
-            segment_mode=self.segment_mode,
-            normal_method=self.normal_method,
-            geometry_seg_profile=self.geometry_seg_profile,
+    def _diagnostic_context(self):
+        if self.diagnostic_sink is None:
+            return None
+        from .diagnostics.schema import DiagnosticContext
+
+        config_id = self.segment_mode
+        if self.segment_mode == "geometry":
+            config_id = f"geometry_{self.geometry_seg_profile}"
+        return DiagnosticContext(
+            run_id=self.diagnostic_run_id,
+            config_id=config_id,
+            sequence_id=self.diagnostic_sequence_id,
+            pass_id=self.diagnostic_pass,
+            window_id=self.cache_id,
+            frame_start=self.cache_id * (self.window_size - self.overlap),
         )
+
+    def _build_segment_graph(self, local_points, conf, images=None):
+        kwargs = {
+            "conf_map": conf.cpu().numpy(),
+            "top_conf_percentile": self.top_conf_percentile,
+            "segment_mode": self.segment_mode,
+            "normal_method": self.normal_method,
+            "geometry_seg_profile": self.geometry_seg_profile,
+        }
+        context = self._diagnostic_context()
+        if self.diagnostic_sink is not None:
+            kwargs.update(
+                diagnostic_sink=self.diagnostic_sink,
+                diagnostic_context=context,
+            )
+        graph = make_sp_graph(
+            local_points.cpu().numpy(),
+            **kwargs,
+        )
+        if self.diagnostic_sink is not None and images is not None:
+            image_array = images.cpu().numpy() if isinstance(images, torch.Tensor) else np.asarray(images)
+            self.diagnostic_sink.emit_inputs(
+                context,
+                image_array,
+                local_points.cpu().numpy(),
+                conf.cpu().numpy(),
+            )
+        return graph
 
     # 把当前已经完成配准的窗口写入磁盘
     def _save_cache(self):
-        torch.save(self.prev_window_cache, self.temp_cache_dir / f'window_cache_{self.cache_id}.pt')
+        destination = self.temp_cache_dir / f'window_cache_{self.cache_id}.pt'
+        if self.cache_policy == "full":
+            torch.save(self.prev_window_cache, destination)
+        else:
+            shard = {
+                "camera_poses": self.prev_window_cache["camera_poses"],
+                "window_id": self.cache_id,
+                "frame_start": self.cache_id * (self.window_size - self.overlap),
+            }
+            partial = destination.with_name(destination.name + ".partial")
+            try:
+                torch.save(shard, partial)
+                os.replace(partial, destination)
+            finally:
+                partial.unlink(missing_ok=True)
         self.cache_id += 1
 
     # 更新相邻窗口参考状态
@@ -307,13 +376,21 @@ class StreamingWindowEngine(VanillaEngine):
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get('images'),
                     )
+                    refine_kwargs = {}
+                    if self.diagnostic_sink is not None:
+                        refine_kwargs.update(
+                            diagnostic_sink=self.diagnostic_sink,
+                            diagnostic_context=self._diagnostic_context(),
+                        )
                     working_window['local_points'] = working_window['local_points'] * refine_depth_segments(
                         self.prev_window_cache['local_points'].cpu().numpy(),
                         tgt_pcd,
                         self.anchor_sp_graph,
                         tgt_sp_graph,
-                        self.overlap
+                        self.overlap,
+                        **refine_kwargs,
                     )
             # ⚠️ 首窗口处理
             else:
@@ -331,6 +408,7 @@ class StreamingWindowEngine(VanillaEngine):
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get('images'),
                     )
 
             # ⚠️ 更新并保存窗口
@@ -470,3 +548,25 @@ class StreamingWindowEngine(VanillaEngine):
             shutil.rmtree(self.temp_cache_dir)
         # 7️⃣ 返回最终结果
         return ret_dict
+
+    def parse_pose_cache_summary(self, remove_cache=True):
+        """Aggregate the bounded metrics-only pose shards."""
+        if self.temp_cache_dir is None:
+            raise RuntimeError("No inference cache is available")
+        cache_files = sorted(
+            glob.glob(str(self.temp_cache_dir / 'window_cache_*.pt')),
+            key=lambda p: int(p.split('_')[-1].split('.')[0]),
+        )
+        if not cache_files:
+            raise RuntimeError("No pose cache shards were produced")
+        poses = []
+        for index, cache_file in enumerate(cache_files):
+            shard = torch.load(cache_file, map_location='cpu', weights_only=False)
+            camera_poses = shard['camera_poses']
+            if index:
+                camera_poses = camera_poses[self.overlap:]
+            poses.append(camera_poses)
+        result = {"extrinsic": torch.cat(poses, dim=0)[None]}
+        if remove_cache:
+            shutil.rmtree(self.temp_cache_dir)
+        return result

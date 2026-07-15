@@ -33,6 +33,11 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             segment_mode: str = "depth",
             normal_method: str = "cross",
             geometry_seg_profile: str = "baseline_params",
+            diagnostic_sink=None,
+            diagnostic_run_id: str | None = None,
+            diagnostic_sequence_id: str | None = None,
+            diagnostic_pass: int = 0,
+            cache_policy: str = "full",
     ):
         super().__init__(
             delegate=delegate.to(inference_device),
@@ -47,6 +52,11 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             segment_mode=segment_mode,
             normal_method=normal_method,
             geometry_seg_profile=geometry_seg_profile,
+            diagnostic_sink=diagnostic_sink,
+            diagnostic_run_id=diagnostic_run_id,
+            diagnostic_sequence_id=diagnostic_sequence_id,
+            diagnostic_pass=diagnostic_pass,
+            cache_policy=cache_policy,
         )
 
     def _registration_worker(self):
