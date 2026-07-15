@@ -205,7 +205,11 @@ class StreamingWindowEngine(VanillaEngine):
 
         config_id = self.segment_mode
         if self.segment_mode == "geometry":
-            config_id = f"geometry_{self.geometry_seg_profile}"
+            config_id = (
+                "geometry_baseline"
+                if self.geometry_seg_profile == "baseline_params"
+                else "geometry_legacy_reference"
+            )
         return DiagnosticContext(
             run_id=self.diagnostic_run_id,
             config_id=config_id,

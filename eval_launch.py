@@ -1,9 +1,5 @@
-from eval.pose_eval import eval_pose_estimation
-from eval.depth_eval import eval_mono_depth_estimation
 from pi3.models.pi3 import Pi3
 from inference_engine import VanillaEngine, StreamingWindowEngine, StreamingWindowEngineLC
-from loop_closure.loop_closure import LoopClosureEngine
-from loop_closure.utils.config_utils import load_config
 from functools import partial
 import eval.misc as misc  # noqa
 import torch
@@ -78,6 +74,11 @@ def get_args_parser():
                         help='choose model for pose evaluation')
     # checkpoint loading
     parser.add_argument('--ckpt_path', default=None, type=str, help='trained checkpoint for evaluation')
+    parser.add_argument('--model_ckpt', default=None, type=str,
+                        help='local .safetensors or PyTorch checkpoint (shared by segmentation profiles)')
+    parser.add_argument('--segment_mode', default='depth', choices=('depth', 'geometry', 'layer_atomic'))
+    parser.add_argument('--normal_method', default='cross', choices=('cross', 'sobel'))
+    parser.add_argument('--geometry_seg_profile', default='baseline_params', choices=('baseline_params', 'legacy'))
 
     # for monocular depth eval
     parser.add_argument('--no_crop', action='store_true', default=False,
@@ -89,8 +90,10 @@ def get_args_parser():
 
 
 # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+)
-dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = (
+    torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+) if device == "cuda" else torch.float32
 
 
 def inference_streaming_model(model, imgs, *args, **kwargs):
@@ -105,6 +108,8 @@ def inference_streaming_model(model, imgs, *args, **kwargs):
 
 
 def inference_streaming_model_lc(model, imgs, img_dir, *args, **kwargs):
+    from loop_closure.loop_closure import LoopClosureEngine
+    from loop_closure.utils.config_utils import load_config
     image_windows = model.img_sliding_window(imgs)
 
     model.begin()
@@ -149,6 +154,8 @@ def inference_streaming_model_lc(model, imgs, img_dir, *args, **kwargs):
 
 
 def pi3_main(args, engine_cls):
+    from eval.pose_eval import eval_pose_estimation
+    from eval.depth_eval import eval_mono_depth_estimation
     print('Launching Pi3 eval')
     misc.init_distributed_mode(args)
 
@@ -158,7 +165,20 @@ def pi3_main(args, engine_cls):
     np.random.seed(seed)
     cudnn.benchmark = args.cudnn_benchmark
 
-    model = engine_cls(Pi3.from_pretrained("yyfz233/Pi3").to(device))
+    if args.model_ckpt:
+        if not os.path.isfile(args.model_ckpt):
+            raise FileNotFoundError(f"Model checkpoint not found: {args.model_ckpt}")
+        delegate = Pi3().to(device)
+        if args.model_ckpt.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            checkpoint = load_file(args.model_ckpt, device=device)
+        else:
+            checkpoint = torch.load(args.model_ckpt, map_location=device, weights_only=False)
+        delegate.load_state_dict(checkpoint, strict=True)
+        del checkpoint
+    else:
+        delegate = Pi3.from_pretrained("yyfz233/Pi3").to(device)
+    model = engine_cls(delegate)
     model.eval()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -200,9 +220,13 @@ if __name__ == '__main__':
         pi3_main(args, VanillaEngine)
     elif model_variant == 'streaming_pi3':
         pi3_main(args, partial(StreamingWindowEngine, dtype=dtype, inference_device=device, window_size=20, overlap=5,
-                               top_conf_percentile=0.5))
+                               top_conf_percentile=0.5, segment_mode=args.segment_mode,
+                               normal_method=args.normal_method,
+                               geometry_seg_profile=args.geometry_seg_profile))
     elif model_variant == 'streaming_pi3_lc':
         pi3_main(args, partial(StreamingWindowEngineLC, dtype=dtype, inference_device=device, window_size=75, overlap=30,
-                               top_conf_percentile=0.3))
+                               top_conf_percentile=0.3, segment_mode=args.segment_mode,
+                               normal_method=args.normal_method,
+                               geometry_seg_profile=args.geometry_seg_profile))
     else:
         raise NotImplementedError
