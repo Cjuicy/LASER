@@ -57,7 +57,9 @@ def refine_depth_segments(
         src_sp_graphs,
         tgt_sp_graphs,
         overlap,
-        corr_iou_thresh=0.4
+        corr_iou_thresh=0.4,
+        diagnostic_sink=None,
+        diagnostic_context=None,
 ):
     """
     src_pcd: previous window pcd
@@ -77,7 +79,9 @@ def refine_depth_segments(
         src_sp_graphs,
         tgt_sp_graphs,
         overlap,
-        corr_iou_thresh
+        corr_iou_thresh,
+        diagnostic_sink=diagnostic_sink,
+        diagnostic_context=diagnostic_context,
     )
 
     return torch.from_numpy(tgt_scale_mask[..., None])
@@ -91,7 +95,9 @@ def make_sp_graph(
         corr_iou_thresh=0.3,
         segment_mode=None,
         normal_method="cross",
-        geometry_seg_profile="baseline_params",
+    geometry_seg_profile="baseline_params",
+    diagnostic_sink=None,
+    diagnostic_context=None,
 ):
     legacy_layer_atomic_call = segment_mode is None
     if legacy_layer_atomic_call:
@@ -128,7 +134,50 @@ def make_sp_graph(
         segmentation_op,
         **common_kwargs,
     )
-    return match_segmentation_seq(labels, iou_thresh=corr_iou_thresh)
+    if diagnostic_sink is not None:
+        from inference_engine.diagnostics.segmentation import trace_segmentation_frame
+
+        point_maps_array = np.asarray(point_maps)
+        conf_array = None if conf_map is None else np.asarray(conf_map)
+        for local_index, formal_labels in enumerate(labels):
+            trace = trace_segmentation_frame(
+                point_maps_array[local_index],
+                formal_labels,
+                segment_mode=segment_mode,
+                depth_merge_thresh=depth_merge_thresh,
+                conf_map=None if conf_array is None else conf_array[local_index],
+                top_conf_percentile=top_conf_percentile,
+                normal_method=normal_method,
+                **params,
+            )
+            arrays = dict(trace["arrays"])
+            if trace["merge_trace"] is not None:
+                arrays["merge_events"] = np.asarray(
+                    [
+                        [
+                            event["left_atom"], event["right_atom"],
+                            event["component_atoms_after"], event["component_pixels_after"],
+                            event["merge_depth_after"],
+                        ]
+                        for event in trace["merge_trace"].events
+                    ],
+                    dtype=np.float64,
+                )
+            diagnostic_sink.emit_segmentation(
+                diagnostic_context,
+                local_index,
+                trace["metrics"],
+                arrays,
+            )
+    graphs = match_segmentation_seq(labels, iou_thresh=corr_iou_thresh)
+    if diagnostic_sink is not None:
+        from inference_engine.diagnostics.temporal import summarize_temporal_graph
+
+        diagnostic_sink.emit_temporal(
+            diagnostic_context,
+            summarize_temporal_graph(graphs),
+        )
+    return graphs
 
 
 def align_adjacent_windows_depth_segments(
@@ -137,7 +186,9 @@ def align_adjacent_windows_depth_segments(
         src_sp_graphs,
         tgt_sp_graphs,
         overlap,
-        corr_iou_thresh=0.4
+        corr_iou_thresh=0.4,
+        diagnostic_sink=None,
+        diagnostic_context=None,
 ):
     """
     src_depth: previous window depth map
@@ -184,6 +235,12 @@ def align_adjacent_windows_depth_segments(
         tgt_sp_graphs_overlap,
         iou_thresh=corr_iou_thresh
     )
+    direct_cache = None
+    if diagnostic_sink is not None:
+        direct_cache = diagnostic_sink.snapshot_direct_anchors(
+            diagnostic_context,
+            tgt_sp_graphs,
+        )
     # temporal scale propagation
     for tgt_graph_layer in tgt_sp_graphs:
         for v in tgt_graph_layer:
@@ -196,4 +253,17 @@ def align_adjacent_windows_depth_segments(
             mask_frame += v.data_cache_op(_get_scale_mask)
         mask_seq.append(mask_frame)
 
-    return np.stack(mask_seq)
+    scale_mask = np.stack(mask_seq)
+    if diagnostic_sink is not None:
+        from inference_engine.diagnostics.scale import summarize_scale_observations
+
+        scale_summary = summarize_scale_observations(
+            tgt_sp_graphs,
+            direct_cache=direct_cache,
+        )
+        diagnostic_sink.emit_scale(
+            diagnostic_context,
+            scale_summary["metrics"],
+            scale_summary["arrays"],
+        )
+    return scale_mask
