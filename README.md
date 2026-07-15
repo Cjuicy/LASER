@@ -114,6 +114,11 @@ See [docs/unified-segmentation-cloud-validation.md](docs/unified-segmentation-cl
 for branch checkout, CPU smoke tests, full regression tests, and matched cloud commands
 for all three modes.
 
+For the one-command, two-pass KITTI 00–10 comparison with a 50 GiB hard cap,
+automatic case selection, scale/temporal diagnostics, PNG/PLY artifacts, Stability Guard,
+Recovery metrics, resume support, and an offline report, see
+[docs/segmentation-diagnostics-cloud.md](docs/segmentation-diagnostics-cloud.md).
+
 ### Loop-closure inference
 Loop-closure requires additional dependencies for package `faiss` can be installed through:
 ```bash
