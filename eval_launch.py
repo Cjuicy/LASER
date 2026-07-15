@@ -28,7 +28,8 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
     # switch mode for train / eval pose / eval depth
-    parser.add_argument('--mode', default='train', type=str, help='train / eval_pose / eval_depth')
+    parser.add_argument('--mode', default='train', type=str,
+                        help='train / eval_pose / eval_depth / segmentation_diagnostics')
 
     # for pose eval
     parser.add_argument('--pose_eval_freq', default=0, type=int, help='pose evaluation frequency')
@@ -79,6 +80,24 @@ def get_args_parser():
     parser.add_argument('--segment_mode', default='depth', choices=('depth', 'geometry', 'layer_atomic'))
     parser.add_argument('--normal_method', default='cross', choices=('cross', 'sobel'))
     parser.add_argument('--geometry_seg_profile', default='baseline_params', choices=('baseline_params', 'legacy'))
+
+    # Unified entry point for the full four-profile diagnostic workflow.  The
+    # dedicated script exposes the same implementation with shorter flag names.
+    parser.add_argument('--diagnostic_dataset_root', type=str)
+    parser.add_argument('--diagnostic_output_dir', default='./results/segmentation-diagnostics')
+    parser.add_argument('--diagnostic_temp_root', default='./cache/segmentation-diagnostics')
+    parser.add_argument('--diagnostic_sequences', nargs='+', default=[f'{i:02d}' for i in range(11)])
+    parser.add_argument('--diagnostic_window_size', type=int, default=20)
+    parser.add_argument('--diagnostic_overlap', type=int, default=5)
+    parser.add_argument('--diagnostic_top_conf_percentile', type=float, default=.3)
+    parser.add_argument('--diagnostic_max_temp_gib', type=float, default=50.0)
+    parser.add_argument('--diagnostic_warn_temp_gib', type=float, default=40.0)
+    parser.add_argument('--diagnostic_min_free_gib', type=float, default=10.0)
+    parser.add_argument('--diagnostic_selected_interval_limit', type=int, default=48)
+    parser.add_argument('--diagnostic_device', default='auto')
+    parser.add_argument('--diagnostic_resume', action='store_true')
+    parser.add_argument('--diagnostic_dry_run', action='store_true')
+    parser.add_argument('--diagnostic_report_only', action='store_true')
 
     # for monocular depth eval
     parser.add_argument('--no_crop', action='store_true', default=False,
@@ -214,6 +233,38 @@ def pi3_main(args, engine_cls):
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
+
+    if args.mode == 'segmentation_diagnostics':
+        if args.model != 'streaming_pi3':
+            raise ValueError('segmentation_diagnostics requires --model streaming_pi3 (loop closure disabled)')
+        if not args.diagnostic_dataset_root or not args.model_ckpt:
+            raise ValueError('segmentation_diagnostics requires --diagnostic_dataset_root and --model_ckpt')
+        from inference_engine.diagnostics.orchestrator import run_master
+        diagnostic_args = argparse.Namespace(
+            dataset_root=args.diagnostic_dataset_root,
+            model_ckpt=args.model_ckpt,
+            output_dir=args.diagnostic_output_dir,
+            temp_root=args.diagnostic_temp_root,
+            sequences=args.diagnostic_sequences,
+            window_size=args.diagnostic_window_size,
+            overlap=args.diagnostic_overlap,
+            top_conf_percentile=args.diagnostic_top_conf_percentile,
+            seed=args.seed,
+            max_temp_gib=args.diagnostic_max_temp_gib,
+            warn_temp_gib=args.diagnostic_warn_temp_gib,
+            min_free_gib=args.diagnostic_min_free_gib,
+            max_selected=args.diagnostic_selected_interval_limit,
+            device=args.diagnostic_device,
+            resume=args.diagnostic_resume,
+            report_only=args.diagnostic_report_only,
+            dry_run=args.diagnostic_dry_run,
+            worker=False,
+            pass_id=0,
+            config_id=None,
+            run_id=None,
+            selected_intervals=None,
+        )
+        raise SystemExit(run_master(diagnostic_args))
 
     model_variant = args.model
     if model_variant == 'pi3':

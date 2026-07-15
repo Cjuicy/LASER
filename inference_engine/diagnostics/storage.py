@@ -6,12 +6,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import os
+import fcntl
 from pathlib import Path
 import shutil
 import socket
 import tempfile
 import threading
 from typing import Any, Iterator
+
+import numpy as np
 
 
 GIB = 1024 ** 3
@@ -85,6 +88,21 @@ def append_jsonl(path: str | os.PathLike[str], record: Any) -> Path:
     return destination
 
 
+def atomic_write_npz(path: str | os.PathLike[str], **arrays: Any) -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.name + ".partial")
+    try:
+        with partial.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(partial, destination)
+    finally:
+        partial.unlink(missing_ok=True)
+    return destination
+
+
 class RunLock:
     def __init__(self, path: str | os.PathLike[str], run_id: str):
         self.path = Path(path)
@@ -98,15 +116,41 @@ class RunLock:
             "pid": os.getpid(),
             "hostname": socket.gethostname(),
         }
+        # The persistent guard serializes stale inspection and replacement.
+        # It is intentionally never unlinked: unlinking a flock inode would
+        # reintroduce a race between old and new guard-file descriptors.
+        guard_path = self.path.with_name(self.path.name + ".guard")
+        guard_descriptor = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError as exc:
-            raise RunLockError(f"Diagnostic run is already locked: {self.path}") from exc
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+            fcntl.flock(guard_descriptor, fcntl.LOCK_EX)
+            try:
+                descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError as exc:
+                # A killed cloud job cannot execute ``__exit__``. Recover only
+                # this exact run on this host whose PID is provably dead.
+                try:
+                    existing = json.loads(self.path.read_text(encoding="utf-8"))
+                    pid = int(existing["pid"])
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    existing = {}
+                    pid = -1
+                recoverable = (
+                    existing.get("run_id") == self.run_id
+                    and existing.get("hostname") == socket.gethostname()
+                    and not _pid_is_alive(pid)
+                )
+                if not recoverable:
+                    raise RunLockError(f"Diagnostic run is already locked: {self.path}") from exc
+                self.path.unlink(missing_ok=True)
+                descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(guard_descriptor, fcntl.LOCK_UN)
+            os.close(guard_descriptor)
         self._owned = True
 
     def release(self) -> None:
@@ -126,6 +170,18 @@ class RunLock:
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.release()
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def cleanup_owned_directory(path: str | os.PathLike[str], run_id: str) -> None:

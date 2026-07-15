@@ -185,9 +185,10 @@ def trace_segmentation_frame(
     arrays: dict[str, np.ndarray] = {"final_labels": np.asarray(formal_labels)}
     merge_trace = None
     if segment_mode in {"depth", "layer_atomic"}:
+        depth_conf = None if conf_map is None else np.asarray(conf_map)[None]
         initial, coarse, merge_threshold = segment_depth_felzenszwalb_rag_stages(
-            depth, depth_merge_thresh, conf_map, top_conf_percentile,
-            seg_scale, seg_sigma, seg_min_size, None,
+            depth, depth_merge_thresh, depth_conf, top_conf_percentile,
+            seg_scale, seg_sigma, seg_min_size, 0,
         )
         arrays.update(initial_labels=initial, coarse_labels=coarse)
         if segment_mode == "depth":
@@ -215,10 +216,24 @@ def trace_segmentation_frame(
     metrics = {
         "mode": segment_mode,
         "merge_threshold": None if merge_threshold is None else float(merge_threshold),
+        "confidence_mean": (
+            float(np.nanmean(conf_map))
+            if conf_map is not None and np.isfinite(conf_map).any()
+            else None
+        ),
+        "confidence_p10": (
+            float(np.nanquantile(conf_map, .10))
+            if conf_map is not None and np.isfinite(conf_map).any()
+            else None
+        ),
         "initial": summarize_labels(initial),
         "final": summarize_labels(formal_labels, initial_labels=initial),
     }
     if merge_trace is not None:
         metrics["merge"] = merge_trace.metrics
         arrays["atom_scales"] = merge_trace.atom_scales
+        arrays["merge_decision"] = merge_trace.decision_map
+        arrays["normalized_gap_map"] = merge_trace.normalized_gap_map
+        arrays["threshold_margin_map"] = merge_trace.threshold_margin_map
+        arrays["component_growth_map"] = merge_trace.component_growth_map
     return {"metrics": metrics, "arrays": arrays, "merge_trace": merge_trace}

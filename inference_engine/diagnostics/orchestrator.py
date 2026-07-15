@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import random
+import signal
 import shutil
 import subprocess
 import sys
@@ -18,11 +20,20 @@ from typing import Any
 import numpy as np
 
 from .metrics import build_sequence_summary, evaluate_stability_guard
-from .rendering import render_case
+from .rendering import render_case, render_method_comparison
 from .report import build_report
 from .schema import RunManifest, SelectedInterval
 from .selection import select_intervals
-from .storage import RunLock, StorageBudget, atomic_write_json
+from .segmentation import compare_labelings
+from .storage import (
+    OWNER_FILE,
+    RunLock,
+    StorageBudget,
+    atomic_write_json,
+    atomic_write_npz,
+    cleanup_owned_directory,
+    directory_size,
+)
 
 
 DIAGNOSTIC_PROFILES = {
@@ -59,9 +70,36 @@ def dataset_fingerprint(root: Path, sequences: list[str] | tuple[str, ...]) -> s
 
 def _git_commit() -> str:
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+        repository = Path(__file__).resolve().parents[2]
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL,
+            cwd=repository,
+        ).strip()
+        tracked_diff = subprocess.check_output(
+            ["git", "diff", "HEAD", "--binary", "--", "."],
+            stderr=subprocess.DEVNULL,
+            cwd=repository,
+        )
+        if tracked_diff:
+            return f"{head}+dirty-{hashlib.sha256(tracked_diff).hexdigest()[:16]}"
+        return head
     except Exception:
         return "unknown-local-commit"
+
+
+@contextmanager
+def _termination_as_interrupt():
+    """Turn SIGTERM into a normal unwind so manifest and lock are persisted."""
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _config_hash(args) -> str:
@@ -69,7 +107,9 @@ def _config_hash(args) -> str:
         "profiles": DIAGNOSTIC_PROFILES,
         "sequences": list(args.sequences), "window_size": args.window_size,
         "overlap": args.overlap, "top_conf_percentile": args.top_conf_percentile,
-        "seed": args.seed,
+        "seed": args.seed, "max_selected": args.max_selected, "device": args.device,
+        "max_temp_gib": args.max_temp_gib, "warn_temp_gib": args.warn_temp_gib,
+        "min_free_gib": args.min_free_gib,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -82,15 +122,28 @@ def preflight(args) -> dict[str, Any]:
     if args.overlap >= args.window_size or args.overlap < 0:
         raise ValueError("overlap must be non-negative and smaller than window_size")
     frame_counts = {}
+    pose_counts = {}
+    image_shapes = {}
     for sequence in args.sequences:
         image_dir = dataset_root / "sequences" / sequence / "image_2"
         pose_file = dataset_root / "poses" / f"{sequence}.txt"
         if not image_dir.is_dir() or not pose_file.is_file():
             raise FileNotFoundError(f"KITTI sequence {sequence} requires {image_dir} and {pose_file}")
-        frames = [path for path in image_dir.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg"}]
+        frames = sorted(path for path in image_dir.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg"})
         if len(frames) < 2:
             raise ValueError(f"KITTI sequence {sequence} has fewer than two images")
         frame_counts[sequence] = len(frames)
+        import cv2
+        sample = cv2.imread(str(frames[0]), cv2.IMREAD_UNCHANGED)
+        if sample is None or sample.ndim < 2:
+            raise ValueError(f"Cannot read KITTI image dimensions: {frames[0]}")
+        image_shapes[sequence] = [int(sample.shape[0]), int(sample.shape[1])]
+        pose_count = sum(bool(line.strip()) for line in pose_file.read_text(encoding="utf-8").splitlines())
+        if pose_count < len(frames):
+            raise ValueError(
+                f"KITTI sequence {sequence} has {len(frames)} images but only {pose_count} poses"
+            )
+        pose_counts[sequence] = pose_count
     temp = Path(args.temp_root); temp.mkdir(parents=True, exist_ok=True)
     budget = StorageBudget(temp, max_gib=args.max_temp_gib, warn_gib=args.warn_temp_gib, min_free_gib=args.min_free_gib)
     state = budget.enforce()
@@ -98,11 +151,46 @@ def preflight(args) -> dict[str, Any]:
         "checkpoint_sha256": checkpoint_sha256(checkpoint),
         "dataset_fingerprint": dataset_fingerprint(dataset_root, args.sequences),
         "frame_counts": frame_counts,
+        "pose_counts": pose_counts,
+        "image_shapes": image_shapes,
         "profiles": list(DIAGNOSTIC_PROFILES),
         "loop_closure": False,
         "git_commit": _git_commit(),
         "config_hash": _config_hash(args),
         "budget": state.__dict__,
+    }
+
+
+def estimate_storage_bytes(info: dict[str, Any], args) -> dict[str, int]:
+    """Conservative compressed-storage projection for both passes and cases."""
+    profiles = len(DIAGNOSTIC_PROFILES)
+    total_frames = sum(info["frame_counts"].values())
+    stride = args.window_size - args.overlap
+    context_span = args.window_size + 4 * stride
+    max_pixels = max(height * width for height, width in info["image_shapes"].values())
+    # The mandatory design pairs anomaly intervals (expanded context) with
+    # matched controls (their native window only); use that mix for preflight.
+    anomaly_cases = (max(0, args.max_selected) + 1) // 2
+    control_cases = max(0, args.max_selected) // 2
+    selected_frames = min(
+        total_frames,
+        anomaly_cases * context_span + control_cases * args.window_size,
+    )
+    # Inputs, segmentation/merge, scale and temporal maps compress to roughly
+    # 24 B/pixel on KITTI; 32 B/pixel leaves headroom for noisy point maps.
+    dense = selected_frames * max_pixels * 32 * profiles
+    scalar = total_frames * profiles * 16 * 1024
+    trajectories = total_frames * profiles * 1024
+    # One center-frame PLY, 15 PNGs, combined trace and metadata per case/config.
+    cases = args.max_selected * profiles * (160 * 1024 * 1024 + max_pixels * 20)
+    report = max(64 * 1024 * 1024, args.max_selected * 2 * 1024 * 1024)
+    total = int(dense + scalar + trajectories + cases + report)
+    return {
+        "pass1_scalar": int(scalar + trajectories),
+        "pass2_dense": int(dense),
+        "cases_and_report": int(cases + report),
+        "total": total,
+        "selected_frame_upper_bound": int(selected_frames),
     }
 
 
@@ -145,6 +233,101 @@ def _phase_done(manifest: RunManifest, phase: str, config: str) -> bool:
     return manifest.state.get(phase, {}).get(config, {}).get("*") == "complete"
 
 
+def _artifact_inventory(output_root: Path, paths: list[Path]) -> dict[str, dict[str, Any]]:
+    files: set[Path] = set()
+    for path in paths:
+        if path.is_dir():
+            files.update(item for item in path.rglob("*") if item.is_file())
+        elif path.is_file():
+            files.add(path)
+    return {
+        str(path.relative_to(output_root)): {
+            "size": path.stat().st_size,
+            "sha256": checkpoint_sha256(path),
+        }
+        for path in sorted(files)
+    }
+
+
+def _validate_sequence_checkpoint(
+    output_root: Path,
+    checkpoint_path: Path,
+    *,
+    run_id: str,
+    config_id: str,
+    sequence_id: str,
+    pass_id: int,
+    checkpoint_hash: str,
+    expected_frames: int,
+    window_size: int,
+    selected_intervals: list[SelectedInterval] | tuple[SelectedInterval, ...] = (),
+    implementation_fingerprint: str | None = None,
+    config_hash: str | None = None,
+    dataset_hash: str | None = None,
+) -> tuple[bool, str]:
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False, "missing_or_invalid_checkpoint"
+    expected = {
+        "run_id": run_id,
+        "config_id": config_id,
+        "sequence_id": sequence_id,
+        "pass_id": pass_id,
+        "checkpoint_sha256": checkpoint_hash,
+        "frame_count": expected_frames,
+        "pose_count": expected_frames,
+    }
+    if implementation_fingerprint is not None:
+        expected["implementation_fingerprint"] = implementation_fingerprint
+    if config_hash is not None:
+        expected["config_hash"] = config_hash
+    if dataset_hash is not None:
+        expected["dataset_fingerprint"] = dataset_hash
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            return False, f"checkpoint_{field}_mismatch"
+    inventory = payload.get("artifacts")
+    if not isinstance(inventory, dict) or not inventory:
+        return False, "missing_artifact_inventory"
+    for relative, metadata in inventory.items():
+        path = output_root / relative
+        if not path.is_file():
+            return False, f"missing_artifact:{relative}"
+        if path.stat().st_size != metadata.get("size"):
+            return False, f"artifact_size_mismatch:{relative}"
+        if checkpoint_sha256(path) != metadata.get("sha256"):
+            return False, f"artifact_checksum_mismatch:{relative}"
+    trajectory_root = output_root / "trajectory"
+    if pass_id != 1:
+        trajectory_root = trajectory_root / f"pass{pass_id}"
+    shard_root = output_root / "artifacts" / config_id / sequence_id / f"pass{pass_id}"
+    required = {
+        str((trajectory_root / config_id / f"{sequence_id}.json").relative_to(output_root)),
+        str((trajectory_root / config_id / f"{sequence_id}.npz").relative_to(output_root)),
+        str((shard_root / "segmentation.jsonl").relative_to(output_root)),
+        str((shard_root / "temporal.jsonl").relative_to(output_root)),
+    }
+    if expected_frames > window_size:
+        required.add(str((shard_root / "scale.jsonl").relative_to(output_root)))
+    if not required <= set(inventory):
+        missing_required = sorted(required - set(inventory))
+        return False, "required_artifact_not_in_inventory:" + ",".join(missing_required)
+    if any(int(inventory[relative].get("size", 0)) <= 0 for relative in required):
+        return False, "empty_required_artifact"
+    if pass_id == 2:
+        trace_root = output_root / "artifacts" / config_id / sequence_id / "pass2" / "traces"
+        for interval in selected_intervals:
+            if interval.sequence_id != sequence_id:
+                continue
+            center = min((interval.start_frame + interval.end_frame) // 2, expected_frames - 1)
+            for prefix in ("inputs", "segmentation"):
+                relative = str((trace_root / f"{prefix}-frame-{center:06d}.npz").relative_to(output_root))
+                if relative not in inventory:
+                    return False, f"missing_selected_trace:{relative}"
+    return True, "complete"
+
+
 def _worker_command(args, *, pass_id: int, config_id: str, run_id: str, selected: Path | None = None) -> list[str]:
     script = Path(__file__).resolve().parents[2] / "scripts" / "run_segmentation_diagnostics.py"
     command = [
@@ -185,7 +368,18 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
         for sequence in args.sequences:
             evaluation = trajectory_results.get(config, {}).get(sequence, {})
             errors = np.asarray(evaluation.get("per_frame_translation_error") or [], dtype=float)
+            atomic_errors = np.asarray(trajectory_results.get("layer_atomic", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
             geometry_errors = np.asarray(trajectory_results.get("geometry_baseline", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
+            depth_errors = np.asarray(trajectory_results.get("depth", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
+            legacy_errors = np.asarray(trajectory_results.get("geometry_legacy_reference", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
+            gt_positions = np.empty((0, 3), dtype=float)
+            gt_rotations = np.empty((0, 3, 3), dtype=float)
+            trajectory_npz = Path(run_dir) / "trajectory" / "layer_atomic" / f"{sequence}.npz"
+            if trajectory_npz.exists():
+                with np.load(trajectory_npz) as data:
+                    ground_truth = data["ground_truth"]
+                gt_positions = ground_truth[:, :3, 3]
+                gt_rotations = ground_truth[:, :3, :3]
             base = Path(run_dir) / "artifacts" / config / sequence / "pass1"
             segmentation = _read_jsonl(base / "segmentation.jsonl")
             scale = {item["context"]["window_id"]: item for item in _read_jsonl(base / "scale.jsonl")}
@@ -197,8 +391,9 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
             for window_id in range(window_count):
                 start = window_id * stride; end = min(start + args.window_size - 1, max(len(errors) - 1, start))
                 frame_slice = errors[start:end + 1]
+                atomic_slice = atomic_errors[start:end + 1]
                 reference_slice = geometry_errors[start:end + 1] if geometry_errors.size else np.asarray([])
-                regret = float(np.nanmean(frame_slice - reference_slice)) if frame_slice.size and reference_slice.size == frame_slice.size else float(np.nanmean(frame_slice)) if frame_slice.size else 0.0
+                regret = float(np.nanmean(atomic_slice - reference_slice)) if atomic_slice.size and reference_slice.size == atomic_slice.size else 0.0
                 frame_metrics = by_window.get(window_id, [])
                 final_metrics = [item["metrics"].get("final", {}) for item in frame_metrics]
                 merge_metrics = [item["metrics"].get("merge", {}) for item in frame_metrics]
@@ -208,48 +403,175 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
                 scale_item = scale.get(window_id, {}).get("metrics", {})
                 scale_p90 = ((scale_item.get("scale_log_mad_quantiles") or {}).get("p90") or 0.0)
                 temporal_item = temporal.get(window_id, {}).get("metrics", {})
+                confidence_values = [
+                    item["metrics"].get("confidence_mean")
+                    for item in frame_metrics
+                    if item["metrics"].get("confidence_mean") is not None
+                ]
+                position_slice = gt_positions[start:end + 1]
+                speed = float(np.mean(np.linalg.norm(np.diff(position_slice, axis=0), axis=1))) if len(position_slice) > 1 else 0.0
+                rotation_slice = gt_rotations[start:end + 1]
+                turn_angles = []
+                for rotation_index in range(max(0, len(rotation_slice) - 1)):
+                    delta_rotation = rotation_slice[rotation_index].T @ rotation_slice[rotation_index + 1]
+                    cosine = np.clip((np.trace(delta_rotation) - 1) / 2, -1, 1)
+                    turn_angles.append(float(np.arccos(cosine)))
+                def mean_regret(reference):
+                    reference_values = reference[start:end + 1]
+                    return float(np.nanmean(atomic_slice - reference_values)) if atomic_slice.size and len(reference_values) == len(atomic_slice) else None
                 records.append({
                     "config_id": config, "sequence_id": sequence, "window_id": window_id,
                     "frame_start": start, "frame_end": end, "trajectory_regret": regret,
-                    "merge_anomaly": lsr + cross + np.log1p(growth), "scale_dispersion": float(scale_p90),
+                    "merge_anomaly": cross,
+                    "atom_anomaly": lsr + np.log1p(growth),
+                    "scale_dispersion": float(scale_p90),
                     "temporal_churn": float(temporal_item.get("segment_churn_ratio") or temporal_item.get("unmatched_area_ratio") or 0),
-                    "gt_speed": 0.0, "gt_turn": 0.0, "confidence": 0.0,
+                    "layer_atomic_minus_depth_regret": mean_regret(depth_errors),
+                    "layer_atomic_minus_geometry_regret": regret,
+                    "layer_atomic_minus_legacy_regret": mean_regret(legacy_errors),
+                    "gt_speed": speed,
+                    "gt_turn": float(np.mean(turn_angles)) if turn_angles else 0.0,
+                    "confidence": float(np.mean(confidence_values)) if confidence_values else 0.0,
                 })
     return records
 
 
-def build_cases(run_dir: Path, intervals: list[SelectedInterval], records: list[dict], args) -> None:
+def build_cases(
+    run_dir: Path,
+    intervals: list[SelectedInterval],
+    records: list[dict],
+    args,
+    *,
+    budget: StorageBudget | None = None,
+) -> None:
     stride = args.window_size - args.overlap
     for interval in intervals:
         center = (interval.start_frame + interval.end_frame) // 2
+        comparison_data: dict[str, dict[str, np.ndarray]] = {}
+        interval_root = run_dir / "cases" / interval.sequence_id / f"{interval.start_frame:06d}-{interval.end_frame:06d}"
+        combined_arrays: dict[str, np.ndarray] = {}
+        artifact_manifest: dict[str, Any] = {
+            "interval": interval.to_dict(),
+            "selection_score": interval.score,
+            "configs": {},
+        }
         for config in DIAGNOSTIC_PROFILES:
             trace_dir = run_dir / "artifacts" / config / interval.sequence_id / "pass2" / "traces"
-            if not trace_dir.exists():
-                continue
-            candidates = [trace_dir / f"inputs-frame-{center:06d}.npz", trace_dir / f"segmentation-frame-{center:06d}.npz"]
+            if not trace_dir.is_dir():
+                raise FileNotFoundError(f"Missing selected trace directory: {trace_dir}")
+            required = [
+                trace_dir / f"inputs-frame-{center:06d}.npz",
+                trace_dir / f"segmentation-frame-{center:06d}.npz",
+            ]
+            missing = [path for path in required if not path.is_file()]
+            if missing:
+                raise FileNotFoundError(
+                    "Missing required selected trace(s): " + ", ".join(map(str, missing))
+                )
             window_id = center // stride
-            candidates.append(trace_dir / f"scale-window-{window_id:06d}.npz")
-            paths = [path for path in candidates if path.exists()]
-            if not any("segmentation" in path.name for path in paths):
-                available = sorted(trace_dir.glob("segmentation-frame-*.npz"))
-                if available:
-                    nearest = min(available, key=lambda path: abs(int(path.stem.rsplit("-", 1)[1]) - center))
-                    paths.append(nearest)
-                    input_path = trace_dir / nearest.name.replace("segmentation-", "inputs-")
-                    if input_path.exists(): paths.append(input_path)
-            if not paths:
-                continue
-            case_dir = run_dir / "cases" / interval.sequence_id / f"{interval.start_frame:06d}-{interval.end_frame:06d}" / config
-            render_case(paths, case_dir)
+            optional = [
+                trace_dir / f"scale-window-{window_id:06d}.npz",
+                trace_dir / f"temporal-window-{window_id:06d}.npz",
+            ]
+            paths = required + [path for path in optional if path.is_file()]
+            case_dir = interval_root / config
+            if budget is not None:
+                budget.enforce(estimated_bytes=100 * 1024 * 1024)
+            local_index = min(max(center - window_id * stride, 0), args.window_size - 1)
+            render_case(paths, case_dir, frame_index=local_index)
+            if budget is not None:
+                budget.enforce()
+            values: dict[str, np.ndarray] = {}
+            config_artifacts = {"available": [], "unavailable": []}
+            for path in paths:
+                kind = path.name.split("-", 1)[0]
+                config_artifacts["available"].append({
+                    "kind": kind,
+                    "path": str(path.relative_to(run_dir)),
+                    "sha256": checkpoint_sha256(path),
+                })
+                with np.load(path) as data:
+                    for name in data.files:
+                        value = data[name]
+                        combined_arrays[f"{config}__{kind}__{name}"] = value
+                        if name in ("final_labels", "scale_map"):
+                            selected_value = value
+                            if selected_value.ndim == 3:
+                                selected_value = selected_value[
+                                    min(max(local_index, 0), len(selected_value) - 1)
+                                ]
+                            values[name] = selected_value
+            for kind, path in zip(("scale", "temporal"), optional, strict=True):
+                if not path.is_file():
+                    config_artifacts["unavailable"].append({
+                        "kind": kind,
+                        "reason": "not_emitted_for_this_window",
+                    })
+            artifact_manifest["configs"][config] = config_artifacts
+            comparison_data[config] = values
             matching = [row for row in records if row["config_id"] == config and row["sequence_id"] == interval.sequence_id and row["frame_start"] <= center <= row["frame_end"]]
             metrics = {"interval": interval.to_dict(), "config_id": config, **(matching[0] if matching else {})}
             atomic_write_json(case_dir / "metrics.json", metrics)
+        atomic = comparison_data.get("layer_atomic", {})
+        geometry = comparison_data.get("geometry_baseline", {})
+        if len(comparison_data) != len(DIAGNOSTIC_PROFILES):
+            raise RuntimeError(f"Incomplete method comparison for {interval.sequence_id}/{center}")
+        if budget is not None:
+            budget.enforce(estimated_bytes=sum(value.nbytes for value in combined_arrays.values()))
+        atomic_write_npz(interval_root / "trace.npz", **combined_arrays)
+        atomic_write_json(interval_root / "artifact-manifest.json", artifact_manifest)
+        if budget is not None:
+            budget.enforce()
+        if "final_labels" in atomic and "final_labels" in geometry:
+            comparison_metrics = compare_labelings(atomic["final_labels"], geometry["final_labels"])
+            render_method_comparison(
+                atomic["final_labels"], geometry["final_labels"], interval_root,
+                left_scale=atomic.get("scale_map"), right_scale=geometry.get("scale_map"),
+            )
+            center_records = [
+                row for row in records
+                if row["config_id"] == "layer_atomic"
+                and row["sequence_id"] == interval.sequence_id
+                and row["frame_start"] <= center <= row["frame_end"]
+            ]
+            center_record = min(
+                center_records,
+                key=lambda row: abs((row["frame_start"] + row["frame_end"]) / 2 - center),
+            ) if center_records else None
+            actual_regret = center_record.get("trajectory_regret") if center_record else None
+            atomic_write_json(interval_root / "metrics.json", {
+                "comparison": "layer_atomic_vs_geometry_baseline",
+                "interval": interval.to_dict(),
+                "selection_score": interval.score,
+                "trajectory_regret": actual_regret,
+                **comparison_metrics,
+            })
+        else:
+            raise RuntimeError(
+                f"Missing comparable final labels for {interval.sequence_id}/{center}"
+            )
 
 
 def run_master(args, *, runner=subprocess.run) -> int:
-    output = Path(args.output_dir); output.mkdir(parents=True, exist_ok=True)
-    info = preflight(args)
+    output = Path(args.output_dir)
     manifest_path = output / "manifest.json"
+    if args.report_only:
+        if not manifest_path.is_file():
+            raise FileNotFoundError("--report-only requires an existing manifest.json")
+        print("[phase report] rebuilding report without inference or manifest mutation")
+        build_report(output)
+        return 0
+    if manifest_path.exists() and not (args.resume or args.report_only):
+        raise FileExistsError(
+            f"Output already contains a diagnostic manifest: {manifest_path}; "
+            "use --resume, --report-only, or a new output directory."
+        )
+    if output.exists() and any(output.iterdir()) and not args.resume:
+        raise FileExistsError(
+            f"Output directory is not empty: {output}; use --resume or a new directory."
+        )
+    output.mkdir(parents=True, exist_ok=True)
+    info = preflight(args)
     if args.resume:
         if not manifest_path.exists():
             raise FileNotFoundError("--resume requested but manifest.json is missing")
@@ -257,59 +579,185 @@ def run_master(args, *, runner=subprocess.run) -> int:
     else:
         run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{info['checkpoint_sha256'][:8]}"
         manifest = _manifest(args, info, run_id)
+    projection = estimate_storage_bytes(info, args)
+    manifest.budget["projection_bytes"] = projection
+    output_budget = StorageBudget(
+        output, max_gib=args.max_temp_gib, warn_gib=args.warn_temp_gib,
+        min_free_gib=args.min_free_gib,
+    )
+    projected_remaining = max(0, projection["total"] - directory_size(output))
+    projected_state = output_budget.enforce(estimated_bytes=projected_remaining)
+    temp_peak = max(info["frame_counts"].values()) * 8 * 1024
+    StorageBudget(
+        args.temp_root, max_gib=args.max_temp_gib, warn_gib=args.warn_temp_gib,
+        min_free_gib=args.min_free_gib,
+    ).enforce(estimated_bytes=temp_peak)
+    if not args.resume:
         atomic_write_json(manifest_path, manifest.to_dict())
-    if args.report_only:
-        print("[phase report] rebuilding report without inference")
-        build_report(output)
-        return 0
-    estimated = sum(info["frame_counts"].values()) * len(DIAGNOSTIC_PROFILES) * 2048
-    print(f"[phase preflight] 4 sequential profiles, {sum(info['frame_counts'].values())} frames, metrics estimate {estimated / 2**20:.1f} MiB")
+    print(
+        f"[phase preflight] 4 sequential profiles, {sum(info['frame_counts'].values())} frames; "
+        f"projected total {projection['total'] / 2**30:.2f} GiB "
+        f"(pass2 {projection['pass2_dense'] / 2**30:.2f} GiB, "
+        f"cases/report {projection['cases_and_report'] / 2**30:.2f} GiB); "
+        f"budget state={projected_state.level}"
+    )
     if args.dry_run:
         manifest.status = "dry_run"
         atomic_write_json(manifest_path, manifest.to_dict())
         print("[phase dry-run] no model inference executed")
         return 0
     lock = RunLock(output / ".diagnostic.lock", manifest.run_id)
-    with lock:
+    with _termination_as_interrupt(), lock:
         budget = StorageBudget(args.temp_root, max_gib=args.max_temp_gib, warn_gib=args.warn_temp_gib, min_free_gib=args.min_free_gib)
+        run_temp = Path(args.temp_root) / manifest.run_id
+        if run_temp.exists():
+            marker = run_temp / OWNER_FILE
+            try:
+                owner = json.loads(marker.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError) as exc:
+                raise PermissionError(f"Cannot verify diagnostic temp ownership: {run_temp}") from exc
+            if owner.get("run_id") != manifest.run_id:
+                raise PermissionError(f"Cannot verify diagnostic temp ownership: {run_temp}")
+        else:
+            run_temp.mkdir(parents=True)
+            atomic_write_json(run_temp / OWNER_FILE, {"run_id": manifest.run_id})
+
+        def enforce_budget():
+            state = budget.enforce()
+            if state.level == "warning":
+                print(
+                    f"[storage warning] projected temporary use "
+                    f"{state.projected_bytes / 2**30:.2f} GiB; hard limit "
+                    f"{state.max_bytes / 2**30:.2f} GiB"
+                )
+            return state
+
+        def config_complete(pass_id, config, sequences, selected=()):
+            failures = []
+            for sequence in sequences:
+                valid, reason = _validate_sequence_checkpoint(
+                    output,
+                    output / "checkpoints" / f"pass{pass_id}" / config / f"{sequence}.json",
+                    run_id=manifest.run_id,
+                    config_id=config,
+                    sequence_id=sequence,
+                    pass_id=pass_id,
+                    checkpoint_hash=info["checkpoint_sha256"],
+                    expected_frames=info["frame_counts"][sequence],
+                    window_size=args.window_size,
+                    selected_intervals=selected,
+                    implementation_fingerprint=manifest.git_commit,
+                    config_hash=manifest.config_hash,
+                    dataset_hash=manifest.dataset_fingerprint,
+                )
+                if not valid:
+                    failures.append(f"{sequence}:{reason}")
+            return not failures, failures
         try:
             for index, config in enumerate(DIAGNOSTIC_PROFILES, 1):
-                if _phase_done(manifest, "pass1", config):
+                pass1_valid, pass1_failures = config_complete(1, config, args.sequences)
+                if _phase_done(manifest, "pass1", config) and pass1_valid:
                     print(f"[phase pass1 {index}/4] {config}: resume skip")
                     continue
+                if _phase_done(manifest, "pass1", config) and not pass1_valid:
+                    print(f"[phase pass1 {index}/4] {config}: invalid resume state ({'; '.join(pass1_failures)}); rerunning")
                 print(f"[phase pass1 {index}/4] {config}: starting")
-                budget.enforce()
+                enforce_budget()
                 runner(_worker_command(args, pass_id=1, config_id=config, run_id=manifest.run_id), check=True)
+                pass1_valid, pass1_failures = config_complete(1, config, args.sequences)
+                if not pass1_valid:
+                    raise RuntimeError(
+                        f"Pass 1 artifact verification failed for {config}: "
+                        + "; ".join(pass1_failures)
+                    )
+                for sequence in args.sequences:
+                    manifest.mark("pass1", config, sequence, "complete")
                 manifest.mark("pass1", config, "*", "complete")
                 atomic_write_json(manifest_path, manifest.to_dict())
             trajectory = _read_trajectory_results(output)
+            invalid_results = [
+                f"{config}/{sequence}"
+                for config in DIAGNOSTIC_PROFILES
+                for sequence in args.sequences
+                if not trajectory.get(config, {}).get(sequence, {}).get("valid", False)
+            ]
+            if invalid_results:
+                raise RuntimeError(
+                    "Pass 1 trajectory verification failed for: "
+                    + ", ".join(invalid_results)
+                )
             summary = build_sequence_summary(trajectory)
             layer_ates = {seq: value["ate_rmse"] for seq, value in trajectory.get("layer_atomic", {}).items() if value.get("valid")}
-            summary["stability_guard"] = evaluate_stability_guard(layer_ates, layer_ates) if layer_ates else {"passed": False, "failure_reasons": ["missing_layer_atomic"]}
+            summary["stability_guard"] = evaluate_stability_guard(
+                layer_ates,
+                layer_ates,
+                expected_sequences=args.sequences,
+            ) if layer_ates else {"passed": False, "failure_reasons": ["missing_layer_atomic"]}
             summary["sequence_metrics"] = trajectory
             summary["recovery"] = summary.get("recovery_gap", {})
             atomic_write_json(output / "summary.json", summary)
             records = build_selection_records(output, trajectory, args)
             atomic_write_json(output / "selection_records.json", records)
             intervals = select_intervals(records, limit=args.max_selected)
+            intervals = [
+                SelectedInterval(
+                    item.sequence_id,
+                    min(item.start_frame, info["frame_counts"][item.sequence_id] - 1),
+                    min(item.end_frame, info["frame_counts"][item.sequence_id] - 1),
+                    item.reasons,
+                    item.score,
+                )
+                for item in intervals
+            ]
             selected_path = output / "selected_intervals.json"
             atomic_write_json(selected_path, [item.to_dict() for item in intervals])
             selected_sequences = sorted({item.sequence_id for item in intervals})
             pass2_args = argparse.Namespace(**vars(args)); pass2_args.sequences = selected_sequences
             for index, config in enumerate(DIAGNOSTIC_PROFILES, 1):
-                if not selected_sequences or _phase_done(manifest, "pass2", config):
+                pass2_valid, pass2_failures = config_complete(
+                    2, config, selected_sequences, intervals
+                ) if selected_sequences else (True, [])
+                if not selected_sequences or (_phase_done(manifest, "pass2", config) and pass2_valid):
                     continue
+                if _phase_done(manifest, "pass2", config) and not pass2_valid:
+                    print(f"[phase pass2 {index}/4] {config}: invalid resume state ({'; '.join(pass2_failures)}); rerunning")
                 print(f"[phase pass2 {index}/4] {config}: full rerun of {','.join(selected_sequences)}; dense writes selected only")
-                budget.enforce()
+                enforce_budget()
                 runner(_worker_command(pass2_args, pass_id=2, config_id=config, run_id=manifest.run_id, selected=selected_path), check=True)
+                pass2_valid, pass2_failures = config_complete(
+                    2, config, selected_sequences, intervals
+                )
+                if not pass2_valid:
+                    raise RuntimeError(
+                        f"Pass 2 artifact verification failed for {config}: "
+                        + "; ".join(pass2_failures)
+                    )
+                for sequence in selected_sequences:
+                    manifest.mark("pass2", config, sequence, "complete")
                 manifest.mark("pass2", config, "*", "complete")
                 atomic_write_json(manifest_path, manifest.to_dict())
             print("[phase verify] rendering selected cases")
-            build_cases(output, intervals, records, args)
+            build_cases(output, intervals, records, args, budget=output_budget)
+            incomplete_cases = []
+            for item in intervals:
+                root = output / "cases" / item.sequence_id / f"{item.start_frame:06d}-{item.end_frame:06d}"
+                required = [root / "trace.npz", root / "artifact-manifest.json", root / "metrics.json"]
+                required.extend(root / config / "rendering.json" for config in DIAGNOSTIC_PROFILES)
+                if any(not path.is_file() for path in required):
+                    incomplete_cases.append(f"{item.sequence_id}/{item.start_frame}-{item.end_frame}")
+            if incomplete_cases:
+                raise RuntimeError("Selected case verification failed for: " + ", ".join(incomplete_cases))
+            print("[phase cleanup] removing run-owned metrics-only engine cache")
+            if run_temp.exists():
+                cleanup_owned_directory(run_temp, manifest.run_id)
             manifest.status = "complete"
             atomic_write_json(manifest_path, manifest.to_dict())
             print("[phase report] building offline HTML/CSV report")
+            output_budget.enforce(
+                estimated_bytes=min(50 * 1024 * 1024, output_budget.max_bytes // 20)
+            )
             build_report(output)
+            output_budget.enforce()
             print(f"[phase complete] report: {output / 'report' / 'index.html'}")
             return 0
         except BaseException:
@@ -363,16 +811,70 @@ def run_worker(args) -> int:
     manifest = json.loads((Path(args.output_dir) / "manifest.json").read_text())
     if expected != manifest["checkpoint_sha256"]:
         raise ValueError("worker checkpoint SHA-256 differs from manifest")
+    run_temp = Path(args.temp_root) / args.run_id
+    try:
+        temp_owner = json.loads((run_temp / OWNER_FILE).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise PermissionError(f"Cannot verify diagnostic temp ownership: {run_temp}") from exc
+    if temp_owner.get("run_id") != args.run_id:
+        raise PermissionError(f"Cannot verify diagnostic temp ownership: {run_temp}")
     profile = DIAGNOSTIC_PROFILES[args.config_id]
     selected = []
     if args.selected_intervals:
         selected = [SelectedInterval.from_dict(item) for item in json.loads(Path(args.selected_intervals).read_text())]
-    artifact_root = Path(args.output_dir) / "artifacts"
+    output_root = Path(args.output_dir)
+    artifact_root = output_root / "artifacts"
+    checkpoint_root = output_root / "checkpoints" / f"pass{args.pass_id}" / args.config_id
+    trajectory_root = output_root / "trajectory"
+    if args.pass_id != 1:
+        trajectory_root = trajectory_root / f"pass{args.pass_id}"
+
+    def sequence_checkpoint(sequence):
+        return checkpoint_root / f"{sequence}.json"
+
+    def is_sequence_complete(sequence):
+        valid, _ = _validate_sequence_checkpoint(
+            output_root,
+            sequence_checkpoint(sequence),
+            run_id=args.run_id,
+            config_id=args.config_id,
+            sequence_id=sequence,
+            pass_id=args.pass_id,
+            checkpoint_hash=expected,
+            expected_frames=int(manifest["budget"]["frame_counts"][sequence]),
+            window_size=args.window_size,
+            selected_intervals=selected,
+            implementation_fingerprint=manifest.get("git_commit"),
+            config_hash=manifest.get("config_hash"),
+            dataset_hash=manifest.get("dataset_fingerprint"),
+        )
+        return valid
+
+    pending_sequences = []
+    for sequence in args.sequences:
+        if is_sequence_complete(sequence):
+            print(f"[worker pass{args.pass_id}] {args.config_id}/{sequence}: resume skip")
+            continue
+        # Remove only this run's incomplete sequence/pass shards before retrying,
+        # so JSONL records cannot be duplicated across resumes.
+        shutil.rmtree(
+            artifact_root / args.config_id / sequence / f"pass{args.pass_id}",
+            ignore_errors=True,
+        )
+        target = trajectory_root / args.config_id
+        (target / f"{sequence}.json").unlink(missing_ok=True)
+        (target / f"{sequence}.npz").unlink(missing_ok=True)
+        sequence_checkpoint(sequence).unlink(missing_ok=True)
+        pending_sequences.append(sequence)
+    if not pending_sequences:
+        return 0
+
     artifact_budget = StorageBudget(Path(args.output_dir), max_gib=args.max_temp_gib, warn_gib=args.warn_temp_gib, min_free_gib=args.min_free_gib)
+    temp_budget = StorageBudget(Path(args.temp_root), max_gib=args.max_temp_gib, warn_gib=args.warn_temp_gib, min_free_gib=args.min_free_gib)
     sink = FileDiagnosticSink(artifact_root, selected_intervals=selected, budget=artifact_budget)
     model = _load_model(Path(args.model_ckpt), device)
     try:
-        for sequence in args.sequences:
+        for sequence in pending_sequences:
             print(f"[worker pass{args.pass_id}] {args.config_id}/{sequence}")
             image_dir = Path(args.dataset_root) / "sequences" / sequence / "image_2"
             image_paths = sorted(str(path) for path in image_dir.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg"})
@@ -387,20 +889,55 @@ def run_worker(args) -> int:
                 diagnostic_sink=sink, diagnostic_run_id=args.run_id,
                 diagnostic_sequence_id=sequence, diagnostic_pass=args.pass_id,
                 cache_policy="metrics-only",
+                storage_budget=temp_budget,
             )
             engine.begin()
             for window in engine.img_sliding_window(image_paths):
-                engine(load_and_preprocess_images(window).to(device))
+                # Keep the producer/queue CPU-resident.  The inference worker
+                # performs the sole upload, avoiding a GPU->CPU->GPU round trip.
+                engine(load_and_preprocess_images(window))
             engine.end()
             poses = engine.parse_pose_cache_summary()["extrinsic"][0].cpu().numpy()
+            if len(poses) != len(image_paths):
+                raise RuntimeError(
+                    f"Inference produced {len(poses)} poses for {len(image_paths)} images "
+                    f"in sequence {sequence}; a worker thread may have failed."
+                )
             gt = _load_kitti_poses(Path(args.dataset_root) / "poses" / f"{sequence}.txt")
             evaluation = evaluate_trajectory(poses, gt)
             aligned = evaluation.pop("aligned_poses", None)
-            target_root = Path(args.output_dir) / "trajectory"
-            if args.pass_id != 1: target_root = target_root / f"pass{args.pass_id}"
-            target = target_root / args.config_id; target.mkdir(parents=True, exist_ok=True)
+            target = trajectory_root / args.config_id; target.mkdir(parents=True, exist_ok=True)
             atomic_write_json(target / f"{sequence}.json", evaluation)
-            np.savez_compressed(target / f"{sequence}.npz", predicted=poses, ground_truth=gt[:len(poses)], aligned=np.asarray(aligned) if aligned is not None else np.empty(0))
+            artifact_budget.enforce(
+                estimated_bytes=int(poses.nbytes + gt[:len(poses)].nbytes + (np.asarray(aligned).nbytes if aligned is not None else 0) + 4096)
+            )
+            atomic_write_npz(
+                target / f"{sequence}.npz",
+                predicted=poses,
+                ground_truth=gt[:len(poses)],
+                aligned=np.asarray(aligned) if aligned is not None else np.empty(0),
+            )
+            artifact_budget.enforce()
+            shard_root = artifact_root / args.config_id / sequence / f"pass{args.pass_id}"
+            inventory = _artifact_inventory(
+                output_root,
+                [
+                    target / f"{sequence}.json",
+                    target / f"{sequence}.npz",
+                    shard_root,
+                ],
+            )
+            atomic_write_json(sequence_checkpoint(sequence), {
+                "run_id": args.run_id, "config_id": args.config_id,
+                "sequence_id": sequence, "pass_id": args.pass_id,
+                "frame_count": len(image_paths), "pose_count": len(poses),
+                "checkpoint_sha256": expected,
+                "implementation_fingerprint": manifest.get("git_commit"),
+                "config_hash": manifest.get("config_hash"),
+                "dataset_fingerprint": manifest.get("dataset_fingerprint"),
+                "artifacts": inventory,
+            })
+            sink.refresh_usage()
             shutil.rmtree(cache_root, ignore_errors=True)
     finally:
         sink.close()

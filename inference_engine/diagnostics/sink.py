@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 
 from .schema import DiagnosticContext, SelectedInterval
-from .storage import StorageBudget, append_jsonl
+from .storage import StorageBudget, append_jsonl, directory_size
 
 
 def _json_safe(value: Any) -> Any:
@@ -59,6 +59,7 @@ class FileDiagnosticSink:
         self.budget = budget or StorageBudget(self.root)
         self._lock = threading.Lock()
         self._closed = False
+        self._used_bytes = directory_size(self.budget.root)
 
     def _base(self, context: DiagnosticContext) -> Path:
         return self.root / context.config_id / context.sequence_id / f"pass{context.pass_id}"
@@ -72,10 +73,18 @@ class FileDiagnosticSink:
     def _record(self, context: DiagnosticContext, family: str, metrics: dict[str, Any], **extra: Any) -> None:
         if self._closed:
             raise RuntimeError("diagnostic sink is closed")
-        record = {"context": context.to_dict(), "metrics": _json_safe(metrics), **_json_safe(extra)}
+        context_values = context.to_dict()
+        record = {
+            **context_values,
+            "context": context_values,
+            "metrics": _json_safe(metrics),
+            **_json_safe(extra),
+        }
         encoded_size = len(json.dumps(record, ensure_ascii=False).encode("utf-8")) + 1
-        self.budget.enforce(estimated_bytes=encoded_size)
-        append_jsonl(self._base(context) / f"{family}.jsonl", record)
+        with self._lock:
+            self.budget.enforce(used_bytes=self._used_bytes, estimated_bytes=encoded_size)
+            append_jsonl(self._base(context) / f"{family}.jsonl", record)
+            self._used_bytes += encoded_size
 
     @staticmethod
     def _compact_arrays(arrays: dict[str, Any]) -> dict[str, np.ndarray]:
@@ -97,18 +106,25 @@ class FileDiagnosticSink:
     def _write_npz(self, path: Path, arrays: dict[str, Any]) -> Path:
         compact = self._compact_arrays(arrays)
         estimated = int(sum(value.nbytes for value in compact.values()))
-        self.budget.enforce(estimated_bytes=estimated)
         path.parent.mkdir(parents=True, exist_ok=True)
         partial = path.with_name(path.name + ".partial")
+        previous_size = path.stat().st_size if path.exists() else 0
         try:
-            with self._lock, partial.open("wb") as handle:
-                np.savez_compressed(handle, **compact)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(partial, path)
+            with self._lock:
+                self.budget.enforce(
+                    used_bytes=max(0, self._used_bytes - previous_size),
+                    estimated_bytes=estimated,
+                )
+                with partial.open("wb") as handle:
+                    np.savez_compressed(handle, **compact)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(partial, path)
+                actual_size = path.stat().st_size
+                self._used_bytes += actual_size - previous_size
         finally:
             partial.unlink(missing_ok=True)
-        self.budget.enforce()
+        self.budget.enforce(used_bytes=self._used_bytes)
         return path
 
     def emit_segmentation(self, context, local_index, metrics, arrays=None):
@@ -130,7 +146,8 @@ class FileDiagnosticSink:
 
     def emit_temporal(self, context, metrics, arrays=None):
         self._record(context, "temporal", metrics)
-        if arrays and context.pass_id == 2:
+        frame_count = len(next(iter(arrays.values()))) if arrays else 0
+        if arrays and any(self._selected(context, context.frame_id(index)) for index in range(frame_count)):
             self._write_npz(self._base(context) / "traces" / f"temporal-window-{context.window_id:06d}.npz", arrays)
 
     def emit_inputs(self, context, images, point_maps, confidence):
@@ -146,3 +163,9 @@ class FileDiagnosticSink:
 
     def close(self):
         self._closed = True
+
+    def refresh_usage(self):
+        """Resync accounting after another owned writer adds small artifacts."""
+        with self._lock:
+            self._used_bytes = directory_size(self.budget.root)
+            return self.budget.enforce(used_bytes=self._used_bytes)

@@ -12,11 +12,15 @@ from .schema import SelectedInterval
 
 FAMILIES = {
     "trajectory": "trajectory_regret",
-    "merge_atom": "merge_anomaly",
+    "merge": "merge_anomaly",
+    "immutable_atom": "atom_anomaly",
     "scale": "scale_dispersion",
     "temporal": "temporal_churn",
 }
-WEIGHTS = {"trajectory": .40, "merge_atom": .20, "scale": .25, "temporal": .15}
+WEIGHTS = {
+    "trajectory": .40, "merge": .10, "immutable_atom": .10,
+    "scale": .25, "temporal": .15,
+}
 RECOVERY = {"02", "04", "10"}
 GUARD = {"00", "05", "09"}
 
@@ -35,7 +39,8 @@ def robust_zscore(values: Iterable[float]) -> np.ndarray:
     if mad > 1e-12:
         scale = 1.4826 * mad
     else:
-        scale = np.std(clean)
+        iqr = np.quantile(clean, .75) - np.quantile(clean, .25)
+        scale = iqr / 1.349 if iqr > 1e-12 else np.std(clean)
     if scale > 1e-12:
         result[finite] = (clean - median) / scale
     result[~finite] = 0
@@ -90,10 +95,16 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
     for row in windows:
         by_sequence[row["sequence_id"]].append(row)
     for sequence, rows in by_sequence.items():
-        ordered = sorted(rows, key=lambda row: (-row["trajectory_z"], row["frame_start"]))
+        if sequence in GUARD:
+            # Negative layer_atomic-minus-geometry regret is the stability
+            # success we need to preserve on 00/05/09.
+            ordered = sorted(rows, key=lambda row: (row["trajectory_regret"], row["frame_start"]))
+        else:
+            ordered = sorted(rows, key=lambda row: (-row["trajectory_z"], row["frame_start"]))
         count = 3 if sequence in RECOVERY else 2 if sequence in GUARD else 1
         for row in ordered[:count]:
-            add(row, "trajectory", 3.0 if sequence in RECOVERY | GUARD else 0.0)
+            reason = "guard_success" if sequence in GUARD else "trajectory"
+            add(row, reason, 3.0 if sequence in RECOVERY | GUARD else 0.0)
         # Matched low-anomaly control nearest in speed, turn and confidence to the strongest event.
         anchor = ordered[0]
         median_score = np.median([row["score"] for row in rows])
@@ -116,15 +127,19 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
     expanded = []
     for item in candidates.values():
         stride = _stride(by_sequence[item["sequence_id"]])
+        is_control = "control" in item["reasons"]
         expanded.append({
             **item,
-            "start": max(0, item["frame_start"] - context_windows * stride),
-            "end": item["frame_end"] + context_windows * stride,
+            "start": item["frame_start"] if is_control else max(0, item["frame_start"] - context_windows * stride),
+            "end": item["frame_end"] if is_control else item["frame_end"] + context_windows * stride,
             "stride": stride,
         })
     expanded.sort(key=lambda item: (item["sequence_id"], item["start"], item["end"]))
     merged_intervals: list[dict] = []
-    for item in expanded:
+    # Controls remain distinct comparison cases even when their context overlaps
+    # an anomaly interval.  Anomaly candidates still obey the normal merge rule.
+    controls = [item for item in expanded if "control" in item["reasons"]]
+    for item in (item for item in expanded if "control" not in item["reasons"]):
         if merged_intervals and item["sequence_id"] == merged_intervals[-1]["sequence_id"] and item["start"] <= merged_intervals[-1]["end"] + item["stride"]:
             current = merged_intervals[-1]
             current["end"] = max(current["end"], item["end"])
@@ -132,11 +147,63 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
             current["priority"] = max(current["priority"], item["priority"])
         else:
             merged_intervals.append({**item, "reasons": set(item["reasons"])})
+    merged_intervals.extend({**item, "reasons": set(item["reasons"])} for item in controls)
 
-    # Mandatory sequence coverage first, followed by the strongest remaining anomalies.
+    # Reserve mandatory sequence, signal-family, and control coverage before
+    # filling the remaining weighted-ranking slots.
     mandatory = RECOVERY | GUARD
-    ranked = sorted(merged_intervals, key=lambda item: (-(item["sequence_id"] in mandatory), -item["priority"], item["sequence_id"], item["start"]))
-    chosen = ranked[:limit]
+    ranked = sorted(
+        merged_intervals,
+        key=lambda item: (-item["priority"], item["sequence_id"], item["start"]),
+    )
+    chosen: list[dict] = []
+    chosen_ids: set[tuple[str, int, int]] = set()
+    def reserve(items, count=1):
+        if count <= 0:
+            return 0
+        added = 0
+        for item in items:
+            identity = (item["sequence_id"], item["start"], item["end"])
+            if identity not in chosen_ids and len(chosen) < limit:
+                chosen.append(item); chosen_ids.add(identity)
+                added += 1
+                if added == count:
+                    break
+        return added
+    for sequence in sorted(mandatory):
+        reserve(
+            item for item in ranked
+            if item["sequence_id"] == sequence and "control" not in item["reasons"]
+        )
+        reserve(
+            item for item in ranked
+            if item["sequence_id"] == sequence and "control" in item["reasons"]
+        )
+    for reason in ("merge", "immutable_atom", "scale", "temporal"):
+        already = sum(reason in item["reasons"] for item in chosen)
+        reserve((item for item in ranked if reason in item["reasons"]), max(0, 2 - already))
+    for item in ranked:
+        identity = (item["sequence_id"], item["start"], item["end"])
+        if identity not in chosen_ids and len(chosen) < limit:
+            chosen.append(item); chosen_ids.add(identity)
+    missing = []
+    for sequence in sorted(mandatory & set(by_sequence)):
+        sequence_items = [item for item in chosen if item["sequence_id"] == sequence]
+        if not any("control" not in item["reasons"] for item in sequence_items):
+            missing.append(f"{sequence}:event")
+        if not any("control" in item["reasons"] for item in sequence_items):
+            missing.append(f"{sequence}:control")
+    for reason in ("merge", "immutable_atom", "scale", "temporal"):
+        available = sum(reason in item["reasons"] for item in ranked)
+        required = min(2, available)
+        actual = sum(reason in item["reasons"] for item in chosen)
+        if actual < required:
+            missing.append(f"{reason}:{actual}/{required}")
+    if missing:
+        raise ValueError(
+            f"interval limit {limit} cannot satisfy mandatory diagnostic diversity: "
+            + ", ".join(missing)
+        )
     chosen.sort(key=lambda item: (item["sequence_id"], item["start"]))
     return [
         SelectedInterval(

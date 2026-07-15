@@ -39,6 +39,8 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             diagnostic_pass: int = 0,
             cache_policy: str = "full",
     ):
+        if cache_policy != "full":
+            raise ValueError("StreamingWindowEngineLC supports only cache_policy='full'")
         super().__init__(
             delegate=delegate.to(inference_device),
             inference_device=inference_device,

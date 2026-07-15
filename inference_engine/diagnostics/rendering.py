@@ -31,7 +31,9 @@ def _write_png(path: Path, rgb: np.ndarray) -> Path:
     ok, encoded = cv2.imencode(".png", cv2.cvtColor(image, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_PNG_COMPRESSION, 6])
     if not ok:
         raise RuntimeError(f"failed to encode {path}")
-    path.write_bytes(encoded.tobytes())
+    partial = path.with_name(path.name + ".partial")
+    partial.write_bytes(encoded.tobytes())
+    partial.replace(path)
     return path
 
 
@@ -70,6 +72,18 @@ def _boundary(labels: np.ndarray) -> np.ndarray:
     result[:, :-1] |= right; result[:, 1:] |= right
     result[:-1] |= down; result[1:] |= down
     return result
+
+
+def _unavailable(shape: tuple[int, int], label: str) -> np.ndarray:
+    canvas = np.full((*shape, 3), 225, dtype=np.uint8)
+    cv2.line(canvas, (0, 0), (shape[1] - 1, shape[0] - 1), (160, 160, 160), 3)
+    cv2.line(canvas, (shape[1] - 1, 0), (0, shape[0] - 1), (160, 160, 160), 3)
+    text = f"UNAVAILABLE: {label}"
+    cv2.putText(
+        canvas, text, (12, max(28, shape[0] // 2)),
+        cv2.FONT_HERSHEY_SIMPLEX, .55, (65, 65, 65), 2, cv2.LINE_AA,
+    )
+    return canvas
 
 
 def _load_traces(trace_paths) -> dict[str, np.ndarray]:
@@ -132,61 +146,136 @@ def write_segment_ply(point_map: np.ndarray, labels: np.ndarray, path: str | Pat
         for point, color in zip(points, colors, strict=True)
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    partial.replace(path)
     return path
 
 
-def render_case(trace_paths, output_dir: str | Path) -> dict[str, Path]:
+def render_case(trace_paths, output_dir: str | Path, *, frame_index: int = 0) -> dict[str, Path]:
     arrays = _load_traces(trace_paths)
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
-    labels = np.asarray(arrays.get("final_labels", arrays.get("coarse_labels")))
+    required = ("final_labels", "initial_labels", "coarse_labels", "rgb", "point_map", "confidence")
+    missing_required = [name for name in required if name not in arrays]
+    if missing_required:
+        raise ValueError("Missing required rendering arrays: " + ", ".join(missing_required))
+    labels = np.asarray(arrays["final_labels"])
     if labels.ndim == 3:
-        labels = labels[0]
-    if "point_map" in arrays:
-        point_map = np.asarray(arrays["point_map"])
-    else:
-        grid_y, grid_x = np.mgrid[:labels.shape[0], :labels.shape[1]]
-        point_map = np.stack([grid_x, grid_y, np.ones(labels.shape)], axis=-1)
+        labels = labels[min(max(frame_index, 0), len(labels) - 1)]
+    point_map = np.asarray(arrays["point_map"])
     if point_map.ndim == 4:
-        point_map = point_map[0]
-    rgb = _normalize_rgb(arrays.get("rgb", _palette(labels)))
+        point_map = point_map[min(max(frame_index, 0), len(point_map) - 1)]
+    rgb = _normalize_rgb(arrays["rgb"])
     depth = point_map[..., -1]
-    confidence = np.asarray(arrays.get("confidence", np.ones(labels.shape)))
+    confidence = np.asarray(arrays["confidence"])
     if confidence.ndim == 3:
-        confidence = confidence[0]
-    initial = np.asarray(arrays.get("initial_labels", labels)); initial = initial[0] if initial.ndim == 3 else initial
-    coarse = np.asarray(arrays.get("coarse_labels", labels)); coarse = coarse[0] if coarse.ndim == 3 else coarse
-    source = np.asarray(arrays.get("source_map", np.zeros(labels.shape, np.uint8))); source = source[0] if source.ndim == 3 else source
-    scale = np.asarray(arrays.get("scale_map", np.ones(labels.shape))); scale = scale[0] if scale.ndim == 3 else scale
-    dispersion = np.asarray(arrays.get("dispersion_map", np.zeros(labels.shape))); dispersion = dispersion[0] if dispersion.ndim == 3 else dispersion
+        confidence = confidence[min(max(frame_index, 0), len(confidence) - 1)]
+    def select_frame(value):
+        value = np.asarray(value)
+        return value[min(max(frame_index, 0), len(value) - 1)] if value.ndim == 3 else value
+    initial = select_frame(arrays["initial_labels"])
+    coarse = select_frame(arrays["coarse_labels"])
+    availability = {name: name in arrays for name in (
+        "merge_decision", "component_growth_map", "source_map", "scale_map",
+        "dispersion_map", "propagation_hop_map", "temporal_best_iou_map",
+    )}
     legends = {}
     depth_rgb, legends["depth"] = _heatmap(depth)
     conf_rgb, legends["confidence"] = _heatmap(confidence)
-    scale_rgb, legends["scale"] = _heatmap(np.log(np.maximum(scale, 1e-9)))
-    dispersion_rgb, legends["dispersion"] = _heatmap(dispersion)
-    decision = np.asarray(arrays.get("merge_decision", _boundary(coarse).astype(np.uint8)))
-    if decision.ndim == 3: decision = decision[0]
-    merge_rgb = _normalize_rgb(rgb)
-    merge_rgb[decision > 0] = [255, 55, 45]
-    atom_counts = {int(segment): np.unique(initial[labels == segment]).size for segment in np.unique(labels)}
-    growth = np.zeros(labels.shape, dtype=float)
-    for segment, count in atom_counts.items(): growth[labels == segment] = count
-    growth_rgb, legends["growth"] = _heatmap(np.log1p(growth))
+    if availability["scale_map"]:
+        scale = select_frame(arrays["scale_map"])
+        scale_rgb, legends["scale"] = _heatmap(np.log(np.maximum(scale, 1e-9)))
+    else:
+        scale_rgb = _unavailable(labels.shape, "scale_map")
+    if availability["dispersion_map"]:
+        dispersion = select_frame(arrays["dispersion_map"])
+        dispersion_rgb, legends["dispersion"] = _heatmap(dispersion)
+    else:
+        dispersion_rgb = _unavailable(labels.shape, "dispersion_map")
+    merge_rgb = _unavailable(labels.shape, "merge_decision")
+    decision_colors = np.asarray([
+        [0, 0, 0],       # not a boundary
+        [20, 190, 110],  # accepted, same coarse
+        [18, 130, 220],  # accepted, cross coarse
+        [245, 175, 35],  # rejected, same coarse
+        [235, 65, 65],   # rejected, cross coarse
+        [145, 151, 160], # invalid geometry
+    ], dtype=np.uint8)
+    if availability["merge_decision"]:
+        decision = np.asarray(arrays["merge_decision"])
+        if decision.ndim == 3: decision = decision[min(max(frame_index, 0), len(decision) - 1)]
+        merge_rgb = _normalize_rgb(rgb)
+        for code in range(1, len(decision_colors)):
+            merge_rgb[decision == code] = decision_colors[code]
+    if availability["component_growth_map"]:
+        growth = np.asarray(arrays["component_growth_map"], dtype=float)
+        if growth.ndim == 3: growth = growth[min(max(frame_index, 0), len(growth) - 1)]
+        growth_rgb, legends["growth"] = _heatmap(np.log1p(growth))
+    else:
+        growth_rgb = _unavailable(labels.shape, "component_growth_map")
     source_colors = np.asarray([[145, 151, 160], [18, 158, 140], [124, 77, 190]], dtype=np.uint8)
-    source_rgb = source_colors[np.clip(source.astype(int), 0, 2)]
-    temporal_rgb = _palette(labels)
-    temporal_rgb[_boundary(labels)] = [255, 255, 255]
+    if availability["source_map"]:
+        source = select_frame(arrays["source_map"])
+        source_rgb = source_colors[np.clip(source.astype(int), 0, 2)]
+    else:
+        source_rgb = _unavailable(labels.shape, "source_map")
+    if availability["propagation_hop_map"]:
+        hops = select_frame(arrays["propagation_hop_map"])
+        hop_rgb, legends["propagation_hops"] = _heatmap(np.where(hops >= 0, hops, np.nan))
+        hop_rgb[hops < 0] = [145, 151, 160]
+    else:
+        hop_rgb = _unavailable(labels.shape, "propagation_hop_map")
+    if availability["temporal_best_iou_map"]:
+        temporal_values = np.asarray(arrays["temporal_best_iou_map"])
+        if temporal_values.ndim == 3: temporal_values = temporal_values[min(max(frame_index, 0), len(temporal_values) - 1)]
+        temporal_rgb, legends["temporal_iou"] = _heatmap(temporal_values)
+    else:
+        temporal_rgb = _unavailable(labels.shape, "temporal_best_iou_map")
     images = {
         "rgb": rgb, "depth": depth_rgb, "confidence": conf_rgb,
         "initial_atoms": _palette(initial), "coarse_layers": _palette(coarse),
         "final_segments": _palette(labels), "merge_decisions": merge_rgb,
         "component_growth": growth_rgb, "scale_source": source_rgb,
         "scale_map": scale_rgb, "scale_dispersion": dispersion_rgb,
+        "propagation_hops": hop_rgb,
         "temporal": temporal_rgb,
         "pointcloud_top": _project_points(point_map, labels, (0, 2)),
         "pointcloud_side": _project_points(point_map, labels, (2, 1)),
     }
     result = {name: _write_png(output / f"{name}.png", image) for name, image in images.items()}
     write_segment_ply(point_map, labels, output / "segments.ply")
-    atomic_write_json(output / "rendering.json", {"legends": legends, "artifacts": {name: path.name for name, path in result.items()}})
+    atomic_write_json(output / "rendering.json", {
+        "legends": legends,
+        "availability": availability,
+        "artifacts": {name: path.name for name, path in result.items()},
+    })
+    return result
+
+
+def render_method_comparison(
+    left_labels: np.ndarray,
+    right_labels: np.ndarray,
+    output_dir: str | Path,
+    *,
+    left_scale: np.ndarray | None = None,
+    right_scale: np.ndarray | None = None,
+) -> dict[str, Path]:
+    """Render partition disagreement and optional log scale ratio."""
+    output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
+    left = np.asarray(left_labels); right = np.asarray(right_labels)
+    if left.shape != right.shape:
+        raise ValueError("comparison label shapes differ")
+    left_boundary = _boundary(left); right_boundary = _boundary(right)
+    image = np.full((*left.shape, 3), 242, dtype=np.uint8)
+    image[left_boundary & right_boundary] = [35, 160, 120]
+    image[left_boundary & ~right_boundary] = [124, 77, 190]
+    image[~left_boundary & right_boundary] = [235, 80, 65]
+    result = {"segmentation_disagreement": _write_png(output / "segmentation_disagreement.png", image)}
+    if left_scale is not None and right_scale is not None:
+        left_scale = np.asarray(left_scale); right_scale = np.asarray(right_scale)
+        if left_scale.shape == right_scale.shape:
+            ratio = np.log(np.maximum(left_scale, 1e-9) / np.maximum(right_scale, 1e-9))
+            ratio_rgb, legend = _heatmap(ratio)
+            result["scale_log_ratio"] = _write_png(output / "scale_log_ratio.png", ratio_rgb)
+            atomic_write_json(output / "comparison-rendering.json", {"scale_log_ratio": legend})
     return result

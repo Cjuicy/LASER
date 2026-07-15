@@ -1,7 +1,9 @@
 import json
+import socket
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 from inference_engine.diagnostics.schema import (
     SCHEMA_VERSION,
@@ -17,6 +19,7 @@ from inference_engine.diagnostics.storage import (
     StorageLimitExceeded,
     append_jsonl,
     atomic_write_json,
+    atomic_write_npz,
     cleanup_owned_directory,
     owned_temp_directory,
 )
@@ -97,6 +100,11 @@ def test_atomic_json_and_jsonl_are_readable(tmp_path):
         {"frame": 2, "value": None},
     ]
 
+    npz_path = atomic_write_npz(tmp_path / "trace.npz", values=np.arange(5))
+    with np.load(npz_path) as data:
+        np.testing.assert_array_equal(data["values"], np.arange(5))
+    assert not (tmp_path / "trace.npz.partial").exists()
+
 
 def test_run_lock_is_exclusive_and_reusable(tmp_path):
     lock_path = tmp_path / "run.lock"
@@ -110,6 +118,21 @@ def test_run_lock_is_exclusive_and_reusable(tmp_path):
     with RunLock(lock_path, run_id="run-2"):
         assert lock_path.exists()
     assert not lock_path.exists()
+
+
+def test_run_lock_recovers_only_same_run_same_host_dead_pid(tmp_path):
+    lock_path = tmp_path / "run.lock"
+    lock_path.write_text(json.dumps({
+        "run_id": "run-1", "pid": 999_999_999, "hostname": socket.gethostname(),
+    }))
+    with RunLock(lock_path, run_id="run-1"):
+        assert lock_path.exists()
+
+    lock_path.write_text(json.dumps({
+        "run_id": "other", "pid": 999_999_999, "hostname": socket.gethostname(),
+    }))
+    with pytest.raises(RunLockError):
+        RunLock(lock_path, run_id="run-1").acquire()
 
 
 def test_owned_temp_cleanup_requires_matching_marker(tmp_path):

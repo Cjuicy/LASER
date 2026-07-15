@@ -62,6 +62,7 @@ def main(argv=None) -> int:
                 "config_id": "layer_atomic", "sequence_id": sequence,
                 "window_id": window, "frame_start": window * 5, "frame_end": window * 5 + 9,
                 "trajectory_regret": spike, "merge_anomaly": spike * .8,
+                "atom_anomaly": spike * .7,
                 "scale_dispersion": spike * .6, "temporal_churn": spike * .4,
                 "gt_speed": window + 1, "gt_turn": .1 * window, "confidence": .9,
             })
@@ -69,7 +70,7 @@ def main(argv=None) -> int:
     assert selected and any(item.sequence_id == "02" for item in selected)
     _pass("selection")
 
-    selected_case = SelectedInterval("02", 0, 20, ("trajectory", "merge_atom", "scale", "temporal"), 8.0)
+    selected_case = SelectedInterval("02", 0, 20, ("trajectory", "merge", "immutable_atom", "scale", "temporal"), 8.0)
     context2 = DiagnosticContext("synthetic", "layer_atomic", "02", 2, 0, 0)
     sink2 = FileDiagnosticSink(output / "artifacts", selected_intervals=[selected_case], budget=budget)
     rgb = np.zeros((1, 4, 6, 3), dtype=np.float32)

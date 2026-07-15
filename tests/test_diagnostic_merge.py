@@ -39,6 +39,8 @@ def test_atomic_analyzer_matches_formal_labels_and_records_decisions():
     assert trace.metrics["normalized_gap_quantiles"]["p50"] is not None
     assert trace.metrics["boundary_gap_quantiles"]["p95"] is not None
     assert trace.metrics["normal_angle_quantiles_deg"]["p50"] is not None
+    assert set(np.unique(trace.decision_map)) >= {0, 1, 4}
+    assert trace.component_growth_map.max() == 2
 
 
 def test_atomic_analyzer_identifies_degenerate_scale_pairs():

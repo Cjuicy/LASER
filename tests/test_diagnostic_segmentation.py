@@ -5,7 +5,9 @@ import numpy as np
 from inference_engine.diagnostics.segmentation import (
     compare_labelings,
     summarize_labels,
+    trace_segmentation_frame,
 )
+from inference_engine.utils.depth import segment_depth_felzenszwalb_rag
 
 
 def test_label_summary_reports_area_boundaries_entropy_and_atom_growth():
@@ -57,3 +59,18 @@ def test_partition_comparison_rejects_shape_mismatch_without_sentinel_numbers():
     assert result["valid"] is False
     assert result["variation_of_information"] is None
     assert result["invalid_reason"] == "shape_mismatch"
+
+
+def test_depth_trace_handles_single_frame_confidence_with_batch_equivalent_semantics():
+    depth = np.linspace(1, 3, 36).reshape(6, 6)
+    points = np.stack(np.meshgrid(np.arange(6), np.arange(6), indexing="xy") + [depth], axis=-1)
+    confidence = np.linspace(0, 1, 36).reshape(6, 6)
+    formal = segment_depth_felzenszwalb_rag(
+        depth, .1, confidence[None], .5, seg_scale=2, seg_sigma=0,
+        seg_min_size=2, batch_idx=0,
+    )
+    trace = trace_segmentation_frame(
+        points, formal, segment_mode="depth", conf_map=confidence,
+        top_conf_percentile=.5, seg_scale=2, seg_sigma=0, seg_min_size=2,
+    )
+    assert trace["metrics"]["final"]["valid"] is True

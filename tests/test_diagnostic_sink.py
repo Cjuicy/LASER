@@ -26,6 +26,9 @@ def test_pass1_writes_scalar_jsonl_but_no_dense_arrays(tmp_path):
     records = list(tmp_path.rglob("segmentation.jsonl"))
     assert len(records) == 1
     assert json.loads(records[0].read_text().splitlines()[0])["metrics"]["segments"] == 3
+    stored = json.loads(records[0].read_text().splitlines()[0])
+    assert stored["schema_version"] == "1.0"
+    assert stored["run_id"] == "run"
     assert not list(tmp_path.rglob("*.npz"))
 
 

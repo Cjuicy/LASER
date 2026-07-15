@@ -53,6 +53,12 @@ def test_stability_guard_and_recovery_metrics():
     assert guard["passed"] is True
     candidate["00"] *= 1.11
     assert evaluate_stability_guard(candidate, baseline)["passed"] is False
+    missing = dict(baseline); missing.pop("08")
+    expected_guard = evaluate_stability_guard(
+        missing, missing, expected_sequences=tuple(baseline)
+    )
+    assert expected_guard["passed"] is False
+    assert "sequence_08_missing" in expected_guard["failure_reasons"]
 
     assert recovery_score(87.0, 78.0, 69.0)["score"] == 0.5
     assert recovery_score(70.0, 60.0, 75.0)["valid"] is False

@@ -15,6 +15,7 @@ def _records():
                 "window_id": window, "frame_start": window * 5, "frame_end": window * 5 + 9,
                 "trajectory_regret": spike,
                 "merge_anomaly": spike * .8,
+                "atom_anomaly": spike * .7,
                 "scale_dispersion": spike * .6,
                 "temporal_churn": spike * .4,
                 "gt_speed": window + 1, "gt_turn": window * .1, "confidence": .9 - window * .01,
@@ -46,5 +47,5 @@ def test_selector_unions_configs_and_keeps_family_diversity():
     duplicate = [{**row, "config_id": "geometry_baseline"} for row in records]
     selected = select_intervals(records + duplicate, limit=48)
     reasons = {reason for item in selected for reason in item.reasons}
-    assert {"trajectory", "merge_atom", "scale", "temporal", "control"} <= reasons
+    assert {"trajectory", "merge", "immutable_atom", "scale", "temporal", "control"} <= reasons
     assert len(selected) <= 48

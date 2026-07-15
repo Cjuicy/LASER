@@ -28,9 +28,15 @@ def evaluate_stability_guard(
     mean_regression_limit: float = .03,
     median_regression_limit: float = 0.0,
     guard_sequence_limit: float = .10,
+    expected_sequences: tuple[str, ...] | list[str] | None = None,
 ) -> dict:
     sequences = sorted(set(candidate) & set(baseline))
     reasons: list[str] = []
+    if expected_sequences is not None:
+        reasons.extend(
+            f"sequence_{sequence}_missing"
+            for sequence in sorted(set(expected_sequences) - set(candidate))
+        )
     if set(baseline) - set(candidate):
         reasons.append("missing_sequences")
     valid = [seq for seq in sequences if np.isfinite(candidate[seq]) and np.isfinite(baseline[seq]) and baseline[seq] > 0]

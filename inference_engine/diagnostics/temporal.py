@@ -46,3 +46,46 @@ def summarize_temporal_graph(graphs) -> dict:
         "max_segment_lifetime": int(max(lifetimes.values(), default=0)),
         "segment_churn_ratio": float(sum(value == 0 for value in incoming.values()) / len(incoming)) if incoming else None,
     }
+
+
+def trace_temporal_graph(graphs) -> dict:
+    metrics = summarize_temporal_graph(graphs)
+    if not graphs or not graphs[0]:
+        return {"metrics": metrics, "arrays": {}}
+    shape = np.asarray(graphs[0][0].data).shape
+    outgoing_map = np.zeros((len(graphs), *shape), dtype=np.uint16)
+    incoming_map = np.zeros((len(graphs), *shape), dtype=np.uint16)
+    best_iou_map = np.zeros((len(graphs), *shape), dtype=np.float32)
+    lifetime_map = np.ones((len(graphs), *shape), dtype=np.uint16)
+    vertex_location = {
+        id(vertex): (layer_index, vertex)
+        for layer_index, layer in enumerate(graphs)
+        for vertex in layer
+    }
+    incoming = {vertex_id: 0 for vertex_id in vertex_location}
+    lifetime = {vertex_id: 1 for vertex_id in vertex_location}
+    best_incoming = {vertex_id: 0.0 for vertex_id in vertex_location}
+    for layer_index, layer in enumerate(graphs):
+        for vertex in layer:
+            mask = np.asarray(vertex.data, dtype=bool)
+            outgoing_map[layer_index][mask] = len(vertex.connectivity)
+            if vertex.edge_weights:
+                best_iou_map[layer_index][mask] = max(vertex.edge_weights)
+            for target, weight in zip(vertex.connectivity, vertex.edge_weights):
+                incoming[id(target)] = incoming.get(id(target), 0) + 1
+                best_incoming[id(target)] = max(best_incoming.get(id(target), 0.0), float(weight))
+                lifetime[id(target)] = max(lifetime.get(id(target), 1), lifetime[id(vertex)] + 1)
+    for vertex_id, (layer_index, vertex) in vertex_location.items():
+        mask = np.asarray(vertex.data, dtype=bool)
+        incoming_map[layer_index][mask] = incoming.get(vertex_id, 0)
+        lifetime_map[layer_index][mask] = lifetime.get(vertex_id, 1)
+        best_iou_map[layer_index][mask] = max(
+            float(best_iou_map[layer_index][mask][0]) if mask.any() else 0.0,
+            best_incoming.get(vertex_id, 0.0),
+        )
+    return {"metrics": metrics, "arrays": {
+        "temporal_outgoing_degree_map": outgoing_map,
+        "temporal_incoming_degree_map": incoming_map,
+        "temporal_best_iou_map": best_iou_map,
+        "temporal_lifetime_map": lifetime_map,
+    }}

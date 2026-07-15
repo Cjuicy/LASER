@@ -21,6 +21,10 @@ class LayerAtomicMergeTrace:
     metrics: dict[str, Any]
     pair_table: tuple[dict[str, Any], ...]
     events: tuple[dict[str, Any], ...]
+    decision_map: np.ndarray
+    normalized_gap_map: np.ndarray
+    threshold_margin_map: np.ndarray
+    component_growth_map: np.ndarray
 
 
 def _compact(labels: np.ndarray) -> np.ndarray:
@@ -232,6 +236,41 @@ def analyze_layer_atomic_merge(
         })
 
     component_atoms = [int(dsu.atoms[root]) for root in np.unique(roots)]
+    decision_map = np.zeros(atoms.shape, dtype=np.uint8)
+    normalized_gap_map = np.full(atoms.shape, np.nan, dtype=np.float32)
+    threshold_margin_map = np.full(atoms.shape, np.nan, dtype=np.float32)
+    pair_lookup = {int(code): index for index, code in enumerate(unique_codes)}
+    for ys, xs, yt, xt in (
+        (slice(None), slice(None, -1), slice(None), slice(1, None)),
+        (slice(None, -1), slice(None), slice(1, None), slice(None)),
+    ):
+        left_atoms, right_atoms = atoms[ys, xs], atoms[yt, xt]
+        boundary = left_atoms != right_atoms
+        codes_grid = np.minimum(left_atoms, right_atoms) * n_atoms + np.maximum(left_atoms, right_atoms)
+        for code in np.unique(codes_grid[boundary]):
+            pair_index = pair_lookup.get(int(code))
+            if pair_index is None:
+                continue
+            pair_mask = boundary & (codes_grid == code)
+            if not valid_pair[pair_index]:
+                decision_code = 5
+            elif accepted[pair_index] and same[pair_index]:
+                decision_code = 1
+            elif accepted[pair_index]:
+                decision_code = 2
+            elif same[pair_index]:
+                decision_code = 3
+            else:
+                decision_code = 4
+            decision_map[ys, xs][pair_mask] = decision_code
+            decision_map[yt, xt][pair_mask] = decision_code
+            if np.isfinite(normalized[pair_index]):
+                normalized_gap_map[ys, xs][pair_mask] = normalized[pair_index]
+                normalized_gap_map[yt, xt][pair_mask] = normalized[pair_index]
+                margin = limits[pair_index] - normalized[pair_index]
+                threshold_margin_map[ys, xs][pair_mask] = margin
+                threshold_margin_map[yt, xt][pair_mask] = margin
+    component_growth_map = dsu.atoms[roots[atoms]].astype(np.uint32)
     metrics = {
         "candidate_count": int(unique_codes.size), "accepted_count": int(accepted.sum()),
         "same_coarse_candidate_count": int(same.sum()), "same_coarse_accepted_count": int((same & accepted).sum()),
@@ -251,4 +290,7 @@ def analyze_layer_atomic_merge(
         "longest_merge_chain": int(max((event["merge_depth_after"] for event in events), default=0)),
         "merge_onset_events": onset,
     }
-    return LayerAtomicMergeTrace(final, scales, metrics, tuple(pair_table), tuple(events))
+    return LayerAtomicMergeTrace(
+        final, scales, metrics, tuple(pair_table), tuple(events), decision_map,
+        normalized_gap_map, threshold_margin_map, component_growth_map,
+    )

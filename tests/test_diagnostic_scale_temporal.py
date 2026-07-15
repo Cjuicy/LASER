@@ -4,7 +4,7 @@ import numpy as np
 from pi3.utils.graph import Vertex
 
 from inference_engine.diagnostics.scale import summarize_scale_observations
-from inference_engine.diagnostics.temporal import summarize_temporal_graph
+from inference_engine.diagnostics.temporal import summarize_temporal_graph, trace_temporal_graph
 from inference_engine.utils.lsa import align_adjacent_windows_depth_segments
 
 
@@ -25,6 +25,7 @@ def test_scale_summary_classifies_sources_and_dispersion():
     assert result["metrics"]["scale_log_mad_quantiles"]["p50"] is not None
     assert result["arrays"]["source_map"].tolist() == [[[1, 1], [2, 0]]]
     assert result["arrays"]["scale_map"][0, 1, 1] == 1.0
+    assert result["metrics"]["max_propagation_hops"] is None
 
 
 def test_temporal_summary_captures_iou_churn_and_split_merge_events():
@@ -43,6 +44,9 @@ def test_temporal_summary_captures_iou_churn_and_split_merge_events():
     assert summary["matched_area_ratio"] == 1.0
     assert summary["weighted_mean_iou"] == np.mean([.8, .4, .7])
     assert summary["max_segment_lifetime"] == 2
+    dense = trace_temporal_graph([[a, b], [c, d]])
+    assert dense["arrays"]["temporal_outgoing_degree_map"].shape == (2, 2, 2)
+    assert dense["arrays"]["temporal_incoming_degree_map"][1].max() == 2
 
 
 def test_alignment_observer_does_not_change_scale_mask_or_caches():

@@ -152,6 +152,24 @@ def make_sp_graph(
             )
             arrays = dict(trace["arrays"])
             if trace["merge_trace"] is not None:
+                pair_fields = (
+                    "left_atom", "right_atom", "same_coarse", "boundary_edges",
+                    "boundary_gap_mean", "boundary_gap_median", "boundary_gap_p90",
+                    "boundary_gap_p95", "normalized_gap", "limit",
+                    "threshold_margin", "accepted", "normal_angle_deg",
+                    "boundary_local_normalized_gap_median",
+                    "whole_vs_local_scale_mismatch",
+                )
+                arrays["merge_pair_table"] = np.asarray(
+                    [
+                        [
+                            np.nan if pair.get(field) is None else pair.get(field)
+                            for field in pair_fields
+                        ]
+                        for pair in trace["merge_trace"].pair_table
+                    ],
+                    dtype=np.float64,
+                )
                 arrays["merge_events"] = np.asarray(
                     [
                         [
@@ -171,11 +189,13 @@ def make_sp_graph(
             )
     graphs = match_segmentation_seq(labels, iou_thresh=corr_iou_thresh)
     if diagnostic_sink is not None:
-        from inference_engine.diagnostics.temporal import summarize_temporal_graph
+        from inference_engine.diagnostics.temporal import trace_temporal_graph
 
+        temporal_trace = trace_temporal_graph(graphs)
         diagnostic_sink.emit_temporal(
             diagnostic_context,
-            summarize_temporal_graph(graphs),
+            temporal_trace["metrics"],
+            temporal_trace["arrays"],
         )
     return graphs
 

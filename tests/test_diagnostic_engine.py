@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from inference_engine.streaming_window_engine import StreamingWindowEngine
+from inference_engine.streaming_window_engine_lc import StreamingWindowEngineLC
 
 
 def _engine(tmp_path, **kwargs):
@@ -79,3 +80,27 @@ def test_diagnostic_ids_are_required_only_when_sink_is_enabled(tmp_path):
     _engine(tmp_path / "off", diagnostic_pass=0)
     with pytest.raises(ValueError, match="diagnostic_run_id"):
         _engine(tmp_path / "on", diagnostic_sink=object(), diagnostic_pass=1, diagnostic_sequence_id="02")
+
+
+def test_loop_closure_rejects_metrics_only_cache_because_it_needs_full_windows(tmp_path):
+    with pytest.raises(ValueError, match="only cache_policy='full'"):
+        StreamingWindowEngineLC(
+            torch.nn.Identity(), inference_device="cpu", dtype=torch.float32,
+            process_device="cpu", cache_root=str(tmp_path), cache_policy="metrics-only",
+        )
+
+
+def test_background_inference_exception_is_raised_by_end(tmp_path):
+    class FailingDelegate(torch.nn.Module):
+        def forward(self, sample):
+            raise RuntimeError("synthetic worker failure")
+
+    engine = StreamingWindowEngine(
+        FailingDelegate(), inference_device="cpu", dtype=torch.bfloat16,
+        process_device="cpu", cache_root=str(tmp_path), benchmark_latency=False,
+        depth_refine=False,
+    )
+    engine.begin()
+    engine(torch.zeros((1, 3, 2, 2)))
+    with pytest.raises(RuntimeError, match="synthetic worker failure"):
+        engine.end()

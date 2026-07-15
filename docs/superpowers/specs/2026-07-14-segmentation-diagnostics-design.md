@@ -1,8 +1,8 @@
 # LASER 三方法分割诊断与可视化系统设计
 
-**日期：** 2026-07-14  
-**目标分支：** `codex/segmentation-diagnostics`  
-**基线分支：** `codex/unified-segmentation-methods`  
+**日期：** 2026-07-14
+**目标分支：** `codex/segmentation-diagnostics`
+**基线分支：** `codex/unified-segmentation-methods`
 **基线提交：** `98cce5f9f470599aca0cf5a6614f39409d929d58`
 
 ## 1. 目标
@@ -292,7 +292,8 @@ robust z-score 使用 median/MAD；MAD 为零时回退到 IQR，再回退到带 
 - 指标首先聚合到 window；
 - change point 或异常 window 前后各扩展两个窗口；
 - 重叠或相隔不超过一个窗口的候选合并；
-- controls 使用 GT speed、turn magnitude 和 median confidence 的最近邻匹配，并要求
+- controls 使用 GT speed、turn magnitude 和 median confidence 的最近邻匹配，仅保留
+  control 原生窗口（异常案例仍前后扩展两个窗口），并要求
   trajectory regret 和综合异常分数不高于该序列中位数。
 
 ### 8.3 最大数量与多样性

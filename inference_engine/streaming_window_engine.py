@@ -39,6 +39,7 @@ import glob
 from collections import defaultdict
 import time
 import numpy as np
+import traceback
 
 # 项目内部依赖
 from . import VanillaEngine
@@ -88,6 +89,7 @@ class StreamingWindowEngine(VanillaEngine):
             diagnostic_sequence_id: str | None = None,
             diagnostic_pass: int = 0,
             cache_policy: str = "full",
+            storage_budget=None,
     ):
         if cache_policy not in ("full", "metrics-only"):
             raise ValueError("cache_policy must be 'full' or 'metrics-only'")
@@ -147,6 +149,8 @@ class StreamingWindowEngine(VanillaEngine):
         self.diagnostic_sequence_id = diagnostic_sequence_id
         self.diagnostic_pass = diagnostic_pass
         self.cache_policy = cache_policy
+        self.storage_budget = storage_budget
+        self._cache_budget_used = None
 
         segmentation_details = f"mode={segment_mode}"
         if segment_mode == "geometry":
@@ -167,8 +171,10 @@ class StreamingWindowEngine(VanillaEngine):
         self.temp_cache_dir = None
         self.cache_id = 0
         # 7️⃣ 两个线程队列
-        self.inference_queue = queue.Queue()
-        self.registration_queue = queue.Queue()
+        queue_size = 2 if self.diagnostic_sink is not None else 0
+        self.inference_queue = queue.Queue(maxsize=queue_size)
+        self.registration_queue = queue.Queue(maxsize=queue_size)
+        self._worker_errors = queue.Queue()
 
         # 8️⃣ 相邻窗口状态
         self.prev_window_cache = None
@@ -250,6 +256,21 @@ class StreamingWindowEngine(VanillaEngine):
     # 把当前已经完成配准的窗口写入磁盘
     def _save_cache(self):
         destination = self.temp_cache_dir / f'window_cache_{self.cache_id}.pt'
+        estimated_bytes = 0
+        if self.storage_budget is not None:
+            estimated_bytes = int(
+                sum(
+                    value.numel() * value.element_size()
+                    for value in self.prev_window_cache.values()
+                    if isinstance(value, torch.Tensor)
+                    and (self.cache_policy == "full" or value is self.prev_window_cache.get("camera_poses"))
+                )
+                + 4096
+            )
+            self.storage_budget.enforce(
+                used_bytes=self._cache_budget_used,
+                estimated_bytes=estimated_bytes,
+            )
         if self.cache_policy == "full":
             torch.save(self.prev_window_cache, destination)
         else:
@@ -264,6 +285,9 @@ class StreamingWindowEngine(VanillaEngine):
                 os.replace(partial, destination)
             finally:
                 partial.unlink(missing_ok=True)
+        if self.storage_budget is not None:
+            self._cache_budget_used += destination.stat().st_size
+            self.storage_budget.enforce(used_bytes=self._cache_budget_used)
         self.cache_id += 1
 
     # 更新相邻窗口参考状态
@@ -275,8 +299,10 @@ class StreamingWindowEngine(VanillaEngine):
     # 将引擎恢复到未运行状态
     def _reset_state(self):
         self.cache_id = 0
-        self.inference_queue = queue.Queue()
-        self.registration_queue = queue.Queue()
+        queue_size = 2 if self.diagnostic_sink is not None else 0
+        self.inference_queue = queue.Queue(maxsize=queue_size)
+        self.registration_queue = queue.Queue(maxsize=queue_size)
+        self._worker_errors = queue.Queue()
 
         self.prev_window_cache = None
         self.anchor_sp_graph = None
@@ -297,6 +323,8 @@ class StreamingWindowEngine(VanillaEngine):
             sample_window = self.inference_queue.get()
             if sample_window is STOP_SIGNAL:
                 return
+            if self.diagnostic_sink is not None and isinstance(sample_window, torch.Tensor):
+                sample_window = sample_window.to(self.inference_device)
 
             # 3️⃣ 统计模型推理时间
             t_start = time.perf_counter()
@@ -311,7 +339,18 @@ class StreamingWindowEngine(VanillaEngine):
             # 6️⃣ 把结果移到后处理设备
             processed_window = dict_to_device(prediction_window, self.process_device)
             # 7️⃣ 发送给配准线程
-            self.registration_queue.put((processed_window, inference_duration))
+            if self.diagnostic_sink is None:
+                self.registration_queue.put((processed_window, inference_duration))
+            else:
+                while True:
+                    self._raise_worker_error_if_any()
+                    try:
+                        self.registration_queue.put(
+                            (processed_window, inference_duration), timeout=0.1
+                        )
+                        break
+                    except queue.Full:
+                        continue
             # 8️⃣ 清理 CUDA 缓存
             if self.inference_device == 'cuda':
                 torch.cuda.empty_cache()
@@ -432,9 +471,19 @@ class StreamingWindowEngine(VanillaEngine):
 
         # 2️⃣ 创建本次运行的临时目录
         self.temp_cache_dir = pathlib.Path(tempfile.mkdtemp(dir=self.cache_dir))
+        if self.storage_budget is not None:
+            self._cache_budget_used = self.storage_budget.enforce().used_bytes
         # 3️⃣ 创建两个后台线程
-        self._inference_thread = threading.Thread(target=self._model_inference_worker, daemon=True)
-        self._registration_thread = threading.Thread(target=self._registration_worker, daemon=True)
+        self._inference_thread = threading.Thread(
+            target=self._guard_worker,
+            args=("inference", self._model_inference_worker),
+            daemon=True,
+        )
+        self._registration_thread = threading.Thread(
+            target=self._guard_worker,
+            args=("registration", self._registration_worker),
+            daemon=True,
+        )
         # 4️⃣ 启动线程
         self._inference_thread.start()
         self._registration_thread.start()
@@ -443,7 +492,18 @@ class StreamingWindowEngine(VanillaEngine):
 
     # 提交窗口
     def forward(self, sample, **kwargs):
-        self.inference_queue.put(sample)
+        if self.diagnostic_sink is None:
+            self.inference_queue.put(sample)
+            return
+        if isinstance(sample, torch.Tensor):
+            sample = sample.cpu()
+        while True:
+            self._raise_worker_error_if_any()
+            try:
+                self.inference_queue.put(sample, timeout=0.1)
+                return
+            except queue.Full:
+                continue
 
     # 结束引擎
     def end(self):
@@ -452,11 +512,23 @@ class StreamingWindowEngine(VanillaEngine):
             raise RuntimeError('Cannot terminate a stopped inference engine')
 
         # 2️⃣ 等待推理线程处理完全部输入
-        self.inference_queue.put(STOP_SIGNAL)
+        self._stop_worker(self.inference_queue, self._inference_thread)
         self._inference_thread.join()
         # 3️⃣ 等待配准线程处理完全部预测结果
-        self.registration_queue.put(STOP_SIGNAL)
+        self._stop_worker(self.registration_queue, self._registration_thread)
         self._registration_thread.join()
+
+        worker_error = None
+        if not self._worker_errors.empty():
+            worker_error = self._worker_errors.get_nowait()
+
+        if worker_error is not None:
+            worker_name, exception, formatted_traceback = worker_error
+            self._reset_state()
+            self.running = False
+            raise RuntimeError(
+                f"Streaming {worker_name} worker failed:\n{formatted_traceback}"
+            ) from exception
 
         # 4️⃣ 打印性能统计
         if self.benchmark_latency:
@@ -484,6 +556,32 @@ class StreamingWindowEngine(VanillaEngine):
         # 5️⃣ 重置内存状态
         self._reset_state()
         self.running = False
+
+    def _guard_worker(self, name, target):
+        try:
+            target()
+        except BaseException as exception:
+            self._worker_errors.put((name, exception, traceback.format_exc()))
+
+    def _stop_worker(self, worker_queue, worker_thread):
+        if self.diagnostic_sink is None:
+            worker_queue.put(STOP_SIGNAL)
+            return
+        while worker_thread.is_alive():
+            try:
+                worker_queue.put(STOP_SIGNAL, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def _raise_worker_error_if_any(self):
+        if self._worker_errors.empty():
+            return
+        worker_name, exception, formatted_traceback = self._worker_errors.get_nowait()
+        self._worker_errors.put((worker_name, exception, formatted_traceback))
+        raise RuntimeError(
+            f"Streaming {worker_name} worker failed:\n{formatted_traceback}"
+        ) from exception
 
     # 图像滑动窗口
     def img_sliding_window(self, imgs):
