@@ -1,6 +1,7 @@
 import copy
 
 import numpy as np
+import pytest
 
 from inference_engine.diagnostics.selection import robust_zscore, select_intervals
 
@@ -28,6 +29,25 @@ def test_robust_zscore_is_finite_for_constant_and_outlier_inputs():
     values = robust_zscore([0, 0, 10])
     assert np.isfinite(values).all()
     assert values[-1] > values[0]
+
+
+def test_selector_rejects_zero_limit_and_controls_obey_both_medians():
+    with pytest.raises(ValueError, match="positive"):
+        select_intervals(_records(), limit=0)
+    records = _records()
+    selected = select_intervals(records, limit=12)
+    for item in selected:
+        if "control" not in item.reasons:
+            continue
+        rows = [row for row in records if row["sequence_id"] == item.sequence_id]
+        control_rows = [
+            row for row in rows
+            if row["frame_start"] == item.start_frame and row["frame_end"] == item.end_frame
+        ]
+        assert control_rows
+        assert control_rows[0]["trajectory_regret"] <= np.median(
+            [row["trajectory_regret"] for row in rows]
+        )
 
 
 def test_selector_is_deterministic_bounded_expanded_and_reason_preserving():

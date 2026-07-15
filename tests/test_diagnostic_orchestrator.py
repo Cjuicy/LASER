@@ -11,6 +11,7 @@ from inference_engine.diagnostics.orchestrator import (
     DIAGNOSTIC_PROFILES,
     _artifact_inventory,
     _git_commit,
+    _validate_case_artifacts,
     _validate_sequence_checkpoint,
     checkpoint_sha256,
     dataset_fingerprint,
@@ -216,3 +217,8 @@ def test_build_cases_requires_all_methods_and_namespaces_complete_trace(tmp_path
     assert metrics["selection_score"] == 3.0
     assert metrics["trajectory_regret"] == 1.25
     assert (root / "artifact-manifest.json").is_file()
+    assert _validate_case_artifacts(root) == (True, "complete")
+    (root / "layer_atomic" / "scale_map.png").write_bytes(b"corrupt")
+    valid, reason = _validate_case_artifacts(root)
+    assert valid is False
+    assert "mismatch" in reason or "unreadable" in reason

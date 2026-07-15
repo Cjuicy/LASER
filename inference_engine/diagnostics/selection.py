@@ -58,7 +58,7 @@ def _stride(rows: list[dict]) -> int:
 
 def select_intervals(records: list[dict], *, limit: int = 48, context_windows: int = 2) -> list[SelectedInterval]:
     if limit <= 0:
-        return []
+        raise ValueError("interval limit must be positive")
     # Union configurations at the same global window so every method gets identical cases.
     grouped: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
     for record in records:
@@ -108,7 +108,13 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
         # Matched low-anomaly control nearest in speed, turn and confidence to the strongest event.
         anchor = ordered[0]
         median_score = np.median([row["score"] for row in rows])
-        pool = [row for row in rows if row["score"] <= median_score and row is not anchor]
+        median_regret = np.median([row["trajectory_regret"] for row in rows])
+        pool = [
+            row for row in rows
+            if row["score"] <= median_score
+            and row["trajectory_regret"] <= median_regret
+            and row is not anchor
+        ]
         if pool:
             scales = {field: max(np.std([row[field] for row in rows]), 1e-6) for field in ("gt_speed", "gt_turn", "confidence")}
             control = min(pool, key=lambda row: (

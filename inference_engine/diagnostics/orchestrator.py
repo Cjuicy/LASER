@@ -23,7 +23,7 @@ from .metrics import build_sequence_summary, evaluate_stability_guard
 from .rendering import render_case, render_method_comparison
 from .report import build_report
 from .schema import RunManifest, SelectedInterval
-from .selection import select_intervals
+from .selection import GUARD, RECOVERY, select_intervals
 from .segmentation import compare_labelings
 from .storage import (
     OWNER_FILE,
@@ -121,6 +121,13 @@ def preflight(args) -> dict[str, Any]:
         raise FileNotFoundError(f"Model checkpoint not found: {checkpoint}")
     if args.overlap >= args.window_size or args.overlap < 0:
         raise ValueError("overlap must be non-negative and smaller than window_size")
+    focus_count = len(set(args.sequences) & (RECOVERY | GUARD))
+    minimum_intervals = 2 * focus_count
+    if args.max_selected <= 0 or args.max_selected < minimum_intervals:
+        raise ValueError(
+            f"max_selected must be at least {minimum_intervals} for the requested "
+            "Recovery/Guard event+control coverage"
+        )
     frame_counts = {}
     pose_counts = {}
     image_shapes = {}
@@ -168,10 +175,15 @@ def estimate_storage_bytes(info: dict[str, Any], args) -> dict[str, int]:
     stride = args.window_size - args.overlap
     context_span = args.window_size + 4 * stride
     max_pixels = max(height * width for height, width in info["image_shapes"].values())
-    # The mandatory design pairs anomaly intervals (expanded context) with
-    # matched controls (their native window only); use that mix for preflight.
-    anomaly_cases = (max(0, args.max_selected) + 1) // 2
-    control_cases = max(0, args.max_selected) // 2
+    # The selector proves one native-window control for every requested
+    # Recovery/Guard sequence. Treat every remaining slot as a fully expanded
+    # anomaly; unlike a 50/50 heuristic, this is a conservative upper bound.
+    guaranteed_controls = min(
+        len(set(args.sequences) & (RECOVERY | GUARD)),
+        max(0, args.max_selected),
+    )
+    anomaly_cases = max(0, args.max_selected) - guaranteed_controls
+    control_cases = guaranteed_controls
     selected_frames = min(
         total_frames,
         anomaly_cases * context_span + control_cases * args.window_size,
@@ -478,11 +490,14 @@ def build_cases(
             if budget is not None:
                 budget.enforce(estimated_bytes=100 * 1024 * 1024)
             local_index = min(max(center - window_id * stride, 0), args.window_size - 1)
-            render_case(paths, case_dir, frame_index=local_index)
+            rendered = render_case(paths, case_dir, frame_index=local_index)
             if budget is not None:
                 budget.enforce()
             values: dict[str, np.ndarray] = {}
-            config_artifacts = {"available": [], "unavailable": []}
+            config_artifacts = {
+                "available": [], "unavailable": [],
+                "rendered": sorted(path.name for path in rendered.values()),
+            }
             for path in paths:
                 kind = path.name.split("-", 1)[0]
                 config_artifacts["available"].append({
@@ -519,7 +534,6 @@ def build_cases(
         if budget is not None:
             budget.enforce(estimated_bytes=sum(value.nbytes for value in combined_arrays.values()))
         atomic_write_npz(interval_root / "trace.npz", **combined_arrays)
-        atomic_write_json(interval_root / "artifact-manifest.json", artifact_manifest)
         if budget is not None:
             budget.enforce()
         if "final_labels" in atomic and "final_labels" in geometry:
@@ -550,6 +564,71 @@ def build_cases(
             raise RuntimeError(
                 f"Missing comparable final labels for {interval.sequence_id}/{center}"
             )
+        generated = _artifact_inventory(interval_root, [interval_root])
+        generated.pop("artifact-manifest.json", None)
+        artifact_manifest["generated_artifacts"] = generated
+        atomic_write_json(interval_root / "artifact-manifest.json", artifact_manifest)
+        valid, reason = _validate_case_artifacts(interval_root)
+        if not valid:
+            raise RuntimeError(f"Case artifact verification failed for {interval_root}: {reason}")
+
+
+def _validate_case_artifacts(interval_root: Path) -> tuple[bool, str]:
+    manifest_path = interval_root / "artifact-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False, "missing_or_invalid_artifact_manifest"
+    inventory = manifest.get("generated_artifacts")
+    if not isinstance(inventory, dict) or not inventory:
+        return False, "missing_generated_artifact_inventory"
+    actual = {
+        str(path.relative_to(interval_root))
+        for path in interval_root.rglob("*")
+        if path.is_file() and path != manifest_path
+    }
+    if actual != set(inventory):
+        return False, "generated_artifact_set_mismatch"
+    required = {"trace.npz", "metrics.json", "segmentation_disagreement.png"}
+    for config in DIAGNOSTIC_PROFILES:
+        required.update({
+            f"{config}/rendering.json",
+            f"{config}/metrics.json",
+            f"{config}/segments.ply",
+        })
+        try:
+            rendering = json.loads(
+                (interval_root / config / "rendering.json").read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, json.JSONDecodeError):
+            return False, f"invalid_rendering_manifest:{config}"
+        artifacts = rendering.get("artifacts", {})
+        if not isinstance(artifacts, dict) or len(artifacts) != 15:
+            return False, f"incomplete_rendering_manifest:{config}"
+        required.update(f"{config}/{filename}" for filename in artifacts.values())
+    if not required <= set(inventory):
+        return False, "missing_required_case_artifact:" + ",".join(sorted(required - set(inventory)))
+    import cv2
+    for relative, metadata in inventory.items():
+        path = interval_root / relative
+        if not path.is_file() or path.stat().st_size != metadata.get("size"):
+            return False, f"case_artifact_size_mismatch:{relative}"
+        if checkpoint_sha256(path) != metadata.get("sha256"):
+            return False, f"case_artifact_checksum_mismatch:{relative}"
+        try:
+            if path.suffix == ".png" and cv2.imread(str(path), cv2.IMREAD_UNCHANGED) is None:
+                return False, f"unreadable_png:{relative}"
+            if path.suffix == ".npz":
+                with np.load(path) as data:
+                    if not data.files:
+                        return False, f"empty_npz:{relative}"
+            elif path.suffix == ".json":
+                json.loads(path.read_text(encoding="utf-8"))
+            elif path.suffix == ".ply" and not path.read_bytes().startswith(b"ply\n"):
+                return False, f"unreadable_ply:{relative}"
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return False, f"unreadable_case_artifact:{relative}:{exc}"
+    return True, "complete"
 
 
 def run_master(args, *, runner=subprocess.run) -> int:
@@ -741,10 +820,11 @@ def run_master(args, *, runner=subprocess.run) -> int:
             incomplete_cases = []
             for item in intervals:
                 root = output / "cases" / item.sequence_id / f"{item.start_frame:06d}-{item.end_frame:06d}"
-                required = [root / "trace.npz", root / "artifact-manifest.json", root / "metrics.json"]
-                required.extend(root / config / "rendering.json" for config in DIAGNOSTIC_PROFILES)
-                if any(not path.is_file() for path in required):
-                    incomplete_cases.append(f"{item.sequence_id}/{item.start_frame}-{item.end_frame}")
+                valid, reason = _validate_case_artifacts(root)
+                if not valid:
+                    incomplete_cases.append(
+                        f"{item.sequence_id}/{item.start_frame}-{item.end_frame}:{reason}"
+                    )
             if incomplete_cases:
                 raise RuntimeError("Selected case verification failed for: " + ", ".join(incomplete_cases))
             print("[phase cleanup] removing run-owned metrics-only engine cache")
