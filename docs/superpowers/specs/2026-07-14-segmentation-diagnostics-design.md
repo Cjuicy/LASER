@@ -291,7 +291,8 @@ robust z-score 使用 median/MAD；MAD 为零时回退到 IQR，再回退到带 
 
 - 指标首先聚合到 window；
 - change point 或异常 window 前后各扩展两个窗口；
-- 重叠或相隔不超过一个窗口的候选合并；
+- 重叠或相隔不超过一个窗口的候选合并，但合并后的单案例跨度不得超过“原窗口 +
+  前后各两个 stride”的存储上界；超过时保留为独立候选，再由多样性与数量约束筛选；
 - controls 使用 GT speed、turn magnitude 和 median confidence 的最近邻匹配，仅保留
   control 原生窗口（异常案例仍前后扩展两个窗口），并要求
   trajectory regret 和综合异常分数不高于该序列中位数。

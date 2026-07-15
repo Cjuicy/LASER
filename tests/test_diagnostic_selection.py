@@ -58,6 +58,10 @@ def test_selector_is_deterministic_bounded_expanded_and_reason_preserving():
     assert len(first) <= 12
     assert {item.sequence_id for item in first} >= {"00", "02", "04", "05", "09", "10"}
     assert all(item.reasons for item in first)
+    assert all(
+        item.end_frame - item.start_frame + 1 <= 30
+        for item in first if "control" not in item.reasons
+    )
     # Original spike at frame 10 is expanded two five-frame strides to frame 0.
     assert any(item.sequence_id == "02" and item.start_frame == 0 for item in first)
 

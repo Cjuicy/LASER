@@ -97,6 +97,8 @@ python scripts/run_segmentation_diagnostics.py \
 
 它验证 00–10 图像/pose 布局、checkpoint SHA-256、数据指纹、窗口参数和磁盘空间，
 输出两遍 trace、案例和报告的空间上界，不执行推理；预测超过 50 GiB 会在加载模型前拒绝。
+异常候选的合并跨度也被限制在 dry-run 使用的同一上下文上界内，避免相邻候选链式合并
+后突破估算。
 完成后正式运行应在同一命令后加 `--resume`，复用
 已经写入的 manifest：
 

@@ -146,9 +146,26 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
     # an anomaly interval.  Anomaly candidates still obey the normal merge rule.
     controls = [item for item in expanded if "control" in item["reasons"]]
     for item in (item for item in expanded if "control" not in item["reasons"]):
-        if merged_intervals and item["sequence_id"] == merged_intervals[-1]["sequence_id"] and item["start"] <= merged_intervals[-1]["end"] + item["stride"]:
+        max_span = (
+            int(item["frame_end"]) - int(item["frame_start"]) + 1
+            + 2 * context_windows * int(item["stride"])
+        )
+        proposed_end = max(
+            item["end"],
+            merged_intervals[-1]["end"] if merged_intervals else item["end"],
+        )
+        merge_is_bounded = (
+            bool(merged_intervals)
+            and proposed_end - merged_intervals[-1]["start"] + 1 <= max_span
+        )
+        if (
+            merged_intervals
+            and item["sequence_id"] == merged_intervals[-1]["sequence_id"]
+            and item["start"] <= merged_intervals[-1]["end"] + item["stride"]
+            and merge_is_bounded
+        ):
             current = merged_intervals[-1]
-            current["end"] = max(current["end"], item["end"])
+            current["end"] = proposed_end
             current["reasons"].update(item["reasons"])
             current["priority"] = max(current["priority"], item["priority"])
         else:
