@@ -33,6 +33,8 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             segment_mode: str = "depth",
             normal_method: str = "cross",
             geometry_seg_profile: str = "baseline_params",
+            split_score_thresh: float = 0.10,
+            split_aux_confirmation: bool = True,
     ):
         super().__init__(
             delegate=delegate.to(inference_device),
@@ -47,6 +49,8 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             segment_mode=segment_mode,
             normal_method=normal_method,
             geometry_seg_profile=geometry_seg_profile,
+            split_score_thresh=split_score_thresh,
+            split_aux_confirmation=split_aux_confirmation,
         )
 
     def _registration_worker(self):
@@ -102,6 +106,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get('images'),
                     )
                     working_window['scale_mask'] = refine_depth_segments(
                         self.prev_window_cache['local_points'].cpu().numpy(),
@@ -127,6 +132,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get('images'),
                     )
 
             self._update_cache(working_window, tgt_sp_graph)

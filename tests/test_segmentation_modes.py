@@ -131,6 +131,40 @@ def test_layer_atomic_mode_routes_full_point_maps_with_aligned_parameters(monkey
     }
 
 
+def test_layer_atomic_split_routes_rgb_and_single_split_configuration(monkeypatch):
+    calls = _capture_route(monkeypatch)
+    point_maps, conf_map = _inputs()
+    rgb_images = np.zeros((2, 3, 4, 5), dtype=np.float32)
+
+    graph = lsa.make_sp_graph(
+        point_maps,
+        depth_merge_thresh=0.3,
+        conf_map=conf_map,
+        top_conf_percentile=0.8,
+        segment_mode="layer_atomic_split",
+        normal_method="sobel",
+        rgb_images=rgb_images,
+        split_score_thresh=0.17,
+        split_aux_confirmation=False,
+    )
+
+    assert graph == "shared_graph"
+    np.testing.assert_array_equal(calls["images"], point_maps)
+    assert calls["op_func"] is lsa.segment_point_map_layer_atomic_split
+    assert calls["kwargs"] == {
+        "depth_merge_thresh": 0.3,
+        "conf_map": conf_map,
+        "top_conf_percentile": 0.8,
+        "seg_scale": 300,
+        "seg_sigma": 1.1,
+        "seg_min_size": 500,
+        "rgb_images": rgb_images,
+        "normal_method": "sobel",
+        "split_score_thresh": 0.17,
+        "split_aux_confirmation": False,
+    }
+
+
 def test_router_rejects_unknown_mode_before_batching():
     point_maps, _ = _inputs()
 
@@ -160,6 +194,17 @@ def test_geometry_router_rejects_unknown_normal_method_before_batching():
         )
 
 
+def test_split_router_rejects_unknown_normal_method_before_batching():
+    point_maps, _ = _inputs()
+
+    with pytest.raises(ValueError, match="normal_method"):
+        lsa.make_sp_graph(
+            point_maps,
+            segment_mode="layer_atomic_split",
+            normal_method="unknown",
+        )
+
+
 def test_effective_felzenszwalb_parameters_match_mode_and_profile():
     assert lsa.get_felzenszwalb_params("depth") == {
         "seg_scale": 300,
@@ -167,6 +212,11 @@ def test_effective_felzenszwalb_parameters_match_mode_and_profile():
         "seg_min_size": 500,
     }
     assert lsa.get_felzenszwalb_params("layer_atomic") == {
+        "seg_scale": 300,
+        "seg_sigma": 1.1,
+        "seg_min_size": 500,
+    }
+    assert lsa.get_felzenszwalb_params("layer_atomic_split") == {
         "seg_scale": 300,
         "seg_sigma": 1.1,
         "seg_min_size": 500,

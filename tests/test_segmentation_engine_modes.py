@@ -25,16 +25,20 @@ def test_engine_defaults_to_depth_and_aligned_geometry_configuration(tmp_path):
     assert engine.segment_mode == "depth"
     assert engine.normal_method == "cross"
     assert engine.geometry_seg_profile == "baseline_params"
+    assert engine.split_score_thresh == 0.10
+    assert engine.split_aux_confirmation is True
 
 
-@pytest.mark.parametrize("mode", ["depth", "geometry", "layer_atomic"])
+@pytest.mark.parametrize(
+    "mode", ["depth", "geometry", "layer_atomic", "layer_atomic_split"]
+)
 def test_engine_accepts_all_explicit_modes_when_refinement_is_enabled(tmp_path, mode):
     engine = _engine(tmp_path / mode, segment_mode=mode, depth_refine=True)
 
     assert engine.segment_mode == mode
 
 
-@pytest.mark.parametrize("mode", ["geometry", "layer_atomic"])
+@pytest.mark.parametrize("mode", ["geometry", "layer_atomic", "layer_atomic_split"])
 def test_non_depth_mode_requires_depth_refinement(tmp_path, mode):
     with pytest.raises(ValueError, match="depth_refine"):
         _engine(tmp_path / mode, segment_mode=mode, depth_refine=False)
@@ -73,26 +77,32 @@ def test_parent_segment_graph_helper_forwards_effective_configuration(monkeypatc
     monkeypatch.setattr(swe_module, "make_sp_graph", fake_make_sp_graph)
     engine = _engine(
         tmp_path,
-        segment_mode="geometry",
+        segment_mode="layer_atomic_split",
         normal_method="sobel",
         geometry_seg_profile="legacy",
+        split_score_thresh=0.17,
+        split_aux_confirmation=False,
         depth_refine=True,
     )
     local_points = torch.arange(24, dtype=torch.float32).reshape(2, 2, 2, 3)
     conf = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+    images = torch.arange(24, dtype=torch.float32).reshape(2, 3, 2, 2)
 
-    graph = engine._build_segment_graph(local_points, conf)
+    graph = engine._build_segment_graph(local_points, conf, images)
 
     assert graph is expected_graph
     assert len(calls) == 1
     point_maps, kwargs = calls[0]
     np.testing.assert_array_equal(point_maps, local_points.numpy())
     np.testing.assert_array_equal(kwargs.pop("conf_map"), conf.numpy())
+    np.testing.assert_array_equal(kwargs.pop("rgb_images"), images.numpy())
     assert kwargs == {
         "top_conf_percentile": engine.top_conf_percentile,
-        "segment_mode": "geometry",
+        "segment_mode": "layer_atomic_split",
         "normal_method": "sobel",
         "geometry_seg_profile": "legacy",
+        "split_score_thresh": 0.17,
+        "split_aux_confirmation": False,
     }
 
 
@@ -104,14 +114,18 @@ def test_loop_closure_engine_forwards_parent_segmentation_configuration(tmp_path
         process_device="cpu",
         cache_root=str(tmp_path),
         depth_refine=True,
-        segment_mode="layer_atomic",
+        segment_mode="layer_atomic_split",
         normal_method="sobel",
         geometry_seg_profile="legacy",
+        split_score_thresh=0.17,
+        split_aux_confirmation=False,
     )
 
-    assert engine.segment_mode == "layer_atomic"
+    assert engine.segment_mode == "layer_atomic_split"
     assert engine.normal_method == "sobel"
     assert engine.geometry_seg_profile == "legacy"
+    assert engine.split_score_thresh == 0.17
+    assert engine.split_aux_confirmation is False
 
 
 @pytest.mark.parametrize(
@@ -121,6 +135,7 @@ def test_loop_closure_engine_forwards_parent_segmentation_configuration(tmp_path
         ("geometry", "baseline_params", "scale=300, sigma=1.1, min_size=500"),
         ("geometry", "legacy", "scale=200, sigma=1.0, min_size=300"),
         ("layer_atomic", "baseline_params", "scale=300, sigma=1.1, min_size=500"),
+        ("layer_atomic_split", "baseline_params", "scale=300, sigma=1.1, min_size=500"),
     ],
 )
 def test_engine_prints_effective_segmentation_configuration(
