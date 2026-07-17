@@ -51,9 +51,13 @@ def test_segmentation_options_default_to_depth_baseline():
     assert args.segment_mode == "depth"
     assert args.normal_method == "cross"
     assert args.geometry_seg_profile == "baseline_params"
+    assert args.split_score_thresh == 0.10
+    assert args.split_aux_confirmation is True
 
 
-@pytest.mark.parametrize("segment_mode", ["depth", "geometry", "layer_atomic"])
+@pytest.mark.parametrize(
+    "segment_mode", ["depth", "geometry", "layer_atomic", "layer_atomic_split"]
+)
 def test_parser_accepts_all_segmentation_modes(segment_mode):
     args = demo.get_args_parser().parse_args([
         "--segment_mode",
@@ -73,6 +77,17 @@ def test_parser_accepts_geometry_options():
 
     assert args.normal_method == "sobel"
     assert args.geometry_seg_profile == "legacy"
+
+
+def test_parser_accepts_split_threshold_and_auxiliary_ablation():
+    args = demo.get_args_parser().parse_args([
+        "--split_score_thresh",
+        "0.17",
+        "--no-split_aux_confirmation",
+    ])
+
+    assert args.split_score_thresh == pytest.approx(0.17)
+    assert args.split_aux_confirmation is False
 
 
 def test_load_model_rejects_missing_checkpoint_before_model_construction(
@@ -107,6 +122,9 @@ def test_load_model_forwards_segmentation_options(tmp_path, monkeypatch):
         "sobel",
         "--geometry_seg_profile",
         "legacy",
+        "--split_score_thresh",
+        "0.17",
+        "--no-split_aux_confirmation",
     ])
     captured = {}
 
@@ -129,6 +147,8 @@ def test_load_model_forwards_segmentation_options(tmp_path, monkeypatch):
     assert captured["segment_mode"] == "geometry"
     assert captured["normal_method"] == "sobel"
     assert captured["geometry_seg_profile"] == "legacy"
+    assert captured["split_score_thresh"] == pytest.approx(0.17)
+    assert captured["split_aux_confirmation"] is False
 
 
 def test_natural_sort_key_orders_embedded_numbers_numerically():

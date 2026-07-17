@@ -77,9 +77,16 @@ def get_args_parser():
     parser.add_argument('--ckpt_path', default=None, type=str, help='trained checkpoint for evaluation')
     parser.add_argument('--model_ckpt', default=None, type=str,
                         help='local .safetensors or PyTorch checkpoint (shared by segmentation profiles)')
-    parser.add_argument('--segment_mode', default='depth', choices=('depth', 'geometry', 'layer_atomic'))
+    parser.add_argument(
+        '--segment_mode',
+        default='depth',
+        choices=('depth', 'geometry', 'layer_atomic', 'layer_atomic_split'),
+    )
     parser.add_argument('--normal_method', default='cross', choices=('cross', 'sobel'))
     parser.add_argument('--geometry_seg_profile', default='baseline_params', choices=('baseline_params', 'legacy'))
+    parser.add_argument('--split_score_thresh', default=0.10, type=float)
+    parser.add_argument('--split_aux_confirmation', default=True,
+                        action=argparse.BooleanOptionalAction)
 
     # Unified entry point for the full four-profile diagnostic workflow.  The
     # dedicated script exposes the same implementation with shorter flag names.
@@ -271,13 +278,21 @@ if __name__ == '__main__':
         pi3_main(args, VanillaEngine)
     elif model_variant == 'streaming_pi3':
         pi3_main(args, partial(StreamingWindowEngine, dtype=dtype, inference_device=device, window_size=20, overlap=5,
-                               top_conf_percentile=0.5, segment_mode=args.segment_mode,
+                               top_conf_percentile=0.5,
+                               depth_refine=args.segment_mode != 'depth',
+                               segment_mode=args.segment_mode,
                                normal_method=args.normal_method,
-                               geometry_seg_profile=args.geometry_seg_profile))
+                               geometry_seg_profile=args.geometry_seg_profile,
+                               split_score_thresh=args.split_score_thresh,
+                               split_aux_confirmation=args.split_aux_confirmation))
     elif model_variant == 'streaming_pi3_lc':
         pi3_main(args, partial(StreamingWindowEngineLC, dtype=dtype, inference_device=device, window_size=75, overlap=30,
-                               top_conf_percentile=0.3, segment_mode=args.segment_mode,
+                               top_conf_percentile=0.3,
+                               depth_refine=args.segment_mode != 'depth',
+                               segment_mode=args.segment_mode,
                                normal_method=args.normal_method,
-                               geometry_seg_profile=args.geometry_seg_profile))
+                               geometry_seg_profile=args.geometry_seg_profile,
+                               split_score_thresh=args.split_score_thresh,
+                               split_aux_confirmation=args.split_aux_confirmation))
     else:
         raise NotImplementedError

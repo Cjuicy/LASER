@@ -38,6 +38,8 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             diagnostic_sequence_id: str | None = None,
             diagnostic_pass: int = 0,
             cache_policy: str = "full",
+            split_score_thresh: float = 0.10,
+            split_aux_confirmation: bool = True,
     ):
         if cache_policy != "full":
             raise ValueError("StreamingWindowEngineLC supports only cache_policy='full'")
@@ -59,6 +61,8 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             diagnostic_sequence_id=diagnostic_sequence_id,
             diagnostic_pass=diagnostic_pass,
             cache_policy=cache_policy,
+            split_score_thresh=split_score_thresh,
+            split_aux_confirmation=split_aux_confirmation,
         )
 
     def _registration_worker(self):
@@ -114,6 +118,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get('images'),
                     )
                     working_window['scale_mask'] = refine_depth_segments(
                         self.prev_window_cache['local_points'].cpu().numpy(),
@@ -139,6 +144,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get('images'),
                     )
 
             self._update_cache(working_window, tgt_sp_graph)

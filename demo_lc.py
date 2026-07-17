@@ -47,13 +47,18 @@ def get_args_parser():
     parser.add_argument('--overlap', default=5, type=int, help='sliding window overlap size')
     parser.add_argument('--depth_refine', action='store_true', help='enable depth refine')
     parser.add_argument('--segment_mode', default='depth',
-                        choices=('depth', 'geometry', 'layer_atomic'),
+                        choices=('depth', 'geometry', 'layer_atomic', 'layer_atomic_split'),
                         help='segmentation method used by depth refinement')
     parser.add_argument('--normal_method', default='cross', choices=('cross', 'sobel'),
                         help='surface-normal estimator for geometry segmentation')
     parser.add_argument('--geometry_seg_profile', default='baseline_params',
                         choices=('baseline_params', 'legacy'),
                         help='Felzenszwalb profile for geometry segmentation')
+    parser.add_argument('--split_score_thresh', default=0.10, type=float,
+                        help='acceptance threshold for post-merge normal splitting')
+    parser.add_argument('--split_aux_confirmation', default=True,
+                        action=argparse.BooleanOptionalAction,
+                        help='confirm normal splits with RGB or normalized 3D gaps')
 
     return parser
 
@@ -101,6 +106,8 @@ def load_model(args):
         segment_mode=args.segment_mode,
         normal_method=args.normal_method,
         geometry_seg_profile=args.geometry_seg_profile,
+        split_score_thresh=args.split_score_thresh,
+        split_aux_confirmation=args.split_aux_confirmation,
     )
 
 # 手动将列表划分为多个重叠窗口

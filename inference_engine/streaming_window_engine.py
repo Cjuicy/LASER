@@ -90,6 +90,8 @@ class StreamingWindowEngine(VanillaEngine):
             diagnostic_pass: int = 0,
             cache_policy: str = "full",
             storage_budget=None,
+            split_score_thresh: float = 0.10,
+            split_aux_confirmation: bool = True,
     ):
         if cache_policy not in ("full", "metrics-only"):
             raise ValueError("cache_policy must be 'full' or 'metrics-only'")
@@ -108,17 +110,20 @@ class StreamingWindowEngine(VanillaEngine):
             raise ValueError(
                 f"segment_mode={segment_mode!r} requires depth_refine=True."
             )
-        if segment_mode == "geometry":
+        if segment_mode in ("geometry", "layer_atomic_split"):
             if normal_method not in NORMAL_METHODS:
                 raise ValueError(
                     f"Unknown normal_method: {normal_method!r}; expected one of {NORMAL_METHODS}."
                 )
+        if segment_mode == "geometry":
             if geometry_seg_profile not in GEOMETRY_SEGMENTATION_PROFILES:
                 raise ValueError(
                     "Unknown geometry_seg_profile: "
                     f"{geometry_seg_profile!r}; expected one of "
                     f"{tuple(GEOMETRY_SEGMENTATION_PROFILES)}."
                 )
+        if not isinstance(split_score_thresh, (int, float)) or split_score_thresh < 0:
+            raise ValueError("split_score_thresh must be non-negative")
 
         # 1️⃣ 模型初始化
         super().__init__(
@@ -140,6 +145,8 @@ class StreamingWindowEngine(VanillaEngine):
         self.segment_mode = segment_mode
         self.normal_method = normal_method
         self.geometry_seg_profile = geometry_seg_profile
+        self.split_score_thresh = float(split_score_thresh)
+        self.split_aux_confirmation = bool(split_aux_confirmation)
         self.felzenszwalb_params = get_felzenszwalb_params(
             segment_mode,
             geometry_seg_profile,
@@ -156,6 +163,11 @@ class StreamingWindowEngine(VanillaEngine):
         if segment_mode == "geometry":
             segmentation_details += (
                 f", profile={geometry_seg_profile}, normal={normal_method}"
+            )
+        elif segment_mode == "layer_atomic_split":
+            segmentation_details += (
+                f", normal={normal_method}, split_score={self.split_score_thresh}, "
+                f"aux_confirmation={self.split_aux_confirmation}"
             )
         print(
             "[segmentation] "
@@ -232,6 +244,9 @@ class StreamingWindowEngine(VanillaEngine):
             "segment_mode": self.segment_mode,
             "normal_method": self.normal_method,
             "geometry_seg_profile": self.geometry_seg_profile,
+            "rgb_images": None if images is None else images.cpu().numpy(),
+            "split_score_thresh": self.split_score_thresh,
+            "split_aux_confirmation": self.split_aux_confirmation,
         }
         context = self._diagnostic_context()
         if self.diagnostic_sink is not None:

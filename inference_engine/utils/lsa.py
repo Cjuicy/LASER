@@ -11,10 +11,13 @@ from .geometry_segmentation import (
     segment_geometry_felzenszwalb_rag,
     segment_geometry_felzenszwalb_rag_baseline_params,
 )
-from .layer_atomic_geometry import segment_point_map_layer_atomic
+from .layer_atomic_geometry import (
+    segment_point_map_layer_atomic,
+    segment_point_map_layer_atomic_split,
+)
 
 
-SEGMENT_MODES = ("depth", "geometry", "layer_atomic")
+SEGMENT_MODES = ("depth", "geometry", "layer_atomic", "layer_atomic_split")
 NORMAL_METHODS = ("cross", "sobel")
 FELZENSZWALB_BASELINE_PARAMS = {
     "seg_scale": 300,
@@ -95,9 +98,12 @@ def make_sp_graph(
         corr_iou_thresh=0.3,
         segment_mode=None,
         normal_method="cross",
-    geometry_seg_profile="baseline_params",
-    diagnostic_sink=None,
-    diagnostic_context=None,
+        geometry_seg_profile="baseline_params",
+        rgb_images=None,
+        split_score_thresh=0.10,
+        split_aux_confirmation=True,
+        diagnostic_sink=None,
+        diagnostic_context=None,
 ):
     legacy_layer_atomic_call = segment_mode is None
     if legacy_layer_atomic_call:
@@ -125,9 +131,22 @@ def make_sp_graph(
             point_map=point_maps,
             normal_method=normal_method,
         )
-    else:
+    elif segment_mode == "layer_atomic":
         images = point_maps
         segmentation_op = segment_point_map_layer_atomic
+    else:
+        if normal_method not in NORMAL_METHODS:
+            raise ValueError(
+                f"Unknown normal_method: {normal_method!r}; expected one of {NORMAL_METHODS}."
+            )
+        images = point_maps
+        segmentation_op = segment_point_map_layer_atomic_split
+        common_kwargs.update(
+            rgb_images=rgb_images,
+            normal_method=normal_method,
+            split_score_thresh=split_score_thresh,
+            split_aux_confirmation=split_aux_confirmation,
+        )
 
     labels = batched_image_op_wrapper(
         images,
