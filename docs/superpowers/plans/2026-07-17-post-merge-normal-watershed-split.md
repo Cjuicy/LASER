@@ -16,8 +16,9 @@
 - split 固定发生在 Auto merge 之后，只处理面积足以容纳至少两个合法子区的 Auto 最终区域。
 - 法向屏障固定为 `30°`；最小子区面积固定为 `max(seg_min_size, ceil(0.02 * parent_area))`。
 - 每个父区域只执行一次 marker-controlled watershed，不递归，markers 和最终叶子最多 4 个。
-- RGB 不能单独产生候选边界；最终只接受 `S = G_normal * max(C_rgb, C_gap) >= split_score_thresh`。
+- RGB 不能单独产生候选边界；辅助确认开启时使用 `S = G_normal * max(C_rgb, C_gap)`，关闭时使用 `S = G_normal`。
 - 唯一新增公开数值参数是 `split_score_thresh`，初始默认值为 `0.10`。
+- 新增布尔消融开关 `split_aux_confirmation=True`；两种状态共用同一个阈值，不新增模式或独立阈值。
 - 不新增第三方依赖，不加入平面拟合、曲率、SLIC、时序投票或数据集特定规则。
 - 分割阶段 CPU 时间相对 `layer_atomic` 增幅不超过 20%；端到端单窗口延迟目标不超过 5%，硬上限 10%。
 - KITTI/TUM 区域数中位增长不超过 30%，单条轨迹不超过 50%；ATE 中位数恶化不超过 2%，单序列不超过 5%。
@@ -30,7 +31,7 @@
 - Create `tests/test_layer_atomic_split_integration.py`: Auto merge 后调用顺序、RGB 布局和旧模式不变性。
 - Modify `inference_engine/utils/lsa.py`: 注册新模式并向它传入 RGB、法向方法和唯一阈值。
 - Modify `inference_engine/streaming_window_engine.py`: 从现有 `working_window['images']` 传入 RGB。
-- Modify `demo.py`, `demo_lc.py`, `eval_launch.py`: 暴露新模式和 `--split_score_thresh`。
+- Modify `demo.py`, `demo_lc.py`, `eval_launch.py`: 暴露新模式、`--split_score_thresh` 和辅助确认正反开关。
 - Modify `tests/test_segmentation_modes.py`, `tests/test_segmentation_engine_modes.py`, `tests/test_demo.py`, `tests/test_demo_lc.py`, `tests/test_segmentation_smoke_script.py`: 路由和 CLI 回归。
 - Modify `scripts/verify_segmentation_modes.py`: 第四种模式 CPU smoke test。
 - Create `scripts/evaluate_post_merge_split.py`: 29 条诊断 trace 的阈值、碎片、耗时和 PNG 对比评估。
@@ -46,8 +47,8 @@
 - Create: `tests/test_post_merge_split.py`
 
 **Interfaces:**
-- Consumes: `point_map: np.ndarray[H,W,3]`, optional `rgb_image: np.ndarray[H,W,3]`, `auto_labels: np.ndarray[H,W]`, compact `atom_labels: np.ndarray[H,W]`, `atom_scales: np.ndarray[num_atoms]`, `seg_min_size: int`, `normal_method: str`, `split_score_thresh: float`.
-- Produces: `refine_auto_regions(point_map, rgb_image, auto_labels, atom_labels, atom_scales, seg_min_size, normal_method, split_score_thresh) -> tuple[np.ndarray, SplitDiagnostics]`.
+- Consumes: `point_map: np.ndarray[H,W,3]`, optional `rgb_image: np.ndarray[H,W,3]`, `auto_labels: np.ndarray[H,W]`, compact `atom_labels: np.ndarray[H,W]`, `atom_scales: np.ndarray[num_atoms]`, `seg_min_size: int`, `normal_method: str`, `split_score_thresh: float`, `split_aux_confirmation: bool`.
+- Produces: `refine_auto_regions(point_map, rgb_image, auto_labels, atom_labels, atom_scales, seg_min_size, normal_method, split_score_thresh, split_aux_confirmation=True) -> tuple[np.ndarray, SplitDiagnostics]`.
 - Produces: immutable `SplitDiagnostics` with `as_dict() -> dict[str, int | float]` for Task 4.
 
 - [ ] **Step 1: Write failing tests for sign-invariant normal edges and equal-weight dispersion**
@@ -124,6 +125,7 @@ class SplitDiagnostics:
     split_reject_small_child: int = 0
     split_reject_low_score: int = 0
     split_runtime_ms: float = 0.0
+    split_aux_confirmation: bool = True
 
     def as_dict(self):
         return asdict(self)
@@ -334,6 +336,34 @@ def test_gap_can_confirm_split_when_rgb_is_flat(monkeypatch):
     assert np.unique(first).size == 2
 
 
+def test_aux_switch_uses_normal_only_and_skips_aux_edges(monkeypatch):
+    points, labels, atoms, rgb = _fixture()
+    normals = np.zeros_like(points)
+    normals[:, :16, 2] = 1.0
+    normals[:, 16:, 0] = 1.0
+    monkeypatch.setattr(pms, "_normal_map", lambda point_map, method: (normals, np.ones(labels.shape, bool)))
+
+    with_aux, _ = pms.refine_auto_regions(
+        points, rgb, labels, atoms, np.asarray([1.0]),
+        seg_min_size=20, normal_method="cross", split_score_thresh=0.10,
+        split_aux_confirmation=True,
+    )
+    monkeypatch.setattr(
+        pms,
+        "_edge_fields",
+        lambda *args: (_ for _ in ()).throw(AssertionError("aux edges must be skipped")),
+    )
+    normal_only, stats = pms.refine_auto_regions(
+        points, rgb, labels, atoms, np.asarray([1.0]),
+        seg_min_size=20, normal_method="cross", split_score_thresh=0.10,
+        split_aux_confirmation=False,
+    )
+
+    assert np.unique(with_aux).size == 1
+    assert np.unique(normal_only).size == 2
+    assert stats.split_aux_confirmation is False
+
+
 def test_small_candidate_keeps_entire_parent(monkeypatch):
     points, labels, atoms, rgb = _fixture()
     normals = np.zeros_like(points)
@@ -422,6 +452,8 @@ def _partition_score(parent_mask, child_labels, normals, valid, edge_fields):
             return 0.0
         child_h += child.sum() / parent_area * dispersion
     normal_gain = float(np.clip((parent_h - child_h) / (parent_h + EPS), 0.0, 1.0))
+    if edge_fields is None:
+        return normal_gain
     confirmations = []
     for name, a_slice, b_slice in (
         ("right", (slice(None), slice(None, -1)), (slice(None), slice(1, None))),
@@ -456,6 +488,7 @@ def refine_auto_regions(
     seg_min_size,
     normal_method,
     split_score_thresh,
+    split_aux_confirmation=True,
 ):
     started = time.perf_counter()
     point_map = np.asarray(point_map)
@@ -469,7 +502,11 @@ def refine_auto_regions(
 
     normals, valid = _normal_map(point_map, normal_method)
     normal_edge = _normal_edge_map(normals, valid)
-    edge_fields = _edge_fields(point_map, rgb_image, atom_labels, atom_scales)
+    edge_fields = (
+        _edge_fields(point_map, rgb_image, atom_labels, atom_scales)
+        if split_aux_confirmation
+        else None
+    )
     output = auto_labels.copy()
     next_label = int(output.max()) + 1
     proposed = accepted = added = 0
@@ -529,6 +566,7 @@ def refine_auto_regions(
         split_reject_small_child=reject_small,
         split_reject_low_score=reject_score,
         split_runtime_ms=runtime_ms,
+        split_aux_confirmation=bool(split_aux_confirmation),
     )
     return output, diagnostics
 ```
@@ -561,7 +599,7 @@ git commit -m "feat: add conservative post-merge splitter"
 
 **Interfaces:**
 - Produces private `AtomMergeResult(labels, atom_labels, atom_scales)`.
-- Produces `segment_point_map_layer_atomic_split(point_map, depth_merge_thresh, rgb_images=None, normal_method="cross", split_score_thresh=0.10, conf_map=None, top_conf_percentile=None, seg_scale=300, seg_sigma=1.1, seg_min_size=500, batch_idx=None) -> np.ndarray`.
+- Produces `segment_point_map_layer_atomic_split(point_map, depth_merge_thresh, rgb_images=None, normal_method="cross", split_score_thresh=0.10, split_aux_confirmation=True, conf_map=None, top_conf_percentile=None, seg_scale=300, seg_sigma=1.1, seg_min_size=500, batch_idx=None) -> np.ndarray`.
 - Preserves `merge_layer_atoms(...) -> np.ndarray` and `segment_point_map_layer_atomic(...) -> np.ndarray` exactly.
 
 - [ ] **Step 1: Write failing integration tests for order, metadata reuse and no split weighting input**
@@ -603,6 +641,7 @@ def test_split_entry_runs_after_merge_and_passes_only_geometry_rgb_and_scales(mo
         conf_map=np.ones((2, 8, 10), dtype=np.float32),
         top_conf_percentile=0.5,
         seg_min_size=20,
+        split_aux_confirmation=False,
         batch_idx=1,
     )
 
@@ -613,7 +652,13 @@ def test_split_entry_runs_after_merge_and_passes_only_geometry_rgb_and_scales(mo
     assert received_auto is merged
     assert received_atoms is initial
     assert received_scales is atom_scales
-    assert set(kwargs) == {"seg_min_size", "normal_method", "split_score_thresh"}
+    assert set(kwargs) == {
+        "seg_min_size",
+        "normal_method",
+        "split_score_thresh",
+        "split_aux_confirmation",
+    }
+    assert kwargs["split_aux_confirmation"] is False
 
 
 def test_old_public_merger_matches_metadata_labels():
@@ -695,7 +740,7 @@ def _select_rgb_frame(rgb_images, batch_idx, height, width):
     return np.clip(rgb.astype(np.float32, copy=False), 0.0, 1.0)
 ```
 
-Implement `segment_point_map_layer_atomic_split` by running the same existing depth stages, calling `_merge_layer_atoms_with_metadata`, selecting the RGB frame, then calling `refine_auto_regions` and returning only the refined labels. The independent evaluation script calls `refine_auto_regions` directly when it needs `SplitDiagnostics`. Do not pass `conf_map` or any derived value into `refine_auto_regions`.
+Implement `segment_point_map_layer_atomic_split` by running the same existing depth stages, calling `_merge_layer_atoms_with_metadata`, selecting the RGB frame, then calling `refine_auto_regions` with both `split_score_thresh` and `split_aux_confirmation`, and returning only the refined labels. The independent evaluation script calls `refine_auto_regions` directly when it needs `SplitDiagnostics`. Do not pass `conf_map` or any derived value into `refine_auto_regions`.
 
 - [ ] **Step 5: Run new integration tests and the complete old atom suite**
 
@@ -735,9 +780,9 @@ git commit -m "feat: refine merged layer-atomic regions"
 
 **Interfaces:**
 - Extends `SEGMENT_MODES` with `layer_atomic_split`.
-- Extends `make_sp_graph(..., rgb_images=None, split_score_thresh=0.10)`.
-- Extends `StreamingWindowEngine(..., split_score_thresh=0.10)` and `_build_segment_graph(local_points, conf, images=None)`.
-- Adds CLI `--segment_mode layer_atomic_split` and `--split_score_thresh 0.10`.
+- Extends `make_sp_graph(..., rgb_images=None, split_score_thresh=0.10, split_aux_confirmation=True)`.
+- Extends `StreamingWindowEngine(..., split_score_thresh=0.10, split_aux_confirmation=True)` and `_build_segment_graph(local_points, conf, images=None)`.
+- Adds CLI `--segment_mode layer_atomic_split`, `--split_score_thresh 0.10`, and `--split_aux_confirmation` / `--no-split_aux_confirmation`.
 
 - [ ] **Step 1: Add failing routing tests**
 
@@ -755,6 +800,7 @@ def test_layer_atomic_split_routes_rgb_without_changing_front_filter(monkeypatch
         top_conf_percentile=0.8,
         rgb_images=rgb,
         split_score_thresh=0.15,
+        split_aux_confirmation=False,
         segment_mode="layer_atomic_split",
         normal_method="sobel",
     )
@@ -763,11 +809,12 @@ def test_layer_atomic_split_routes_rgb_without_changing_front_filter(monkeypatch
     assert calls["op_func"] is lsa.segment_point_map_layer_atomic_split
     assert calls["kwargs"]["rgb_images"] is rgb
     assert calls["kwargs"]["split_score_thresh"] == 0.15
+    assert calls["kwargs"]["split_aux_confirmation"] is False
     assert calls["kwargs"]["normal_method"] == "sobel"
     assert calls["kwargs"]["conf_map"] is conf_map
 ```
 
-Extend `tests/test_segmentation_engine_modes.py` so `layer_atomic_split` is accepted only with depth refinement, validates `normal_method`, stores `split_score_thresh`, and `_build_segment_graph(local_points, conf, images)` forwards the exact RGB tensor converted to NumPy.
+Extend `tests/test_segmentation_engine_modes.py` so `layer_atomic_split` is accepted only with depth refinement, validates `normal_method`, stores both split settings, and `_build_segment_graph(local_points, conf, images)` forwards the exact RGB tensor converted to NumPy plus the auxiliary boolean.
 
 - [ ] **Step 2: Run routing tests and verify the new mode is rejected**
 
@@ -777,7 +824,7 @@ Run:
 python -m pytest -q tests/test_segmentation_modes.py tests/test_segmentation_engine_modes.py
 ```
 
-Expected: failures because `layer_atomic_split`, RGB, and the threshold are not registered.
+Expected: failures because `layer_atomic_split`, RGB, the threshold, and the auxiliary switch are not registered.
 
 - [ ] **Step 3: Register the mode and route its frame inputs in `lsa.py`**
 
@@ -792,7 +839,7 @@ from .layer_atomic_geometry import (
 SEGMENT_MODES = ("depth", "geometry", "layer_atomic", "layer_atomic_split")
 ```
 
-Extend `make_sp_graph` with `rgb_images=None` and `split_score_thresh=0.10`. Keep the three existing branches byte-for-byte equivalent. Add a distinct fourth branch:
+Extend `make_sp_graph` with `rgb_images=None`, `split_score_thresh=0.10`, and `split_aux_confirmation=True`. Keep the three existing branches byte-for-byte equivalent. Add a distinct fourth branch:
 
 ```python
     elif segment_mode == "layer_atomic_split":
@@ -806,6 +853,7 @@ Extend `make_sp_graph` with `rgb_images=None` and `split_score_thresh=0.10`. Kee
             rgb_images=rgb_images,
             normal_method=normal_method,
             split_score_thresh=split_score_thresh,
+            split_aux_confirmation=split_aux_confirmation,
         )
 ```
 
@@ -813,7 +861,7 @@ Do not add RGB kwargs to depth, geometry, or old layer-atomic calls.
 
 - [ ] **Step 4: Pass existing window images from the streaming engine**
 
-Extend the constructor with `split_score_thresh: float = 0.10`, validate `0.0 <= split_score_thresh <= 1.0`, and store it. Validate `normal_method` for both `geometry` and `layer_atomic_split`.
+Extend the constructor with `split_score_thresh: float = 0.10` and `split_aux_confirmation: bool = True`, validate `0.0 <= split_score_thresh <= 1.0`, normalize the switch with `bool(...)`, and store both. Validate `normal_method` for both `geometry` and `layer_atomic_split`.
 
 Change the helper to:
 
@@ -829,6 +877,7 @@ def _build_segment_graph(self, local_points, conf, images=None):
         geometry_seg_profile=self.geometry_seg_profile,
         rgb_images=rgb_images,
         split_score_thresh=self.split_score_thresh,
+        split_aux_confirmation=self.split_aux_confirmation,
     )
 ```
 
@@ -845,9 +894,15 @@ parser.add_argument(
     type=float,
     help="acceptance threshold for layer_atomic_split",
 )
+parser.add_argument(
+    "--split_aux_confirmation",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="enable RGB or normalized-gap confirmation for layer_atomic_split",
+)
 ```
 
-Add `layer_atomic_split` to existing `segment_mode` choices, and pass `split_score_thresh=args.split_score_thresh` to engine construction. In `eval_launch.py`, also add `--segment_mode` and `--normal_method`, and include them in both streaming engine partials so KITTI/TUM ATE can compare `layer_atomic` and `layer_atomic_split` under identical settings.
+Add `layer_atomic_split` to existing `segment_mode` choices, and pass both split settings to engine construction. In `eval_launch.py`, also add `--segment_mode` and `--normal_method`, and include all split settings in both streaming engine partials so KITTI/TUM ATE can compare Auto, auxiliary-on, and auxiliary-off under identical settings.
 
 - [ ] **Step 6: Extend parser tests and rerun routing tests**
 
@@ -857,6 +912,9 @@ Add `layer_atomic_split` to parser parametrizations and assert the threshold def
 def test_split_threshold_defaults_and_forwards(tmp_path, monkeypatch):
     args = demo.get_args_parser().parse_args([])
     assert args.split_score_thresh == 0.10
+    assert args.split_aux_confirmation is True
+    disabled = demo.get_args_parser().parse_args(["--no-split_aux_confirmation"])
+    assert disabled.split_aux_confirmation is False
 ```
 
 Run:
@@ -895,7 +953,7 @@ git commit -m "feat: expose layer atomic split mode"
 - Modify: `docs/unified-segmentation-cloud-validation.md`
 
 **Interfaces:**
-- Produces CLI `evaluate_post_merge_split.py --trace-glob PATTERN --thresholds VALUES --repeats 30 --output-dir DIRECTORY`.
+- Produces CLI `evaluate_post_merge_split.py --trace-glob PATTERN --thresholds VALUES --aux-states on off --repeats 30 --output-dir DIRECTORY`.
 - Reads the existing NPZ keys `layer_atomic__inputs__rgb`, `layer_atomic__inputs__point_map`, `layer_atomic__segmentation__final_labels`, `layer_atomic__segmentation__initial_labels`, `layer_atomic__segmentation__atom_scales`, and optional `geometry_baseline__segmentation__final_labels`.
 - Writes `summary.json`, `per_trace.json`, and deterministic PNG panels for selected traces.
 
@@ -971,11 +1029,11 @@ def test_summary_enforces_region_and_runtime_budgets():
 
 - [ ] **Step 5: Implement the evaluation CLI**
 
-Use `argparse`, `glob`, `json`, `time.perf_counter`, NumPy and Pillow only. For each threshold and trace:
+Use `argparse`, `glob`, `json`, `time.perf_counter`, NumPy and Pillow only. For each threshold, auxiliary state, and trace:
 
 1. Load the six keys shown in the interface.
-2. Run `refine_auto_regions` once for labels/diagnostics.
-3. Run `segment_point_map_layer_atomic` and `segment_point_map_layer_atomic_split` for `repeats` timed iterations after one warm-up.
+2. Run `refine_auto_regions` once for labels/diagnostics with the selected boolean.
+3. Run `segment_point_map_layer_atomic` once per trace for the shared baseline, then run `segment_point_map_layer_atomic_split` for both auxiliary states for `repeats` timed iterations after one warm-up.
 4. Record Auto/split region counts, score diagnostics, median runtime and P90.
 5. If Geometry labels exist, report boundary support as a diagnostic proxy only; never treat it as ground truth.
 6. Save panels for these four exact traces when present:
@@ -983,7 +1041,8 @@ Use `argparse`, `glob`, `json`, `time.perf_counter`, NumPy and Pillow only. For 
    - `laser-case-05-002160-002414-trace.npz`
    - `laser-tum-freiburg1_360-000000-000254-trace.npz`
    - `laser-tum-freiburg1_desk-000135-000389-trace.npz`
-7. Select `0.10` if it satisfies the region/runtime budgets; otherwise select the first of `0.15`, then `0.20`, that satisfies both. Exit non-zero if none satisfies them.
+7. At every shared threshold, report paired deltas `aux_on - aux_off` for accepted splits, region growth, runtime, and Geometry-supported boundary proxy.
+8. Select `0.10` using only `aux_on`; if it violates the region/runtime budgets, select the first of `0.15`, then `0.20`, that satisfies both. Never tune a separate threshold for `aux_off`; exit non-zero if the production state has no acceptable threshold.
 
 Expose pure `load_trace(path)` and `summarize(records)` functions so the tests do not launch subprocesses.
 
@@ -1015,7 +1074,26 @@ python demo.py \
     --depth_refine \
     --segment_mode layer_atomic_split \
     --normal_method cross \
-    --split_score_thresh 0.10
+    --split_score_thresh 0.10 \
+    --split_aux_confirmation
+```
+
+Add the paired normal-only ablation command with the same method and threshold:
+
+```bash
+python demo.py \
+    --model_ckpt "$MODEL_CKPT" \
+    --data_path "$DATA_PATH" \
+    --cache_path "./comparison_cache/layer_atomic_split_no_aux" \
+    --output_path "./comparison_results/layer_atomic_split_no_aux" \
+    --sample_interval 1 \
+    --window_size 30 \
+    --overlap 10 \
+    --depth_refine \
+    --segment_mode layer_atomic_split \
+    --normal_method cross \
+    --split_score_thresh 0.10 \
+    --no-split_aux_confirmation
 ```
 
 - [ ] **Step 8: Commit evaluation and documentation**
@@ -1082,11 +1160,12 @@ python scripts/evaluate_post_merge_split.py \
   --trace-glob '/private/tmp/laser-case-*-trace.npz' \
   --trace-glob '/private/tmp/laser-tum-*-trace.npz' \
   --thresholds 0.05 0.075 0.10 0.15 0.20 \
+  --aux-states on off \
   --repeats 30 \
   --output-dir /private/tmp/post-merge-split-eval
 ```
 
-Expected: exactly 29 traces, `selected_threshold` is one of `0.10`, `0.15`, `0.20`, median region growth is at most 1.30, every trace growth is at most 1.50, and median segmentation-stage overhead is at most 0.20.
+Expected: exactly 29 traces for each auxiliary state, paired on/off deltas are present, `selected_threshold` is chosen from production `aux_on` and is one of `0.10`, `0.15`, `0.20`, median region growth is at most 1.30, every trace growth is at most 1.50, and median segmentation-stage overhead is at most 0.20.
 
 - [ ] **Step 4: Inspect the four deterministic panels**
 
@@ -1138,10 +1217,20 @@ CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12346 eval_laun
   --eval_dataset=kitti \
   --output_dir=outputs/cam_pose/kitti_layer_atomic_split \
   --segment_mode layer_atomic_split \
-  --normal_method cross
+  --normal_method cross \
+  --split_aux_confirmation
+
+CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12349 eval_launch.py \
+  --mode=eval_pose \
+  --model=streaming_pi3 \
+  --eval_dataset=kitti \
+  --output_dir=outputs/cam_pose/kitti_layer_atomic_split_no_aux \
+  --segment_mode layer_atomic_split \
+  --normal_method cross \
+  --no-split_aux_confirmation
 ```
 
-Expected: ATE median degradation is at most 2%, no sequence degrades more than 5%, and end-to-end median window latency overhead is at most 10%.
+Expected: report both `aux_on - layer_atomic` and `aux_off - layer_atomic`; production `aux_on` ATE median degradation is at most 2%, no sequence degrades more than 5%, and end-to-end median window latency overhead is at most 10%. The off run uses the same frozen threshold and is diagnostic only.
 
 - [ ] **Step 7: Run matched TUM pose evaluation including both indoor scenes**
 
@@ -1162,10 +1251,20 @@ CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12348 eval_laun
   --eval_dataset=tum \
   --output_dir=outputs/cam_pose/tum_layer_atomic_split \
   --segment_mode layer_atomic_split \
-  --normal_method cross
+  --normal_method cross \
+  --split_aux_confirmation
+
+CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12350 eval_launch.py \
+  --mode=eval_pose \
+  --model=streaming_pi3 \
+  --eval_dataset=tum \
+  --output_dir=outputs/cam_pose/tum_layer_atomic_split_no_aux \
+  --segment_mode layer_atomic_split \
+  --normal_method cross \
+  --no-split_aux_confirmation
 ```
 
-Confirm the detailed output includes `freiburg1_360` and `freiburg1_desk`. Apply the same 2% median / 5% per-sequence ATE guards and 10% latency hard limit.
+Confirm all three runs include `freiburg1_360` and `freiburg1_desk`. Apply the same production guards to `aux_on`, and report the same-threshold `aux_off` deltas without tuning it separately.
 
 - [ ] **Step 8: Perform final repository hygiene and diff review**
 
