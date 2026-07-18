@@ -123,6 +123,17 @@ def test_resume_refuses_changed_checkpoint(tmp_path):
         run_master(args)
 
 
+def test_dry_run_reports_the_registered_profile_count(tmp_path, capsys):
+    args = _args(tmp_path, dry_run=True)
+
+    assert run_master(args) == 0
+
+    assert (
+        f"[phase preflight] {len(DIAGNOSTIC_PROFILES)} sequential profiles"
+        in capsys.readouterr().out
+    )
+
+
 def test_dry_run_rejects_projected_two_pass_storage_before_manifest(tmp_path):
     args = _args(
         tmp_path, dry_run=True, max_temp_gib=.001, warn_temp_gib=.0009,

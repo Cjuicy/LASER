@@ -678,7 +678,7 @@ def run_master(args, *, runner=subprocess.run) -> int:
     if not args.resume:
         atomic_write_json(manifest_path, manifest.to_dict())
     print(
-        f"[phase preflight] 4 sequential profiles, {sum(info['frame_counts'].values())} frames; "
+        f"[phase preflight] {len(DIAGNOSTIC_PROFILES)} sequential profiles, {sum(info['frame_counts'].values())} frames; "
         f"projected total {projection['total'] / 2**30:.2f} GiB "
         f"(pass2 {projection['pass2_dense'] / 2**30:.2f} GiB, "
         f"cases/report {projection['cases_and_report'] / 2**30:.2f} GiB); "
