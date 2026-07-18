@@ -1,31 +1,28 @@
 # 三方法分割诊断：云端执行与验收
 
-本文档对应分支 `codex/segmentation-diagnostics`。系统不会修改已经验证的
-`depth`、`geometry`、`layer_atomic` 默认算法，只在显式运行诊断入口时增加只读观测。
+本文档是三方法分割诊断的唯一云端操作流程。诊断入口是只读观测：不会改变默认
+推理路径，也不包含回环、参数 sweep 或额外对比配置。
 
 ## 1. 固定实验口径
 
-一条命令会按以下顺序串行运行，不并行占用四份 GPU/磁盘：
+每次运行严格按以下顺序串行执行三项配置；不得并行占用多份 GPU 或诊断磁盘：
 
-1. `depth`：正式基线，Felzenszwalb `300 / 1.1 / 500`；
-2. `geometry_baseline`：正式旧 Geometry 对比，`300 / 1.1 / 500`；
-3. `layer_atomic`：当前方法，`300 / 1.1 / 500`；
-4. `geometry_legacy_reference`：机制参考，历史参数 `200 / 1.0 / 300`，不进入正式排名。
+1. `depth`：深度基线，Felzenszwalb `300 / 1.1 / 500`；
+2. `geometry_baseline`：几何基线，Felzenszwalb `300 / 1.1 / 500`；
+3. `layer_atomic_split`：分层原子分割，Felzenszwalb `300 / 1.1 / 500`，固定
+   `normal_method=cross`、`split_score_thresh=0.10`、
+   `split_aux_confirmation=true`。
 
-目标是无回环 `StreamingWindowEngine`。四项配置共享一个 checkpoint；入口会计算
-SHA-256 并写入 manifest，worker 载入前再次核验。轨迹统一使用一次全序列 Sim(3)
-对齐，RPE 使用 `delta=1 frame, all_pairs=True`。
+三项配置共享同一个 checkpoint；入口会把 checkpoint SHA-256、git commit、数据指纹、
+窗口参数和上述固定配置写入 `manifest.json`。轨迹使用一次全序列 Sim(3) 对齐，
+RPE 使用 `delta=1 frame, all_pairs=True`。引擎为无回环的
+`StreamingWindowEngine`。
 
-默认分组：
+默认重点分组为 Recovery：02、04、10；Stability Guard：00、05、09。选择器默认最多
+48 个区间；在 50 GiB 硬上限下全量 00–10 使用 `--max-selected 12`，以保留重点序列的
+事件与 matched control 覆盖。
 
-- Recovery：02、04、10；
-- Stability Guard：00、05、09；
-- 全局保护：00–10；
-- 选择器能力上限默认 48；在 50 GiB 硬上限下，全量 00–10 推荐 `--max-selected 12`，
-  仍强制覆盖六个重点序列各一个事件与一个 matched control。若希望 48 个区间，必须提高
-  空间上限并先通过 dry-run，不能绕过预检。
-
-## 2. 获取分支和准备环境
+## 2. 获取代码和准备环境
 
 ```bash
 git fetch origin codex/segmentation-diagnostics
@@ -38,7 +35,7 @@ python setup.py build_ext --inplace
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 ```
 
-KITTI Odometry 目录必须是：
+KITTI Odometry 根目录必须包含图像和 pose：
 
 ```text
 /data/KITTI_Odometry/dataset/
@@ -50,8 +47,6 @@ KITTI Odometry 目录必须是：
     └── 10.txt
 ```
 
-下文用变量避免把路径写错：
-
 ```bash
 export KITTI_ROOT=/data/KITTI_Odometry/dataset
 export LASER_CKPT=$PWD/weights/model.safetensors
@@ -61,18 +56,19 @@ export DIAG_TMP=$PWD/cache/segmentation-diagnostics
 
 ## 3. 先做 CPU 无权重验收
 
-此命令不加载模型、不需要 KITTI/GPU，会真实执行 schema、layer-atomic parity、存储阈值、
-选区间、PNG/PLY 渲染与 HTML 报告链路：
+此命令不加载模型，也不需要 KITTI 或 GPU。它真实验证 schema 2.0、staged/public
+split parity、三方法 dense 渲染、两个 regret、所有 selection reason、存储上下限与离线
+HTML 报告。
 
 ```bash
 python scripts/verify_segmentation_diagnostics.py \
-  --output-dir /tmp/laser-diagnostics-verify
+  --output-dir /tmp/laser-split-diagnostics-verify
 ```
 
-成功时必须依次看到：
+成功输出包含：
 
 ```text
-[PASS] schema
+[PASS] schema 2.0
 [PASS] parity
 [PASS] storage
 [PASS] selection
@@ -80,9 +76,12 @@ python scripts/verify_segmentation_diagnostics.py \
 [PASS] report
 ```
 
-报告位于 `/tmp/laser-diagnostics-verify/report/index.html`。
+报告位于 `/tmp/laser-split-diagnostics-verify/report/index.html`。这只证明 CPU
+诊断链路；没有 KITTI、checkpoint 和 GPU 的真实运行时，不能据此声明 ATE 结果。
 
-## 4. 预检（不加载模型）
+## 4. 全量 00–10 预检（不加载模型）
+
+先以最终输出目录运行 dry-run：
 
 ```bash
 python scripts/run_segmentation_diagnostics.py \
@@ -95,16 +94,13 @@ python scripts/run_segmentation_diagnostics.py \
   --dry-run
 ```
 
-它验证 00–10 图像/pose 布局、checkpoint SHA-256、数据指纹、窗口参数和磁盘空间，
-输出两遍 trace、案例和报告的空间上界，不执行推理；预测超过 50 GiB 会在加载模型前拒绝。
-异常候选的合并跨度也被限制在 dry-run 使用的同一上下文上界内，避免相邻候选链式合并
-后突破估算。
-完成后正式运行应在同一命令后加 `--resume`，复用
-已经写入的 manifest：
+它校验 00–10 图像/pose 布局、checkpoint SHA-256、数据指纹、窗口参数及磁盘空间，
+并估算两遍 trace、case 和报告的空间上界，不执行推理。预测超过 50 GiB 会在加载模型前
+拒绝。dry-run 会写入 manifest；随后同一目录的正式运行必须使用 `--resume`。
 
 ## 5. 先跑 KITTI 04 小规模 GPU 验证
 
-为避免与全量输出混用，使用独立目录：
+为避免和全量结果混用，使用独立输出目录：
 
 ```bash
 python scripts/run_segmentation_diagnostics.py \
@@ -122,21 +118,22 @@ python scripts/run_segmentation_diagnostics.py \
   --min-free-gib 10
 ```
 
-虽然只写一条命令，它内部仍完成四配置 Pass 1 → 自动选区间 → 四配置完整序列 Pass 2 →
-PNG/PLY/HTML。日志中的配置必须严格串行：
+日志必须按三项配置串行出现：
 
 ```text
-[phase pass1 1/4] depth
-[phase pass1 2/4] geometry_baseline
-[phase pass1 3/4] layer_atomic
-[phase pass1 4/4] geometry_legacy_reference
+[phase pass1 1/3] depth
+[phase pass1 2/3] geometry_baseline
+[phase pass1 3/3] layer_atomic_split
 ...
 [phase complete] report: .../report/index.html
 ```
 
+该命令完成 Pass 1、自动选区间、三方法 Pass 2、PNG/PLY 渲染和离线报告。完成 KITTI 04
+不代表全量 ATE 已验证；全量结论只能来自下一节的实际 00–10 结果。
+
 ## 6. 正式运行 KITTI 00–10
 
-如果第 4 节已经用相同 `$DIAG_OUT` 做过 `--dry-run`，使用：
+若第 4 节使用相同 `$DIAG_OUT` 成功完成 dry-run，执行：
 
 ```bash
 python scripts/run_segmentation_diagnostics.py \
@@ -155,38 +152,22 @@ python scripts/run_segmentation_diagnostics.py \
   --resume
 ```
 
-如果未做 dry-run，去掉最后的 `--resume`。Pass 1 只写 pose shard 和标量 JSONL；Pass 2
-从每个选中序列开头完整重跑以保留尺度传播历史，但只为 selected-frame union 保存重型
-RGB、point map、labels、scale trace。
+没有先运行 dry-run 时，使用一个新的空输出目录并去掉 `--resume`。Pass 1 只写 pose
+shard 和标量 JSONL；Pass 2 从每个选中序列开头完整重跑以保留尺度传播历史，但仅为
+selected-frame union 保存 RGB、point map、labels 和 scale trace。
 
-## 7. 中断、空间保护和恢复
+## 7. 中断、恢复和空间保护
 
-- 临时/诊断写入到 40 GiB 进入 warning 状态；
-- 写入前预测会超过 50 GiB 时立即停止，不继续制造 partial 文件；
-- 可用空间不得低于 10 GiB；
-- `.partial` 文件只在原子写入过程中存在；
-- 清理只允许删除带本次 run-id ownership marker 的目录；
-- 四配置不并行；metrics-only engine cache 每个序列结束即删除。
-- SIGTERM 会先把 manifest 写成 `interrupted` 并释放锁；若进程被强杀，`--resume` 只会
-  回收同 run-id、同主机且 PID 已不存在的 stale lock。
-- 每个 sequence checkpoint 保存轨迹、JSONL、dense trace 的大小与 SHA-256；缺失或篡改
-  会使对应 sequence 自动重跑，不能仅靠 manifest 的 wildcard 状态跳过。
+- 40 GiB 时进入 warning；任何写入若预测超过 50 GiB 会立即停止；可用空间必须至少保留
+  10 GiB。
+- `.partial` 仅存在于原子写入期间；临时目录必须带本次 run-id ownership marker，清理
+  只允许删除已验证属于本次运行的目录。
+- SIGTERM 会将 manifest 标为 `interrupted` 并释放锁。进程被强杀后，`--resume` 只会回收
+  同 run-id、同主机且 PID 已不存在的 stale lock。
+- 每个 sequence checkpoint 保存轨迹、JSONL、dense trace 的大小与 SHA-256。缺失或篡改
+  会使对应 sequence 自动重跑；commit、checkpoint、配置或数据指纹变化时拒绝混用旧结果。
 
-中断后原命令加 `--resume`。系统核验 commit、checkpoint、配置和数据指纹；任一发生变化
-会拒绝混用旧结果：
-
-```bash
-python scripts/run_segmentation_diagnostics.py \
-  --dataset-root "$KITTI_ROOT" \
-  --model-ckpt "$LASER_CKPT" \
-  --output-dir "$DIAG_OUT" \
-  --temp-root "$DIAG_TMP" \
-  --device cuda \
-  --max-selected 12 \
-  --resume
-```
-
-只重建报告、不调用 worker：
+中断后，重复原正式命令并附带 `--resume`。只重建报告、不运行 worker 时使用：
 
 ```bash
 python scripts/run_segmentation_diagnostics.py \
@@ -209,12 +190,9 @@ $DIAG_OUT/
 ├── trajectory/<config>/<sequence>.json|npz
 ├── artifacts/<config>/<sequence>/pass1|pass2/
 ├── cases/<sequence>/<interval>/<config>/
-│   ├── 14 类 PNG
-│   ├── segments.ply
-│   ├── rendering.json
-│   └── metrics.json
-├── cases/<sequence>/<interval>/trace.npz
-├── cases/<sequence>/<interval>/artifact-manifest.json
+│   ├── PNG、segments.ply、rendering.json、metrics.json
+│   └── （三个 config 均存在）
+├── cases/<sequence>/<interval>/comparison-rendering.json
 └── report/
     ├── index.html
     ├── metrics.csv
@@ -223,14 +201,16 @@ $DIAG_OUT/
 
 正式成功必须同时满足：
 
-1. `manifest.json` 的 `status` 为 `complete`；
-2. commit、checkpoint SHA-256、四配置、00–10 和 50/40/10 GiB 阈值正确；
-3. `summary.json` 有三正式方法的 ATE/RPE、Stability Guard 与 Recovery；
-4. `selected_intervals.json` 有可追溯 reasons/score；
-5. `report/index.html` 可离线打开，案例页面能访问 15 类 PNG/PLY；缺失的可选 scale/
-   temporal 证据必须显示 `UNAVAILABLE`，不得用单位尺度或伪造热图代替；
-6. 正常三方法文件和 Felzenszwalb 参数未发生变化。
+1. `manifest.json` 的 `status` 为 `complete`，schema 为 `2.0`；
+2. manifest 的三项配置、00–10、checkpoint SHA-256 和 50/40/10 GiB 阈值符合本页契约；
+3. `summary.json` 仅含 `depth`、`geometry_baseline`、`layer_atomic_split` 三种方法的
+   ATE/RPE、Stability Guard 和 Recovery；
+4. `selected_intervals.json` 可追溯每个区间的 score/reasons，记录同时包含
+   `split_minus_depth_regret` 与 `split_minus_geometry_regret`；
+5. `report/index.html` 可离线打开，三方法案例和 comparison PNG/PLY 可访问；缺失的可选
+   scale/temporal 证据必须显示 `UNAVAILABLE`，不能以单位尺度或伪造热图代替；
+6. 实际 00–10 GPU 运行完成前，不报告或推广任何 ATE 结论。
 
-建议先看 overview 的 Stability Guard 和 02/04/10 Recovery，再打开 selected case，按
-`Segmentation → Merge → Scale → Trajectory` 顺序观察。报告中的相关性只用于支持排查，
-不把相关关系写成因果结论。
+建议先检查 overview 的 Stability Guard 和 02/04/10 Recovery，再按
+`Segmentation → Merge → Scale → Trajectory` 查看 selected case。相关性只支持排查，
+不表示因果关系。

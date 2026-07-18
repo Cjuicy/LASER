@@ -14,7 +14,7 @@ from inference_engine.diagnostics.orchestrator import DEFAULT_SEQUENCES, run_mas
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Two-pass KITTI diagnostics for depth, geometry and layer-atomic LASER segmentation.",
+        description="Two-pass KITTI diagnostics for depth, geometry_baseline, and layer_atomic_split LASER segmentation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--dataset-root", required=True, help="KITTI Odometry dataset root containing sequences/ and poses/")
