@@ -241,7 +241,7 @@ def segment_point_map_layer_atomic_split_stages(
     seg_sigma=1.1,
     seg_min_size=500,
     batch_idx=None,
-) -> np.ndarray:
+) -> LayerAtomicSplitResult:
     point_map = np.asarray(point_map)
     if point_map.ndim != 3 or point_map.shape[-1] != 3:
         raise ValueError("point_map must have shape (H, W, 3)")

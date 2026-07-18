@@ -144,6 +144,7 @@ def test_trace_records_accepted_parent_evidence(monkeypatch):
     assert trace.diagnostics.split_accepted_count == 1
     assert np.all(trace.decision_map == 1)
     assert np.all(trace.parent_map == 0)
+    assert set(np.unique(trace.child_map)) == {1, 2}
     assert np.all(trace.score_map >= 0.10)
     assert np.any(trace.changed_mask)
 
@@ -174,6 +175,7 @@ def test_trace_records_rejected_parent_evidence(monkeypatch):
     assert np.all(trace.decision_map == 4)
     assert not np.any(trace.changed_mask)
     assert np.all(trace.score_map == 0.0)
+    assert set(np.unique(trace.child_map)) == {1, 2}
 
 
 def test_trace_records_no_marker_rejection(monkeypatch):
@@ -199,6 +201,8 @@ def test_trace_records_no_marker_rejection(monkeypatch):
 
     assert trace.diagnostics.split_reject_no_markers == 1
     assert np.all(trace.decision_map == 2)
+    assert np.all(trace.child_map == -1)
+    assert np.all(np.isnan(trace.score_map))
 
 
 def test_trace_records_small_child_rejection(monkeypatch):
@@ -231,6 +235,34 @@ def test_trace_records_small_child_rejection(monkeypatch):
 
     assert trace.diagnostics.split_reject_small_child == 1
     assert np.all(trace.decision_map == 3)
+    assert set(np.unique(trace.child_map)) == {1, 2}
+    assert np.all(np.isnan(trace.score_map))
+
+
+def test_trace_marks_ineligible_parent_evidence_as_missing(monkeypatch):
+    points, labels, atoms, rgb = _fixture(height=4, width=9)
+    normals = np.zeros_like(points)
+    normals[..., 2] = 1.0
+    monkeypatch.setattr(
+        pms,
+        "_normal_map",
+        lambda point_map, method: (normals, np.ones(labels.shape, bool)),
+    )
+
+    trace = pms.refine_auto_regions_with_trace(
+        points,
+        rgb,
+        labels,
+        atoms,
+        np.ones(1),
+        seg_min_size=20,
+        normal_method="cross",
+        split_score_thresh=0.10,
+    )
+
+    assert np.all(trace.decision_map == 0)
+    assert np.all(trace.child_map == -1)
+    assert np.all(np.isnan(trace.score_map))
 
 
 def test_one_pass_never_exceeds_four_children(monkeypatch):

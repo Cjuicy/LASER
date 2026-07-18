@@ -99,8 +99,19 @@ def test_staged_split_result_matches_public_final_labels():
 
 
 def test_public_split_signature_matches_staged_entry_point():
-    assert inspect.signature(lag.segment_point_map_layer_atomic_split) == inspect.signature(
-        lag.segment_point_map_layer_atomic_split_stages
+    public_signature = inspect.signature(lag.segment_point_map_layer_atomic_split)
+    staged_signature = inspect.signature(lag.segment_point_map_layer_atomic_split_stages)
+
+    assert public_signature.parameters == staged_signature.parameters
+    assert public_signature.return_annotation is np.ndarray
+
+
+def test_staged_split_entry_has_result_annotation():
+    assert (
+        inspect.signature(
+            lag.segment_point_map_layer_atomic_split_stages
+        ).return_annotation
+        is lag.LayerAtomicSplitResult
     )
 
 

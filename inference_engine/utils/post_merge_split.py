@@ -325,8 +325,8 @@ def refine_auto_regions_with_trace(
 
     result = labels.copy()
     parent_map = labels.copy()
-    child_map = labels.copy()
-    score_map = np.zeros(labels.shape, dtype=np.float32)
+    child_map = np.full(labels.shape, -1, dtype=np.intp)
+    score_map = np.full(labels.shape, np.nan, dtype=np.float32)
     decision_map = np.zeros(labels.shape, dtype=np.uint8)
     next_label = int(result.max()) + 1 if result.size else 0
     parent_count = proposed_count = accepted_count = added_regions = 0
