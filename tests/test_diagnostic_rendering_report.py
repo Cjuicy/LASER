@@ -1,10 +1,15 @@
+import csv
 import json
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from inference_engine.diagnostics.rendering import render_case, write_segment_ply
+from inference_engine.diagnostics.rendering import (
+    render_case,
+    render_method_comparison,
+    write_segment_ply,
+)
 from inference_engine.diagnostics.report import build_report
 
 
@@ -82,6 +87,42 @@ def test_renderer_writes_explicit_unavailable_split_evidence(tmp_path):
     assert rendering["availability"]["split_decision_map"] is False
 
 
+def test_method_comparison_replaces_stale_scale_ratio_with_unavailable_panel(tmp_path):
+    labels = np.zeros((4, 6), dtype=np.int32)
+    labels[:, 3:] = 1
+    methods = {
+        "depth": labels,
+        "geometry_baseline": labels,
+        "layer_atomic_split": labels,
+    }
+    valid_scales = {
+        "geometry_baseline": np.ones(labels.shape),
+        "layer_atomic_split": np.ones(labels.shape) * 1.2,
+    }
+    first = render_method_comparison(
+        methods, tmp_path / "comparison", method_scales=valid_scales
+    )
+    before = first["scale_log_ratio"].read_bytes()
+
+    second = render_method_comparison(
+        methods,
+        tmp_path / "comparison",
+        method_scales={
+            "geometry_baseline": np.ones((2, 2)),
+            "layer_atomic_split": np.ones((3, 3)),
+        },
+    )
+
+    assert "scale_log_ratio" in second
+    assert second["scale_log_ratio"].read_bytes() != before
+    image = cv2.imread(str(second["scale_log_ratio"]))
+    assert image.shape[:2] == labels.shape
+    rendering = json.loads(
+        (tmp_path / "comparison" / "comparison-rendering.json").read_text()
+    )
+    assert rendering["availability"]["scale_log_ratio"] is False
+
+
 def test_ply_has_deterministic_vertex_colors_and_count(tmp_path):
     points = np.array([[[0., 0., 1.], [1., 0., 1.]], [[0., 1., 1.], [np.nan, 0., 1.]]])
     labels = np.array([[0, 1], [0, 1]])
@@ -130,6 +171,21 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
             "layer_atomic": {"02": {"ate_rmse": 8}},
         },
     }))
+    (tmp_path / "selection_records.json").write_text(json.dumps([
+        {
+            "config_id": "layer_atomic_split", "sequence_id": "02",
+            "window_id": 2, "frame_start": 10, "frame_end": 20,
+            "split_minus_depth_regret": 1.2,
+            "split_minus_geometry_regret": None,
+        },
+    ]))
+    (tmp_path / "selected_intervals.json").write_text(json.dumps([
+        {
+            "sequence_id": "02", "start_frame": 10, "end_frame": 20,
+            "reasons": ["trajectory_degradation", "split_anomaly"],
+            "score": 8.2,
+        },
+    ]))
 
     index = build_report(tmp_path)
     html = index.read_text()
@@ -156,5 +212,42 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
     assert "split_minus_geometry_regret" in detail
     summary_export = json.loads((index.parent / "summary.json").read_text())
     assert set(summary_export["sequence_metrics"]) == {
+        "depth", "geometry_baseline", "layer_atomic_split",
+    }
+    diagnostics = summary_export["selection_diagnostics"]
+    assert diagnostics["reason_counts"] == {
+        "split_anomaly": 1,
+        "trajectory_degradation": 1,
+    }
+    assert diagnostics["selection_reasons"] == [
+        "split_anomaly", "trajectory_degradation",
+    ]
+    assert diagnostics["records"] == [{
+        "config_id": "layer_atomic_split",
+        "sequence_id": "02",
+        "window_id": 2,
+        "frame_start": 10,
+        "frame_end": 20,
+        "split_minus_depth_regret": 1.2,
+        "split_minus_geometry_regret": None,
+        "selection_reasons": ["split_anomaly", "trajectory_degradation"],
+    }]
+    with (index.parent / "metrics.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows == [{
+        "config_id": "layer_atomic_split",
+        "sequence_id": "02",
+        "window_id": "2",
+        "frame_start": "10",
+        "frame_end": "20",
+        "split_minus_depth_regret": "1.2",
+        "split_minus_geometry_regret": "",
+        "selection_reasons": '["split_anomaly","trajectory_degradation"]',
+    }]
+    with (index.parent / "sequence_metrics.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        trajectory_rows = list(csv.DictReader(handle))
+    assert {row["config_id"] for row in trajectory_rows} == {
         "depth", "geometry_baseline", "layer_atomic_split",
     }

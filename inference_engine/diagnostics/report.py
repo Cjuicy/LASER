@@ -137,19 +137,117 @@ def _case_page(case_dir: Path, report_cases: Path, run_dir: Path) -> tuple[str, 
     return page_name, score, metrics
 
 
-def _write_csv(run_dir: Path, summary: dict):
+def _selection_diagnostics(run_dir: Path) -> dict:
+    selected = _load(run_dir / "selected_intervals.json", [])
+    if not selected:
+        selected = []
+        for metrics_path in sorted((run_dir / "cases").glob("*/*/metrics.json")):
+            metrics = _load(metrics_path, {})
+            interval = metrics.get("interval", {})
+            selected.append({
+                "sequence_id": interval.get("sequence_id"),
+                "start_frame": interval.get("start_frame"),
+                "end_frame": interval.get("end_frame"),
+                "reasons": metrics.get(
+                    "selection_reasons", interval.get("reasons", [])
+                ),
+            })
+    normalized_intervals = []
+    for interval in selected:
+        sequence = interval.get("sequence_id")
+        start = interval.get("start_frame")
+        end = interval.get("end_frame")
+        if sequence is None or start is None or end is None:
+            continue
+        normalized_intervals.append({
+            "sequence_id": str(sequence),
+            "start_frame": int(start),
+            "end_frame": int(end),
+            "reasons": sorted(set(interval.get("reasons", []))),
+        })
+    normalized_intervals.sort(
+        key=lambda item: (
+            item["sequence_id"], item["start_frame"], item["end_frame"]
+        )
+    )
+    reason_counts: dict[str, int] = {}
+    for interval in normalized_intervals:
+        for reason in interval["reasons"]:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    records = []
+    for record in _load(run_dir / "selection_records.json", []):
+        if record.get("config_id") not in COLORS:
+            continue
+        sequence = str(record.get("sequence_id", ""))
+        start = record.get("frame_start")
+        end = record.get("frame_end")
+        reasons = sorted({
+            reason
+            for interval in normalized_intervals
+            if interval["sequence_id"] == sequence
+            and start is not None and end is not None
+            and int(start) <= interval["end_frame"]
+            and int(end) >= interval["start_frame"]
+            for reason in interval["reasons"]
+        })
+        records.append({
+            "config_id": record.get("config_id"),
+            "sequence_id": record.get("sequence_id"),
+            "window_id": record.get("window_id"),
+            "frame_start": start,
+            "frame_end": end,
+            "split_minus_depth_regret": record.get("split_minus_depth_regret"),
+            "split_minus_geometry_regret": record.get(
+                "split_minus_geometry_regret"
+            ),
+            "selection_reasons": reasons,
+        })
+    records.sort(key=lambda item: (
+        str(item["sequence_id"]),
+        -1 if item["frame_start"] is None else int(item["frame_start"]),
+        -1 if item["frame_end"] is None else int(item["frame_end"]),
+        str(item["config_id"]),
+        -1 if item["window_id"] is None else int(item["window_id"]),
+    ))
+    return {
+        "selection_reasons": sorted(reason_counts),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "records": records,
+    }
+
+
+def _write_csv(run_dir: Path, summary: dict, selection_diagnostics: dict):
     rows = [["config_id", "sequence_id", "ATE_RMSE", "RPE_translation_RMSE", "RPE_rotation_RMSE_deg"]]
     for config in COLORS:
         sequences = summary.get("sequence_metrics", {}).get(config, {})
         for sequence, metrics in sorted(sequences.items()):
             rows.append([config, sequence, metrics.get("ate_rmse"), metrics.get("rpe_translation_rmse"), metrics.get("rpe_rotation_rmse_deg")])
-    for filename in ("sequence_metrics.csv", "metrics.csv"):
-        path = run_dir / "report" / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        partial = path.with_name(path.name + ".partial")
-        with partial.open("w", newline="", encoding="utf-8") as handle:
-            csv.writer(handle).writerows(rows)
-        partial.replace(path)
+    path = run_dir / "report" / "sequence_metrics.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".partial")
+    with partial.open("w", newline="", encoding="utf-8") as handle:
+        csv.writer(handle).writerows(rows)
+    partial.replace(path)
+
+    fields = [
+        "config_id", "sequence_id", "window_id", "frame_start", "frame_end",
+        "split_minus_depth_regret", "split_minus_geometry_regret",
+        "selection_reasons",
+    ]
+    path = run_dir / "report" / "metrics.csv"
+    partial = path.with_name(path.name + ".partial")
+    with partial.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for record in selection_diagnostics["records"]:
+            writer.writerow({
+                **record,
+                "selection_reasons": json.dumps(
+                    record["selection_reasons"], separators=(",", ":")
+                ),
+            })
+    partial.replace(path)
 
 
 def _correlations(run_dir: Path) -> list[dict]:
@@ -221,7 +319,9 @@ def build_report(run_dir: str | Path) -> Path:
     report_dir = run_dir / "report"; report_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load(run_dir / "manifest.json", {})
     summary = _strict_summary(_load(run_dir / "summary.json", {}))
-    _write_csv(run_dir, summary)
+    selection_diagnostics = _selection_diagnostics(run_dir)
+    summary["selection_diagnostics"] = selection_diagnostics
+    _write_csv(run_dir, summary, selection_diagnostics)
     atomic_write_json(report_dir / "summary.json", summary)
     correlations = _correlations(run_dir)
     atomic_write_json(report_dir / "correlations.json", correlations)

@@ -349,6 +349,7 @@ def render_method_comparison(
     comparison_manifest = {
         "methods": list(COLORS),
         "colors": COLORS,
+        "availability": {"scale_log_ratio": False},
     }
     method_scales = method_scales or {}
     left_scale = method_scales.get("layer_atomic_split")
@@ -356,21 +357,31 @@ def render_method_comparison(
     if left_scale is not None and right_scale is not None:
         left_scale = np.asarray(left_scale)
         right_scale = np.asarray(right_scale)
-        if left_scale.shape == right_scale.shape:
+        if left_scale.shape == right_scale.shape == shape:
             valid = np.isfinite(left_scale) & np.isfinite(right_scale)
-            ratio = np.full(left_scale.shape, np.nan, dtype=float)
-            ratio[valid] = np.log(
-                np.maximum(left_scale[valid], 1e-9)
-                / np.maximum(right_scale[valid], 1e-9)
-            )
-            ratio_rgb, legend = _heatmap(ratio)
-            ratio_rgb[~valid] = [145, 151, 160]
-            result["scale_log_ratio"] = _write_png(output / "scale_log_ratio.png", ratio_rgb)
-            comparison_manifest["scale_log_ratio"] = {
-                **legend,
-                "numerator": "layer_atomic_split",
-                "denominator": "geometry_baseline",
-                "unavailable": "NaN",
-            }
+            if valid.any():
+                ratio = np.full(left_scale.shape, np.nan, dtype=float)
+                ratio[valid] = np.log(
+                    np.maximum(left_scale[valid], 1e-9)
+                    / np.maximum(right_scale[valid], 1e-9)
+                )
+                ratio_rgb, legend = _heatmap(ratio)
+                ratio_rgb[~valid] = [145, 151, 160]
+                comparison_manifest["availability"]["scale_log_ratio"] = True
+                comparison_manifest["scale_log_ratio"] = {
+                    **legend,
+                    "numerator": "layer_atomic_split",
+                    "denominator": "geometry_baseline",
+                    "unavailable": "NaN",
+                }
+            else:
+                ratio_rgb = _unavailable(shape, "finite scale_log_ratio")
+        else:
+            ratio_rgb = _unavailable(shape, "shape-matched scale_log_ratio")
+    else:
+        ratio_rgb = _unavailable(shape, "scale_log_ratio")
+    result["scale_log_ratio"] = _write_png(
+        output / "scale_log_ratio.png", ratio_rgb
+    )
     atomic_write_json(output / "comparison-rendering.json", comparison_manifest)
     return result
