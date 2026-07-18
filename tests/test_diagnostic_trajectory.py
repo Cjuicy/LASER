@@ -3,8 +3,10 @@ import pytest
 
 from inference_engine.diagnostics.metrics import (
     build_sequence_summary,
+    compute_regret_series,
     evaluate_stability_guard,
     recovery_score,
+    summarize_regret,
 )
 from inference_engine.diagnostics.trajectory import evaluate_trajectory
 
@@ -68,6 +70,24 @@ def test_stability_guard_uses_depth_as_its_baseline_and_recovery_is_depth_to_geo
     assert recovery_score(70.0, 60.0, 75.0)["valid"] is False
 
 
+@pytest.mark.parametrize(
+    "depth,split,geometry",
+    [
+        (np.nan, 1.0, 0.5),
+        (1.0, np.inf, 0.5),
+        (1.0, 0.5, -np.inf),
+    ],
+)
+def test_recovery_rejects_each_non_finite_ate_input(depth, split, geometry):
+    result = recovery_score(depth, split, geometry)
+
+    assert result == {
+        "valid": False,
+        "score": None,
+        "invalid_reason": "non_finite_ate_input",
+    }
+
+
 def test_sequence_summary_is_strict_three_method_contract_with_recovery_scores():
     values = {
         "depth": {
@@ -90,3 +110,38 @@ def test_sequence_summary_is_strict_three_method_contract_with_recovery_scores()
     assert "legacy_reference" not in summary
     assert "recovery_gap" not in summary
     assert summary["recovery"]["02"]["score"] == pytest.approx(0.5)
+
+
+def test_regret_summary_exports_positive_area_duration_persistence_and_change_points():
+    summary = summarize_regret(np.asarray([-1.0, 2.0, 3.0, -2.0, 1.0]))
+
+    assert summary == {
+        "valid": True,
+        "invalid_reason": None,
+        "mean": pytest.approx(0.6),
+        "max": 3.0,
+        "positive_area": 6.0,
+        "positive_duration": 3,
+        "positive_persistence": 2,
+        "change_points": [
+            {"frame_index": 3, "delta": -5.0, "magnitude": 5.0},
+            {"frame_index": 1, "delta": 3.0, "magnitude": 3.0},
+            {"frame_index": 4, "delta": 3.0, "magnitude": 3.0},
+        ],
+    }
+
+
+def test_regret_series_preserves_partial_and_missing_comparisons():
+    partial = compute_regret_series([1.0, np.nan, 4.0], [0.5, 2.0])
+    assert partial["valid"] is True
+    assert partial["invalid_reason"] == "partial_missing_comparison"
+    assert partial["values"] == [0.5, None, None]
+    assert partial["summary"]["mean"] == 0.5
+    assert partial["summary"]["positive_duration"] == 1
+
+    missing = compute_regret_series([], [1.0, 2.0])
+    assert missing["valid"] is False
+    assert missing["invalid_reason"] == "missing_comparison"
+    assert missing["values"] == [None, None]
+    assert missing["summary"]["mean"] is None
+    assert missing["summary"]["positive_duration"] is None

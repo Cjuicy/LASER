@@ -86,6 +86,30 @@ def test_diagnostic_ids_are_required_only_when_sink_is_enabled(tmp_path):
         _engine(tmp_path / "on", diagnostic_sink=object(), diagnostic_pass=1, diagnostic_sequence_id="02")
 
 
+def test_diagnostics_reject_legacy_geometry_before_creating_artifacts(tmp_path):
+    cache_root = tmp_path / "legacy-diagnostic-cache"
+
+    with pytest.raises(ValueError, match="diagnostics require geometry_seg_profile='baseline_params'"):
+        StreamingWindowEngine(
+            torch.nn.Identity(),
+            inference_device="cpu",
+            dtype=torch.float32,
+            process_device="cpu",
+            intermediate_device="cpu",
+            cache_root=str(cache_root),
+            benchmark_latency=False,
+            depth_refine=True,
+            segment_mode="geometry",
+            geometry_seg_profile="legacy",
+            diagnostic_sink=object(),
+            diagnostic_run_id="run",
+            diagnostic_sequence_id="02",
+            diagnostic_pass=1,
+        )
+
+    assert not cache_root.exists()
+
+
 def test_loop_closure_rejects_metrics_only_cache_because_it_needs_full_windows(tmp_path):
     with pytest.raises(ValueError, match="only cache_policy='full'"):
         StreamingWindowEngineLC(

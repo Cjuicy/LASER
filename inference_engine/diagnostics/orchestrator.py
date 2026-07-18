@@ -19,11 +19,16 @@ from typing import Any
 
 import numpy as np
 
-from .metrics import build_sequence_summary, evaluate_stability_guard
+from .metrics import (
+    build_sequence_summary,
+    compute_regret_series,
+    evaluate_stability_guard,
+    summarize_regret,
+)
 from .rendering import render_case, render_method_comparison
 from .report import build_report
 from .schema import RunManifest, SelectedInterval
-from .selection import GUARD, RECOVERY, select_intervals
+from .selection import GUARD, RECOVERY, select_intervals_with_coverage
 from .segmentation import compare_labelings
 from .storage import (
     OWNER_FILE,
@@ -34,11 +39,15 @@ from .storage import (
     cleanup_owned_directory,
     directory_size,
 )
+from .trajectory import SIGNATURE
 
 
 DIAGNOSTIC_PROFILES = {
     "depth": {"segment_mode": "depth", "geometry_seg_profile": "baseline_params", "official": True},
-    "geometry_baseline": {"segment_mode": "geometry", "geometry_seg_profile": "baseline_params", "official": True},
+    "geometry_baseline": {
+        "segment_mode": "geometry", "geometry_seg_profile": "baseline_params",
+        "normal_method": "cross", "official": True,
+    },
     "layer_atomic_split": {
         "segment_mode": "layer_atomic_split",
         "geometry_seg_profile": "baseline_params",
@@ -108,11 +117,32 @@ def _termination_as_interrupt():
         signal.signal(signal.SIGTERM, previous)
 
 
+def _experiment_contract(args) -> dict[str, Any]:
+    profiles = []
+    for config_id, profile in DIAGNOSTIC_PROFILES.items():
+        effective = dict(profile)
+        effective.update(
+            seg_scale=300,
+            seg_sigma=1.1,
+            seg_min_size=500,
+            top_conf_percentile=float(args.top_conf_percentile),
+        )
+        profiles.append({
+            "config_id": config_id,
+            "effective_parameters": effective,
+        })
+    return {
+        "profiles": profiles,
+        "sequences": list(args.sequences),
+        "window_size": int(args.window_size),
+        "overlap": int(args.overlap),
+        "evaluation_signature": dict(SIGNATURE),
+    }
+
+
 def _config_hash(args) -> str:
     payload = {
-        "profiles": DIAGNOSTIC_PROFILES,
-        "sequences": list(args.sequences), "window_size": args.window_size,
-        "overlap": args.overlap, "top_conf_percentile": args.top_conf_percentile,
+        "experiment_contract": _experiment_contract(args),
         "seed": args.seed, "max_selected": args.max_selected, "device": args.device,
         "max_temp_gib": args.max_temp_gib, "warn_temp_gib": args.warn_temp_gib,
         "min_free_gib": args.min_free_gib,
@@ -230,6 +260,7 @@ def _manifest(args, info, run_id: str) -> RunManifest:
             "max_gib": args.max_temp_gib, "warn_gib": args.warn_temp_gib,
             "min_free_gib": args.min_free_gib, "frame_counts": info["frame_counts"],
         },
+        experiment_contract=_experiment_contract(args),
     )
 
 
@@ -335,14 +366,77 @@ def _validate_sequence_checkpoint(
         return False, "empty_required_artifact"
     if pass_id == 2:
         trace_root = output_root / "artifacts" / config_id / sequence_id / "pass2" / "traces"
-        for interval in selected_intervals:
-            if interval.sequence_id != sequence_id:
-                continue
-            center = min((interval.start_frame + interval.end_frame) // 2, expected_frames - 1)
+        selected_frames = sorted({
+            frame
+            for interval in selected_intervals
+            if interval.sequence_id == sequence_id
+            for frame in range(
+                max(0, interval.start_frame),
+                min(interval.end_frame, expected_frames - 1) + 1,
+            )
+        })
+        for frame in selected_frames:
             for prefix in ("inputs", "segmentation"):
-                relative = str((trace_root / f"{prefix}-frame-{center:06d}.npz").relative_to(output_root))
+                relative = str((trace_root / f"{prefix}-frame-{frame:06d}.npz").relative_to(output_root))
                 if relative not in inventory:
                     return False, f"missing_selected_trace:{relative}"
+            if config_id == "layer_atomic_split":
+                valid, reason = _validate_split_trace(
+                    trace_root / f"segmentation-frame-{frame:06d}.npz",
+                    frame,
+                )
+                if not valid:
+                    return valid, reason
+    return True, "complete"
+
+
+def _validate_split_trace(path: Path, frame: int) -> tuple[bool, str]:
+    required = {
+        "pre_split_labels", "final_labels", "atom_labels", "atom_scales",
+        "split_parent_map", "split_child_map", "split_score_map",
+        "split_decision_map",
+    }
+    try:
+        with np.load(path) as data:
+            missing = required - set(data.files)
+            if "changed_mask" not in data.files and not {
+                "changed_mask__packed", "changed_mask__shape",
+            } <= set(data.files):
+                missing.add("changed_mask")
+            if missing:
+                return False, (
+                    f"missing_split_evidence:{frame:06d}:"
+                    + ",".join(sorted(missing))
+                )
+            pre = np.asarray(data["pre_split_labels"])
+            if pre.ndim != 2 or pre.size == 0:
+                return False, f"invalid_split_evidence_shape:{frame:06d}:pre_split_labels"
+            shape = pre.shape
+            for name in (
+                "final_labels", "atom_labels", "split_parent_map",
+                "split_child_map", "split_score_map", "split_decision_map",
+            ):
+                if np.asarray(data[name]).shape != shape:
+                    return False, f"split_evidence_shape_mismatch:{frame:06d}:{name}"
+            atom_labels = np.asarray(data["atom_labels"])
+            atom_scales = np.asarray(data["atom_scales"])
+            if atom_scales.ndim != 1 or (
+                atom_labels.size
+                and (
+                    np.min(atom_labels) < 0
+                    or np.max(atom_labels) >= atom_scales.size
+                )
+            ):
+                return False, f"split_evidence_shape_mismatch:{frame:06d}:atom_scales"
+            changed_shape = (
+                np.asarray(data["changed_mask"]).shape
+                if "changed_mask" in data.files
+                else tuple(np.asarray(data["changed_mask__shape"], dtype=int))
+            )
+            if changed_shape != shape:
+                return False, f"split_evidence_shape_mismatch:{frame:06d}:changed_mask"
+    except (OSError, ValueError) as exc:
+        return False, f"unreadable_split_evidence:{frame:06d}:{exc}"
     return True, "complete"
 
 
@@ -379,6 +473,40 @@ def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _persist_regret_artifacts(
+    run_dir: Path,
+    trajectory_results: dict,
+    sequences: list[str] | tuple[str, ...],
+) -> dict[str, dict]:
+    output = Path(run_dir) / "trajectory" / "regret"
+    result = {}
+    for sequence in sequences:
+        split = trajectory_results.get("layer_atomic_split", {}).get(
+            sequence, {}
+        ).get("per_frame_translation_error")
+        depth = trajectory_results.get("depth", {}).get(sequence, {}).get(
+            "per_frame_translation_error"
+        )
+        geometry = trajectory_results.get("geometry_baseline", {}).get(
+            sequence, {}
+        ).get("per_frame_translation_error")
+        comparisons = {
+            "split_minus_depth_regret": compute_regret_series(split, depth),
+            "split_minus_geometry_regret": compute_regret_series(split, geometry),
+        }
+        arrays = {
+            name: np.asarray([
+                np.nan if value is None else value
+                for value in comparison["values"]
+            ], dtype=np.float64)
+            for name, comparison in comparisons.items()
+        }
+        atomic_write_npz(output / f"{sequence}.npz", **arrays)
+        atomic_write_json(output / f"{sequence}.json", comparisons)
+        result[sequence] = comparisons
+    return result
+
+
 def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> list[dict]:
     records = []
     stride = args.window_size - args.overlap
@@ -386,9 +514,30 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
         for sequence in args.sequences:
             evaluation = trajectory_results.get(config, {}).get(sequence, {})
             errors = np.asarray(evaluation.get("per_frame_translation_error") or [], dtype=float)
-            split_errors = np.asarray(trajectory_results.get("layer_atomic_split", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
-            geometry_errors = np.asarray(trajectory_results.get("geometry_baseline", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
-            depth_errors = np.asarray(trajectory_results.get("depth", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
+            split_values = trajectory_results.get("layer_atomic_split", {}).get(sequence, {}).get("per_frame_translation_error")
+            depth_regret_series = compute_regret_series(
+                split_values,
+                trajectory_results.get("depth", {}).get(sequence, {}).get(
+                    "per_frame_translation_error"
+                ),
+            )
+            geometry_regret_series = compute_regret_series(
+                split_values,
+                trajectory_results.get("geometry_baseline", {}).get(sequence, {}).get(
+                    "per_frame_translation_error"
+                ),
+            )
+            split_errors = np.asarray(
+                [] if split_values is None else split_values, dtype=float
+            )
+            depth_regrets = np.asarray([
+                np.nan if value is None else value
+                for value in depth_regret_series["values"]
+            ], dtype=float)
+            geometry_regrets = np.asarray([
+                np.nan if value is None else value
+                for value in geometry_regret_series["values"]
+            ], dtype=float)
             gt_positions = np.empty((0, 3), dtype=float)
             gt_rotations = np.empty((0, 3, 3), dtype=float)
             trajectory_npz = Path(run_dir) / "trajectory" / "layer_atomic_split" / f"{sequence}.npz"
@@ -440,9 +589,13 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
                     delta_rotation = rotation_slice[rotation_index].T @ rotation_slice[rotation_index + 1]
                     cosine = np.clip((np.trace(delta_rotation) - 1) / 2, -1, 1)
                     turn_angles.append(float(np.arccos(cosine)))
-                def mean_regret(reference):
-                    reference_values = reference[start:end + 1]
-                    return float(np.nanmean(split_slice - reference_values)) if split_slice.size and len(reference_values) == len(split_slice) else None
+                def regret_metrics(values):
+                    summary = summarize_regret(values[start:end + 1])
+                    change_points = [
+                        {**item, "frame_index": item["frame_index"] + start}
+                        for item in summary["change_points"]
+                    ]
+                    return {**summary, "change_points": change_points}
                 split_metrics = [
                     item.get("metrics", {}).get("split", {})
                     for item in split_frame_metrics
@@ -457,18 +610,91 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
                     for metrics in split_metrics
                     if metrics.get("split_changed_pixel_ratio") is not None
                 ]
-                depth_regret = mean_regret(depth_errors)
-                geometry_regret = mean_regret(geometry_errors)
+                def split_mean(field):
+                    values = []
+                    for metrics in split_metrics:
+                        value = metrics.get(field)
+                        try:
+                            value = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if np.isfinite(value):
+                            values.append(value)
+                    return float(np.mean(values)) if values else None
+                def split_reason(field):
+                    reasons = sorted({
+                        str(metrics[field])
+                        for metrics in split_metrics
+                        if metrics.get(field)
+                    })
+                    return ";".join(reasons) if reasons else None
+                structural_fields = (
+                    "split_pre_segment_count", "split_post_segment_count",
+                    "split_child_count_mean", "split_min_child_fraction_min",
+                    "split_parent_normal_dispersion_mean",
+                    "split_child_normal_dispersion_mean",
+                    "split_largest_segment_ratio_delta",
+                    "split_area_entropy_delta",
+                    "split_effective_segment_count_delta",
+                    "split_tiny_child_area_ratio", "split_boundary_ratio_delta",
+                )
+                depth_regret = regret_metrics(depth_regrets)
+                geometry_regret = regret_metrics(geometry_regrets)
                 records.append({
                     "config_id": config, "sequence_id": sequence, "window_id": window_id,
                     "frame_start": start, "frame_end": end,
-                    "split_minus_depth_regret": depth_regret,
-                    "split_minus_geometry_regret": geometry_regret,
+                    "split_minus_depth_regret": depth_regret["mean"],
+                    "split_minus_geometry_regret": geometry_regret["mean"],
+                    **{
+                        f"split_minus_depth_regret_{name}": depth_regret[name]
+                        for name in (
+                            "max", "positive_area", "positive_duration",
+                            "positive_persistence", "change_points",
+                        )
+                    },
+                    **{
+                        f"split_minus_geometry_regret_{name}": geometry_regret[name]
+                        for name in (
+                            "max", "positive_area", "positive_duration",
+                            "positive_persistence", "change_points",
+                        )
+                    },
                     "split_accepted_count": (
                         int(sum(accepted_values)) if accepted_values else None
                     ),
                     "split_changed_pixel_ratio": (
                         float(np.mean(changed_values)) if changed_values else None
+                    ),
+                    "split_score_mean": split_mean("split_score_mean"),
+                    "split_score_invalid_reason": split_reason(
+                        "split_score_invalid_reason"
+                    ),
+                    "split_segment_count_delta": split_mean(
+                        "split_segment_count_delta"
+                    ),
+                    **{
+                        field: split_mean(field) for field in structural_fields
+                    },
+                    "split_child_summary_invalid_reason": split_reason(
+                        "split_child_summary_invalid_reason"
+                    ),
+                    "split_normal_dispersion_gain_mean": split_mean(
+                        "split_normal_dispersion_gain_mean"
+                    ),
+                    "split_normal_dispersion_invalid_reason": split_reason(
+                        "split_normal_dispersion_invalid_reason"
+                    ),
+                    "split_fragmentation_signal": (
+                        bool(any(
+                            bool(metrics["split_fragmentation_signal"])
+                            for metrics in split_metrics
+                            if metrics.get("split_fragmentation_signal") is not None
+                        ))
+                        if any(
+                            metrics.get("split_fragmentation_signal") is not None
+                            for metrics in split_metrics
+                        )
+                        else None
                     ),
                     "merge_anomaly": cross,
                     "atom_anomaly": lsr + np.log1p(growth),
@@ -479,6 +705,67 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
                     "confidence": float(np.mean(confidence_values)) if confidence_values else 0.0,
                 })
     return records
+
+
+def _build_split_structural_summary(center_record: dict | None) -> dict[str, Any]:
+    if center_record is None:
+        raise RuntimeError("Missing required split structural summary record")
+    fields = {
+        "accepted_count": "split_accepted_count",
+        "score_mean": "split_score_mean",
+        "score_invalid_reason": "split_score_invalid_reason",
+        "changed_pixel_ratio": "split_changed_pixel_ratio",
+        "pre_segment_count": "split_pre_segment_count",
+        "post_segment_count": "split_post_segment_count",
+        "segment_count_delta": "split_segment_count_delta",
+        "child_count_mean": "split_child_count_mean",
+        "child_summary_invalid_reason": "split_child_summary_invalid_reason",
+        "min_child_fraction_min": "split_min_child_fraction_min",
+        "parent_normal_dispersion_mean": "split_parent_normal_dispersion_mean",
+        "child_normal_dispersion_mean": "split_child_normal_dispersion_mean",
+        "normal_dispersion_gain_mean": "split_normal_dispersion_gain_mean",
+        "normal_dispersion_invalid_reason": "split_normal_dispersion_invalid_reason",
+        "largest_segment_ratio_delta": "split_largest_segment_ratio_delta",
+        "area_entropy_delta": "split_area_entropy_delta",
+        "effective_segment_count_delta": "split_effective_segment_count_delta",
+        "tiny_child_area_ratio": "split_tiny_child_area_ratio",
+        "boundary_ratio_delta": "split_boundary_ratio_delta",
+        "fragmentation_signal": "split_fragmentation_signal",
+    }
+    missing_keys = [source for source in fields.values() if source not in center_record]
+    if missing_keys:
+        raise RuntimeError(
+            "Missing required split structural summary: "
+            + ", ".join(sorted(missing_keys))
+        )
+    result = {name: center_record[source] for name, source in fields.items()}
+    reasoned_nulls = (
+        ("score_mean", "score_invalid_reason"),
+        ("child_count_mean", "child_summary_invalid_reason"),
+        ("min_child_fraction_min", "child_summary_invalid_reason"),
+        ("parent_normal_dispersion_mean", "normal_dispersion_invalid_reason"),
+        ("child_normal_dispersion_mean", "normal_dispersion_invalid_reason"),
+        ("normal_dispersion_gain_mean", "normal_dispersion_invalid_reason"),
+    )
+    silent = [
+        value_name
+        for value_name, reason_name in reasoned_nulls
+        if result[value_name] is None and not result[reason_name]
+    ]
+    always_required = (
+        "accepted_count", "changed_pixel_ratio", "pre_segment_count",
+        "post_segment_count", "segment_count_delta",
+        "largest_segment_ratio_delta", "area_entropy_delta",
+        "effective_segment_count_delta", "tiny_child_area_ratio",
+        "boundary_ratio_delta", "fragmentation_signal",
+    )
+    silent.extend(name for name in always_required if result[name] is None)
+    if silent:
+        raise RuntimeError(
+            "Missing required split structural summary: "
+            + ", ".join(sorted(set(silent)))
+        )
+    return result
 
 
 def build_cases(
@@ -534,7 +821,12 @@ def build_cases(
             if budget is not None:
                 budget.enforce(estimated_bytes=100 * 1024 * 1024)
             local_index = min(max(center - window_id * stride, 0), args.window_size - 1)
-            rendered = render_case(paths, case_dir, frame_index=local_index)
+            rendered = render_case(
+                paths,
+                case_dir,
+                frame_index=local_index,
+                require_split_evidence=(config == "layer_atomic_split"),
+            )
             if budget is not None:
                 budget.enforce()
             values: dict[str, np.ndarray] = {}
@@ -553,7 +845,12 @@ def build_cases(
                     for name in data.files:
                         value = data[name]
                         combined_arrays[f"{config}__{kind}__{name}"] = value
-                        if name in ("final_labels", "scale_map"):
+                        if name in (
+                            "final_labels", "pre_split_labels", "atom_labels",
+                            "atom_scales", "changed_mask", "split_parent_map",
+                            "split_child_map", "split_score_map",
+                            "split_decision_map", "scale_map",
+                        ):
                             selected_value = value
                             if selected_value.ndim == 3:
                                 selected_value = selected_value[
@@ -626,6 +923,37 @@ def build_cases(
                     comparable["layer_atomic_split"],
                 ),
             }
+            split_values = comparison_data["layer_atomic_split"]
+            pre_geometry = compare_labelings(
+                split_values["pre_split_labels"],
+                comparable["geometry_baseline"],
+            )
+            post_geometry = compare_labelings(
+                comparable["layer_atomic_split"],
+                comparable["geometry_baseline"],
+            )
+            if not pre_geometry["valid"] or not post_geometry["valid"]:
+                raise RuntimeError(
+                    f"Required geometry split comparison unavailable for "
+                    f"{interval.sequence_id}/{center}"
+                )
+            geometry_split_comparison = {
+                "boundary_disagreement_pre": pre_geometry["boundary_disagreement_ratio"],
+                "boundary_disagreement_post": post_geometry["boundary_disagreement_ratio"],
+                "boundary_disagreement_delta": (
+                    post_geometry["boundary_disagreement_ratio"]
+                    - pre_geometry["boundary_disagreement_ratio"]
+                ),
+                "variation_of_information_pre": pre_geometry["variation_of_information"],
+                "variation_of_information_post": post_geometry["variation_of_information"],
+                "variation_of_information_delta": (
+                    post_geometry["variation_of_information"]
+                    - pre_geometry["variation_of_information"]
+                ),
+            }
+            split_structural_summary = _build_split_structural_summary(
+                center_record
+            )
             atomic_write_json(interval_root / "metrics.json", {
                 "comparison": "depth_vs_geometry_baseline_vs_layer_atomic_split",
                 "interval": interval.to_dict(),
@@ -633,6 +961,8 @@ def build_cases(
                 "selection_reasons": list(interval.reasons),
                 "split_minus_depth_regret": depth_regret,
                 "split_minus_geometry_regret": geometry_regret,
+                "geometry_split_comparison": geometry_split_comparison,
+                "split_structural_summary": split_structural_summary,
                 "pairwise_comparisons": pairwise_comparisons,
                 **pairwise_comparisons["geometry_baseline_vs_layer_atomic_split"],
             })
@@ -640,6 +970,10 @@ def build_cases(
             raise RuntimeError(
                 f"Missing comparable final labels for {interval.sequence_id}/{center}"
             )
+        timeline = _build_case_trajectory_timeline(
+            run_dir, interval.sequence_id, interval.start_frame, interval.end_frame
+        )
+        atomic_write_json(interval_root / "trajectory-timeline.json", timeline)
         generated = _artifact_inventory(interval_root, [interval_root])
         generated.pop("artifact-manifest.json", None)
         artifact_manifest["generated_artifacts"] = generated
@@ -667,7 +1001,7 @@ def _validate_case_artifacts(interval_root: Path) -> tuple[bool, str]:
         return False, "generated_artifact_set_mismatch"
     required = {
         "trace.npz", "metrics.json", "segmentation_disagreement.png",
-        "comparison-rendering.json",
+        "comparison-rendering.json", "trajectory-timeline.json",
     }
     for config in DIAGNOSTIC_PROFILES:
         required.update({
@@ -682,8 +1016,16 @@ def _validate_case_artifacts(interval_root: Path) -> tuple[bool, str]:
         except (FileNotFoundError, json.JSONDecodeError):
             return False, f"invalid_rendering_manifest:{config}"
         artifacts = rendering.get("artifacts", {})
-        if not isinstance(artifacts, dict) or len(artifacts) != 19:
+        if not isinstance(artifacts, dict) or len(artifacts) != 21:
             return False, f"incomplete_rendering_manifest:{config}"
+        if config == "layer_atomic_split":
+            availability = rendering.get("availability", {})
+            required_split = {
+                "pre_split_labels", "changed_mask", "split_parent_map",
+                "split_child_map", "split_score_map", "split_decision_map",
+            }
+            if not all(availability.get(name) is True for name in required_split):
+                return False, "missing_required_split_rendering_evidence"
         required.update(f"{config}/{filename}" for filename in artifacts.values())
     if not required <= set(inventory):
         return False, "missing_required_case_artifact:" + ",".join(sorted(required - set(inventory)))
@@ -708,6 +1050,40 @@ def _validate_case_artifacts(interval_root: Path) -> tuple[bool, str]:
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             return False, f"unreadable_case_artifact:{relative}:{exc}"
     return True, "complete"
+
+
+def _build_case_trajectory_timeline(
+    run_dir: Path, sequence: str, start: int, end: int,
+) -> dict[str, Any]:
+    errors = {}
+    for config in DIAGNOSTIC_PROFILES:
+        path = Path(run_dir) / "trajectory" / config / f"{sequence}.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            raise FileNotFoundError(
+                f"Missing required aligned trajectory evidence: {path}"
+            ) from exc
+        values = payload.get("per_frame_translation_error")
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Missing per-frame aligned errors: {path}")
+        local_end = min(end, len(values) - 1)
+        errors[config] = values[start:local_end + 1]
+    depth = compute_regret_series(errors["layer_atomic_split"], errors["depth"])
+    geometry = compute_regret_series(
+        errors["layer_atomic_split"], errors["geometry_baseline"]
+    )
+    if not depth["valid"] or not geometry["valid"]:
+        raise ValueError("Missing required local regret comparison")
+    return {
+        "frame_start": int(start),
+        "frame_end": int(start + len(errors["layer_atomic_split"]) - 1),
+        "errors": errors,
+        "regrets": {
+            "split_minus_depth_regret": depth["values"],
+            "split_minus_geometry_regret": geometry["values"],
+        },
+    }
 
 
 def run_master(args, *, runner=subprocess.run) -> int:
@@ -852,10 +1228,17 @@ def run_master(args, *, runner=subprocess.run) -> int:
                 expected_sequences=args.sequences,
             ) if split_ates else {"passed": False, "baseline_config": "depth", "failure_reasons": ["missing_layer_atomic_split"]}
             summary["sequence_metrics"] = trajectory
+            summary["regret"] = _persist_regret_artifacts(
+                output, trajectory, args.sequences
+            )
             atomic_write_json(output / "summary.json", summary)
             records = build_selection_records(output, trajectory, args)
             atomic_write_json(output / "selection_records.json", records)
-            intervals = select_intervals(records, limit=args.max_selected)
+            intervals, coverage = select_intervals_with_coverage(
+                records, limit=args.max_selected
+            )
+            summary["selection_coverage"] = coverage
+            atomic_write_json(output / "summary.json", summary)
             intervals = [
                 SelectedInterval(
                     item.sequence_id,

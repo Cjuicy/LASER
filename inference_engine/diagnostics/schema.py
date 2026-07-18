@@ -103,6 +103,7 @@ class RunManifest:
     seed: int
     environment: dict[str, Any]
     budget: dict[str, Any]
+    experiment_contract: dict[str, Any]
     status: str = "created"
     state: dict[str, Any] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
@@ -120,6 +121,17 @@ class RunManifest:
             raise ValueError(
                 f"Unsupported schema_version {self.schema_version!r}; "
                 f"expected {SCHEMA_VERSION!r}."
+            )
+        required_contract_fields = {
+            "profiles", "sequences", "window_size", "overlap",
+            "evaluation_signature",
+        }
+        if not isinstance(self.experiment_contract, dict):
+            raise ValueError("experiment_contract must be a dictionary")
+        missing = required_contract_fields - set(self.experiment_contract)
+        if missing:
+            raise ValueError(
+                "experiment_contract is missing: " + ", ".join(sorted(missing))
             )
 
     def mark(
@@ -144,4 +156,6 @@ class RunManifest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunManifest":
         _check_schema(data)
+        if "experiment_contract" not in data:
+            raise ValueError("manifest is missing experiment_contract")
         return cls(**data)

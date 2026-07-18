@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import numpy as np
 import pytest
@@ -10,6 +11,9 @@ from inference_engine.diagnostics.segmentation import (
     trace_segmentation_frame,
 )
 from inference_engine.utils.depth import segment_depth_felzenszwalb_rag
+from inference_engine.utils.geometry_segmentation import (
+    segment_geometry_felzenszwalb_rag_stages,
+)
 from inference_engine.utils import post_merge_split as pms
 from inference_engine.utils.layer_atomic_geometry import (
     segment_point_map_layer_atomic_split_stages,
@@ -67,6 +71,28 @@ def test_partition_comparison_rejects_shape_mismatch_without_sentinel_numbers():
     assert result["invalid_reason"] == "shape_mismatch"
 
 
+def test_geometry_segmentation_declares_four_channel_geometry_as_multichannel():
+    height, width = 8, 10
+    yy, xx = np.mgrid[:height, :width].astype(np.float32)
+    points = np.stack((xx, yy, 1.0 + xx / width), axis=-1)
+
+    with warnings.catch_warnings(record=True) as observed:
+        warnings.simplefilter("always")
+        segment_geometry_felzenszwalb_rag_stages(
+            points[..., -1],
+            point_map=points,
+            seg_scale=2,
+            seg_sigma=0,
+            seg_min_size=2,
+            normal_method="cross",
+        )
+
+    assert not [
+        warning for warning in observed
+        if "third dimension of 4" in str(warning.message)
+    ]
+
+
 def test_depth_trace_handles_single_frame_confidence_with_batch_equivalent_semantics():
     depth = np.linspace(1, 3, 36).reshape(6, 6)
     points = np.stack(np.meshgrid(np.arange(6), np.arange(6), indexing="xy") + [depth], axis=-1)
@@ -122,6 +148,19 @@ def test_layer_atomic_split_trace_matches_staged_formal_labels_and_emits_evidenc
     assert ratio == np.count_nonzero(changed_mask) / changed_mask.size
     assert np.count_nonzero(changed_mask) == 0
     assert ratio == 0.0
+    split = trace["metrics"]["split"]
+    assert split["geometry_boundary_disagreement_pre"] is not None
+    assert split["geometry_boundary_disagreement_post"] is not None
+    assert split["geometry_boundary_disagreement_delta"] == pytest.approx(
+        split["geometry_boundary_disagreement_post"]
+        - split["geometry_boundary_disagreement_pre"]
+    )
+    assert split["geometry_vi_pre"] is not None
+    assert split["geometry_vi_post"] is not None
+    assert split["geometry_vi_delta"] == pytest.approx(
+        split["geometry_vi_post"] - split["geometry_vi_pre"]
+    )
+    assert split["geometry_comparison_invalid_reason"] is None
 
 
 def test_layer_atomic_split_trace_reports_observed_changed_pixel_ratio(monkeypatch):

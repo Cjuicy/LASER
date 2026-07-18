@@ -27,13 +27,45 @@ class SplitDiagnostics:
     split_proposed_count: int = 0
     split_accepted_count: int = 0
     split_added_regions: int = 0
-    split_score_mean: float = 0.0
-    split_score_max: float = 0.0
+    split_score_mean: float | None = None
+    split_score_max: float | None = None
+    split_score_quantiles: dict[str, float] | None = None
+    split_score_invalid_reason: str | None = "no_scored_candidates"
     split_reject_no_markers: int = 0
     split_reject_small_child: int = 0
     split_reject_low_score: int = 0
     split_runtime_ms: float = 0.0
     split_aux_confirmation: bool = True
+    split_pre_segment_count: int = 0
+    split_post_segment_count: int = 0
+    split_segment_count_delta: int = 0
+    split_segment_growth_ratio: float | None = None
+    split_changed_pixel_count: int = 0
+    split_changed_pixel_ratio: float | None = None
+    split_child_count_mean: float | None = None
+    split_child_count_max: int | None = None
+    split_min_child_fraction_mean: float | None = None
+    split_min_child_fraction_min: float | None = None
+    split_child_summary_invalid_reason: str | None = "no_valid_child_proposals"
+    split_parent_normal_dispersion_mean: float | None = None
+    split_child_normal_dispersion_mean: float | None = None
+    split_normal_dispersion_gain_mean: float | None = None
+    split_normal_dispersion_gain_max: float | None = None
+    split_normal_dispersion_invalid_reason: str | None = "no_valid_child_proposals"
+    split_largest_segment_ratio_pre: float | None = None
+    split_largest_segment_ratio_post: float | None = None
+    split_largest_segment_ratio_delta: float | None = None
+    split_area_entropy_pre: float | None = None
+    split_area_entropy_post: float | None = None
+    split_area_entropy_delta: float | None = None
+    split_effective_segment_count_pre: float | None = None
+    split_effective_segment_count_post: float | None = None
+    split_effective_segment_count_delta: float | None = None
+    split_tiny_child_area_ratio: float | None = None
+    split_boundary_ratio_pre: float | None = None
+    split_boundary_ratio_post: float | None = None
+    split_boundary_ratio_delta: float | None = None
+    split_fragmentation_signal: bool = False
 
     def as_dict(self):
         return asdict(self)
@@ -245,6 +277,45 @@ def _normal_gain(normals, valid, parent_mask, candidate):
     return float(np.clip((parent_dispersion - after) / parent_dispersion, 0.0, 1.0))
 
 
+def _normal_dispersion_pair(normals, valid, parent_mask, candidate):
+    parent_valid = parent_mask & valid
+    parent_dispersion = _normal_dispersion(normals, parent_valid)
+    total = 0
+    weighted = 0.0
+    for child_id in np.unique(candidate[parent_mask]):
+        child_valid = parent_valid & (candidate == child_id)
+        count = int(np.count_nonzero(child_valid))
+        dispersion = _normal_dispersion(normals, child_valid)
+        if count and np.isfinite(dispersion):
+            total += count
+            weighted += count * dispersion
+    child_dispersion = weighted / total if total else np.nan
+    return float(parent_dispersion), float(child_dispersion)
+
+
+def _partition_structure(labels):
+    labels = np.asarray(labels)
+    if labels.ndim != 2 or labels.size == 0:
+        return None
+    _, compact = np.unique(labels, return_inverse=True)
+    compact = compact.reshape(labels.shape)
+    counts = np.bincount(compact.reshape(-1)).astype(np.float64)
+    probabilities = counts / counts.sum()
+    entropy = float(-np.sum(probabilities * np.log(probabilities)))
+    right = compact[:, 1:] != compact[:, :-1]
+    down = compact[1:, :] != compact[:-1, :]
+    possible = int(right.size + down.size)
+    return {
+        "segment_count": int(counts.size),
+        "largest_segment_ratio": float(probabilities.max()),
+        "area_entropy": entropy,
+        "effective_segment_count": float(np.exp(entropy)),
+        "boundary_ratio": (
+            float((right.sum() + down.sum()) / possible) if possible else None
+        ),
+    }
+
+
 def _split_score(
     normals,
     valid,
@@ -332,6 +403,14 @@ def refine_auto_regions_with_trace(
     parent_count = proposed_count = accepted_count = added_regions = 0
     reject_no_markers = reject_small_child = reject_low_score = 0
     scores = []
+    had_non_finite_score = False
+    child_counts = []
+    min_child_fractions = []
+    parent_dispersions = []
+    child_dispersions = []
+    normal_gains = []
+    had_non_finite_dispersion = False
+    tiny_child_pixels = 0
 
     # Iterate over the original Auto labels only: newly created leaves are never revisited.
     parent_areas = np.bincount(labels.reshape(-1))
@@ -377,6 +456,9 @@ def refine_auto_regions_with_trace(
         nonzero = child_ids > 0
         child_ids = child_ids[nonzero]
         child_sizes = child_sizes[nonzero]
+        if child_ids.size:
+            child_counts.append(int(child_ids.size))
+            min_child_fractions.append(float(child_sizes.min() / parent_area))
         if (
             child_ids.size < 2
             or child_ids.size > MAX_LEAVES
@@ -391,6 +473,25 @@ def refine_auto_regions_with_trace(
         normal_gain = _normal_gain(
             crop_normals, crop_valid, crop_parent, candidate
         )
+        parent_dispersion, child_dispersion = _normal_dispersion_pair(
+            crop_normals, crop_valid, crop_parent, candidate
+        )
+        if (
+            np.isfinite(parent_dispersion)
+            and np.isfinite(child_dispersion)
+            and np.isfinite(normal_gain)
+        ):
+            parent_dispersions.append(parent_dispersion)
+            child_dispersions.append(child_dispersion)
+            normal_gains.append(float(normal_gain))
+        else:
+            had_non_finite_dispersion = True
+        if not np.isfinite(normal_gain):
+            had_non_finite_score = True
+            reject_low_score += 1
+            child_map[crop][crop_parent] = candidate[crop_parent]
+            decision_map[crop][crop_parent] = 4
+            continue
         if normal_gain < split_score_thresh:
             scores.append(normal_gain)
             reject_low_score += 1
@@ -417,6 +518,12 @@ def refine_auto_regions_with_trace(
             edge_fields,
             normal_gain=normal_gain,
         )
+        if not np.isfinite(score):
+            had_non_finite_score = True
+            reject_low_score += 1
+            child_map[crop][crop_parent] = candidate[crop_parent]
+            decision_map[crop][crop_parent] = 4
+            continue
         scores.append(score)
         if score < split_score_thresh:
             reject_low_score += 1
@@ -426,6 +533,9 @@ def refine_auto_regions_with_trace(
             continue
 
         accepted_count += 1
+        tiny_child_pixels += int(
+            child_sizes[(child_sizes / parent_area) < 0.05].sum()
+        )
         child_map[crop][crop_parent] = candidate[crop_parent]
         score_map[crop][crop_parent] = score
         decision_map[crop][crop_parent] = 1
@@ -443,18 +553,125 @@ def refine_auto_regions_with_trace(
             added_regions += 1
 
     runtime_ms = (time.perf_counter() - start) * 1000.0
+    score_values = np.asarray(scores, dtype=np.float64)
+    score_quantiles = (
+        {
+            f"p{int(quantile * 100)}": float(np.quantile(score_values, quantile))
+            for quantile in (0.10, 0.25, 0.50, 0.75, 0.90)
+        }
+        if score_values.size
+        else None
+    )
+    pre_structure = _partition_structure(labels)
+    post_structure = _partition_structure(result)
+    changed_pixel_count = int(np.count_nonzero(result != labels))
+    pixel_count = int(labels.size)
+    boundary_pre = pre_structure["boundary_ratio"] if pre_structure else None
+    boundary_post = post_structure["boundary_ratio"] if post_structure else None
+    boundary_delta = (
+        float(boundary_post - boundary_pre)
+        if boundary_pre is not None and boundary_post is not None
+        else None
+    )
+    tiny_child_ratio = float(tiny_child_pixels / pixel_count) if pixel_count else None
+    segment_delta = (
+        post_structure["segment_count"] - pre_structure["segment_count"]
+        if pre_structure and post_structure else 0
+    )
+    segment_growth = (
+        float(segment_delta / pre_structure["segment_count"])
+        if pre_structure and pre_structure["segment_count"] else None
+    )
     diagnostics = SplitDiagnostics(
         split_parent_count=parent_count,
         split_proposed_count=proposed_count,
         split_accepted_count=accepted_count,
         split_added_regions=added_regions,
-        split_score_mean=float(np.mean(scores)) if scores else 0.0,
-        split_score_max=float(np.max(scores)) if scores else 0.0,
+        split_score_mean=float(np.mean(score_values)) if score_values.size else None,
+        split_score_max=float(np.max(score_values)) if score_values.size else None,
+        split_score_quantiles=score_quantiles,
+        split_score_invalid_reason=(
+            None if score_values.size else (
+                "non_finite_split_score" if had_non_finite_score
+                else "no_scored_candidates"
+            )
+        ),
         split_reject_no_markers=reject_no_markers,
         split_reject_small_child=reject_small_child,
         split_reject_low_score=reject_low_score,
         split_runtime_ms=runtime_ms,
         split_aux_confirmation=bool(split_aux_confirmation),
+        split_pre_segment_count=pre_structure["segment_count"] if pre_structure else 0,
+        split_post_segment_count=post_structure["segment_count"] if post_structure else 0,
+        split_segment_count_delta=int(segment_delta),
+        split_segment_growth_ratio=segment_growth,
+        split_changed_pixel_count=changed_pixel_count,
+        split_changed_pixel_ratio=(
+            float(changed_pixel_count / pixel_count) if pixel_count else None
+        ),
+        split_child_count_mean=(float(np.mean(child_counts)) if child_counts else None),
+        split_child_count_max=(int(max(child_counts)) if child_counts else None),
+        split_min_child_fraction_mean=(
+            float(np.mean(min_child_fractions)) if min_child_fractions else None
+        ),
+        split_min_child_fraction_min=(
+            float(min(min_child_fractions)) if min_child_fractions else None
+        ),
+        split_child_summary_invalid_reason=(None if child_counts else "no_valid_child_proposals"),
+        split_parent_normal_dispersion_mean=(
+            float(np.mean(parent_dispersions)) if parent_dispersions else None
+        ),
+        split_child_normal_dispersion_mean=(
+            float(np.mean(child_dispersions)) if child_dispersions else None
+        ),
+        split_normal_dispersion_gain_mean=(
+            float(np.mean(normal_gains)) if normal_gains else None
+        ),
+        split_normal_dispersion_gain_max=(
+            float(np.max(normal_gains)) if normal_gains else None
+        ),
+        split_normal_dispersion_invalid_reason=(
+            None if normal_gains else (
+                "non_finite_normal_dispersion" if had_non_finite_dispersion
+                else "no_valid_child_proposals"
+            )
+        ),
+        split_largest_segment_ratio_pre=(
+            pre_structure["largest_segment_ratio"] if pre_structure else None
+        ),
+        split_largest_segment_ratio_post=(
+            post_structure["largest_segment_ratio"] if post_structure else None
+        ),
+        split_largest_segment_ratio_delta=(
+            post_structure["largest_segment_ratio"] - pre_structure["largest_segment_ratio"]
+            if pre_structure and post_structure else None
+        ),
+        split_area_entropy_pre=(pre_structure["area_entropy"] if pre_structure else None),
+        split_area_entropy_post=(post_structure["area_entropy"] if post_structure else None),
+        split_area_entropy_delta=(
+            post_structure["area_entropy"] - pre_structure["area_entropy"]
+            if pre_structure and post_structure else None
+        ),
+        split_effective_segment_count_pre=(
+            pre_structure["effective_segment_count"] if pre_structure else None
+        ),
+        split_effective_segment_count_post=(
+            post_structure["effective_segment_count"] if post_structure else None
+        ),
+        split_effective_segment_count_delta=(
+            post_structure["effective_segment_count"]
+            - pre_structure["effective_segment_count"]
+            if pre_structure and post_structure else None
+        ),
+        split_tiny_child_area_ratio=tiny_child_ratio,
+        split_boundary_ratio_pre=boundary_pre,
+        split_boundary_ratio_post=boundary_post,
+        split_boundary_ratio_delta=boundary_delta,
+        split_fragmentation_signal=bool(
+            (segment_growth is not None and segment_growth > 0.5)
+            or (tiny_child_ratio is not None and tiny_child_ratio > 0.05)
+            or (boundary_delta is not None and boundary_delta > 0.10)
+        ),
     )
     return SplitTrace(
         labels=result,

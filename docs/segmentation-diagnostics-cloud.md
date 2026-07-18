@@ -8,13 +8,15 @@
 每次运行严格按以下顺序串行执行三项配置；不得并行占用多份 GPU 或诊断磁盘：
 
 1. `depth`：深度基线，Felzenszwalb `300 / 1.1 / 500`；
-2. `geometry_baseline`：几何基线，Felzenszwalb `300 / 1.1 / 500`；
+2. `geometry_baseline`：几何基线，Felzenszwalb `300 / 1.1 / 500`，固定
+   `normal_method=cross`；
 3. `layer_atomic_split`：分层原子分割，Felzenszwalb `300 / 1.1 / 500`，固定
    `normal_method=cross`、`split_score_thresh=0.10`、
    `split_aux_confirmation=true`。
 
 三项配置共享同一个 checkpoint；入口会把 checkpoint SHA-256、git commit、数据指纹、
-窗口参数和上述固定配置写入 `manifest.json`。轨迹使用一次全序列 Sim(3) 对齐，
+窗口参数、按顺序排列的三项完整有效参数、序列清单和评估签名写入
+`manifest.json` 的 `experiment_contract`。轨迹使用一次全序列 Sim(3) 对齐，
 RPE 使用 `delta=1 frame, all_pairs=True`。引擎为无回环的
 `StreamingWindowEngine`。
 
@@ -188,11 +190,13 @@ $DIAG_OUT/
 ├── selection_records.json
 ├── checkpoints/pass1|pass2/<config>/<sequence>.json
 ├── trajectory/<config>/<sequence>.json|npz
+├── trajectory/regret/<sequence>.json|npz
 ├── artifacts/<config>/<sequence>/pass1|pass2/
 ├── cases/<sequence>/<interval>/<config>/
 │   ├── PNG、segments.ply、rendering.json、metrics.json
 │   └── （三个 config 均存在）
 ├── cases/<sequence>/<interval>/comparison-rendering.json
+├── cases/<sequence>/<interval>/trajectory-timeline.json
 └── report/
     ├── index.html
     ├── metrics.csv
@@ -202,14 +206,19 @@ $DIAG_OUT/
 正式成功必须同时满足：
 
 1. `manifest.json` 的 `status` 为 `complete`，schema 为 `2.0`；
-2. manifest 的三项配置、00–10、checkpoint SHA-256 和 50/40/10 GiB 阈值符合本页契约；
+2. manifest 的 `experiment_contract` 精确记录按顺序排列的三项完整配置（包括 geometry
+   `normal_method=cross`）、00–10、窗口/overlap 和全序列 Sim(3) + RPE 评估签名；
 3. `summary.json` 仅含 `depth`、`geometry_baseline`、`layer_atomic_split` 三种方法的
    ATE/RPE、Stability Guard 和 Recovery；
-4. `selected_intervals.json` 可追溯每个区间的 score/reasons，记录同时包含
-   `split_minus_depth_regret` 与 `split_minus_geometry_regret`；
-5. `report/index.html` 可离线打开，三方法案例和 comparison PNG/PLY 可访问；缺失的可选
+4. `trajectory/regret` 持久化两条逐帧 regret；窗口记录同时包含两条 regret 的
+   mean/max/正面积/正持续长度/最长持续段/change point，缺失比较保持 `null`；
+5. `selected_intervals.json` 可追溯每个区间的 score/reasons，`summary.json` 对六种选择原因
+   给出明确的 available/selected/reason coverage；
+6. `report/index.html` 可离线打开，包含每条请求序列的两条 regret timeline、split activity、
+   正式排名/aggregate、split scatter，以及案例的 parent/child、pre/post geometry 和局部
+   三误差/两 regret 证据；缺失的可选
    scale/temporal 证据必须显示 `UNAVAILABLE`，不能以单位尺度或伪造热图代替；
-6. 实际 00–10 GPU 运行完成前，不报告或推广任何 ATE 结论。
+7. 实际 00–10 GPU 运行完成前，不报告或推广任何 ATE 结论。
 
 建议先检查 overview 的 Stability Guard 和 02/04/10 Recovery，再按
 `Segmentation → Merge → Scale → Trajectory` 查看 selected case。相关性只支持排查，

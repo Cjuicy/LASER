@@ -94,6 +94,13 @@ def test_run_manifest_round_trip_and_status_updates():
         seed=0,
         environment={"python": "3.11"},
         budget={"max_temp_gib": 50},
+        experiment_contract={
+            "profiles": [],
+            "sequences": ["02"],
+            "window_size": 20,
+            "overlap": 5,
+            "evaluation_signature": {},
+        },
     )
     manifest.mark("pass1", "layer_atomic_split", "02", "complete")
 
@@ -101,6 +108,23 @@ def test_run_manifest_round_trip_and_status_updates():
 
     assert restored.to_dict() == manifest.to_dict()
     assert restored.state["pass1"]["layer_atomic_split"]["02"] == "complete"
+
+
+def test_current_schema_manifest_without_experiment_contract_is_rejected():
+    data = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": "run-1",
+        "git_commit": "abc123",
+        "checkpoint_sha256": "f" * 64,
+        "config_hash": "c" * 64,
+        "dataset_fingerprint": "d" * 64,
+        "seed": 0,
+        "environment": {},
+        "budget": {},
+    }
+
+    with pytest.raises(ValueError, match="experiment_contract"):
+        RunManifest.from_dict(data)
 
 
 def test_atomic_json_and_jsonl_are_readable(tmp_path):

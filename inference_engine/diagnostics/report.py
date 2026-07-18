@@ -105,7 +105,7 @@ def _case_page(case_dir: Path, report_cases: Path, run_dir: Path) -> tuple[str, 
     image_names = [
         "rgb.png", "initial_atoms.png", "coarse_layers.png", "pre_split_segments.png",
         "final_segments.png", "split_changed_regions.png", "split_scores.png",
-        "split_decisions.png",
+        "split_decisions.png", "split_parent_map.png", "split_child_map.png",
         "merge_decisions.png", "component_growth.png", "scale_source.png",
         "scale_map.png", "scale_dispersion.png", "propagation_hops.png", "temporal.png",
         "pointcloud_top.png", "pointcloud_side.png", "segmentation_disagreement.png", "scale_log_ratio.png",
@@ -130,7 +130,26 @@ def _case_page(case_dir: Path, report_cases: Path, run_dir: Path) -> tuple[str, 
             )
     ply_link = f'<p><a href="../../{escape(str(relative / "segments.ply"))}">segments.ply</a></p>' if (case_dir / "segments.ply").exists() else ""
     trace_link = f'<p><a href="../../{escape(str(relative / "trace.npz"))}">trace.npz</a></p>' if (case_dir / "trace.npz").exists() else ""
-    html = f"<!doctype html><meta charset='utf-8'><style>{STYLE}</style><main><a href='../index.html'>← Overview</a><h1>{escape(str(relative))}</h1><h2>Segmentation → Merge → Scale → Trajectory</h2><div class='card'><pre>{escape(json.dumps(metrics, indent=2, ensure_ascii=False))}</pre>{ply_link}{trace_link}</div><div class='grid'>{images}</div>{''.join(method_sections)}</main>"
+    timeline = _load(case_dir / "trajectory-timeline.json", {})
+    if not timeline:
+        raise ValueError(f"Missing required local trajectory timeline: {case_dir}")
+    geometry_evidence = metrics.get("geometry_split_comparison")
+    structural = metrics.get("split_structural_summary")
+    if not isinstance(geometry_evidence, dict) or not isinstance(structural, dict):
+        raise ValueError(f"Missing required split case summaries: {case_dir}")
+    html = (
+        f"<!doctype html><meta charset='utf-8'><style>{STYLE}</style><main>"
+        f"<a href='../index.html'>← Overview</a><h1>{escape(str(relative))}</h1>"
+        "<h2>Segmentation → Merge → Scale → Trajectory</h2>"
+        f"<div class='card'><pre>{escape(json.dumps(metrics, indent=2, ensure_ascii=False))}</pre>{ply_link}{trace_link}</div>"
+        "<section class='card'><h2>Aligned local three-error / two-regret timeline</h2>"
+        f"{_local_timeline_svg(timeline)}</section>"
+        "<section class='card'><h2>Geometry boundary disagreement pre/post</h2>"
+        f"<pre>{escape(json.dumps(geometry_evidence, indent=2, ensure_ascii=False))}</pre></section>"
+        "<section class='card'><h2>Structural split summary</h2>"
+        f"<pre>{escape(json.dumps(structural, indent=2, ensure_ascii=False))}</pre></section>"
+        f"<div class='grid'>{images}</div>{''.join(method_sections)}</main>"
+    )
     report_cases.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(report_cases / page_name, html)
     score = float(metrics.get("selection_score", metrics.get("score", 0)) or 0)
@@ -252,7 +271,11 @@ def _write_csv(run_dir: Path, summary: dict, selection_diagnostics: dict):
 
 def _correlations(run_dir: Path) -> list[dict]:
     records = _load(run_dir / "selection_records.json", [])
-    signals = ("merge_anomaly", "atom_anomaly", "scale_dispersion", "temporal_churn")
+    signals = (
+        "split_score_mean", "split_accepted_count",
+        "split_changed_pixel_ratio", "split_segment_count_delta",
+        "merge_anomaly", "atom_anomaly", "scale_dispersion", "temporal_churn",
+    )
     grouped: dict[tuple[str, str], list[dict]] = {}
     for record in records:
         grouped.setdefault((record.get("config_id", ""), record.get("sequence_id", "")), []).append(record)
@@ -286,32 +309,194 @@ def _correlations(run_dir: Path) -> list[dict]:
     return result
 
 
-def _timeline_svg(summary: dict) -> str:
+def _svg_points(values, *, width, height, minimum, maximum):
+    array = np.asarray(values, dtype=float)
+    finite = np.isfinite(array)
+    points = []
+    for index, value in enumerate(array):
+        if not finite[index]:
+            continue
+        x = 12 + index * (width - 24) / max(len(array) - 1, 1)
+        y = height - 18 - (value - minimum) * (height - 36) / max(
+            maximum - minimum, 1e-9
+        )
+        points.append(f"{x:.1f},{y:.1f}")
+    return " ".join(points)
+
+
+def _local_timeline_svg(timeline: dict) -> str:
+    series = {
+        **timeline.get("errors", {}),
+        **timeline.get("regrets", {}),
+    }
+    values = [
+        float(value)
+        for item in series.values()
+        for value in item
+        if value is not None and np.isfinite(value)
+    ]
+    if not values:
+        return "<p>UNAVAILABLE: local aligned errors and regrets.</p>"
+    low, high = min(values), max(values)
+    width, height = 720, 190
+    colors = {
+        **COLORS,
+        "split_minus_depth_regret": "#7048e8",
+        "split_minus_geometry_regret": "#e67700",
+    }
+    paths = []
+    for name, item in series.items():
+        points = _svg_points(
+            item, width=width, height=height, minimum=low, maximum=high
+        )
+        paths.append(
+            f'<polyline fill="none" stroke="{colors.get(name, "#495057")}" '
+            f'stroke-width="1.7" points="{points}"/><text x="12" '
+            f'y="{16 + 14 * len(paths)}" font-size="10">{escape(name)}</text>'
+        )
+    return f'<svg viewBox="0 0 {width} {height}" role="img">{"".join(paths)}</svg>'
+
+
+def _timeline_svg(summary: dict, records: list[dict], selected: list[dict]) -> str:
     metrics = summary.get("sequence_metrics", {})
     panels = []
-    for sequence in ("02", "04", "10"):
-        series = []
-        maximum = 0.0
-        for config in COLORS:
-            values = metrics.get(config, {}).get(sequence, {}).get("per_frame_translation_error") or []
-            if values:
-                array = np.asarray(values, dtype=float)
-                finite = array[np.isfinite(array)]
-                maximum = max(maximum, float(finite.max()) if finite.size else 0)
-                series.append((config, array))
-        if not series:
+    sequences = sorted({
+        sequence for config in COLORS
+        for sequence in metrics.get(config, {})
+    })
+    for sequence in sequences:
+        split = metrics.get("layer_atomic_split", {}).get(sequence, {}).get(
+            "per_frame_translation_error"
+        ) or []
+        depth = metrics.get("depth", {}).get(sequence, {}).get(
+            "per_frame_translation_error"
+        ) or []
+        geometry = metrics.get("geometry_baseline", {}).get(sequence, {}).get(
+            "per_frame_translation_error"
+        ) or []
+        count = min(len(split), len(depth), len(geometry))
+        if not count:
             continue
-        width, height = 440, 125
-        paths = []
-        for config, values in series:
-            sample = values[np.linspace(0, len(values) - 1, min(len(values), 300)).astype(int)]
-            points = " ".join(
-                f"{10 + index * (width-20)/max(len(sample)-1,1):.1f},{height-15 - min(max(float(value),0),maximum)*(height-30)/max(maximum,1e-9):.1f}"
-                for index, value in enumerate(sample)
+        regret_series = {
+            "split_minus_depth_regret": (
+                np.asarray(split[:count], dtype=float)
+                - np.asarray(depth[:count], dtype=float)
+            ),
+            "split_minus_geometry_regret": (
+                np.asarray(split[:count], dtype=float)
+                - np.asarray(geometry[:count], dtype=float)
+            ),
+        }
+        all_values = np.concatenate(list(regret_series.values()))
+        finite = all_values[np.isfinite(all_values)]
+        low, high = (
+            (float(finite.min()), float(finite.max())) if finite.size else (-1.0, 1.0)
+        )
+        width, height = 620, 150
+        overlays = []
+        for interval in selected:
+            if str(interval.get("sequence_id")) != sequence:
+                continue
+            start = int(interval.get("start_frame", 0))
+            end = int(interval.get("end_frame", start))
+            x = 12 + start * (width - 24) / max(count - 1, 1)
+            overlay_width = max(
+                2.0, (end - start + 1) * (width - 24) / max(count, 1)
             )
-            paths.append(f'<polyline fill="none" stroke="{COLORS[config]}" stroke-width="1.5" points="{points}"/>')
-        panels.append(f'<svg viewBox="0 0 {width} {height}" role="img"><text x="10" y="13">KITTI {sequence}</text>{"".join(paths)}</svg>')
-    return "".join(panels) or "<p>No per-frame trajectory series yet.</p>"
+            overlays.append(
+                f'<rect x="{x:.1f}" y="20" width="{overlay_width:.1f}" '
+                'height="112" fill="#ffd43b" opacity="0.20"/>'
+            )
+        activity = [
+            row for row in records
+            if row.get("config_id") == "layer_atomic_split"
+            and str(row.get("sequence_id")) == sequence
+        ]
+        bars = []
+        max_activity = max(
+            (float(row.get("split_accepted_count") or 0) for row in activity),
+            default=0.0,
+        )
+        for row in activity:
+            value = float(row.get("split_accepted_count") or 0)
+            if value <= 0:
+                continue
+            x = 12 + int(row.get("frame_start", 0)) * (width - 24) / max(count - 1, 1)
+            bar_height = 22 * value / max(max_activity, 1e-9)
+            bars.append(
+                f'<rect x="{x:.1f}" y="{132-bar_height:.1f}" width="3" '
+                f'height="{bar_height:.1f}" fill="#343a40"/>'
+            )
+        lines = []
+        for name, values in regret_series.items():
+            color = "#7048e8" if name.endswith("depth_regret") else "#e67700"
+            points = _svg_points(
+                values, width=width, height=height, minimum=low, maximum=high
+            )
+            lines.append(
+                f'<polyline fill="none" stroke="{color}" stroke-width="1.6" '
+                f'points="{points}"/><text x="12" y="{36 + 13*len(lines)}" '
+                f'font-size="10">{name}</text>'
+            )
+        panels.append(
+            f'<svg viewBox="0 0 {width} {height}" role="img">'
+            f'<text x="10" y="13">KITTI {sequence}: two regrets + split activity</text>'
+            f'{"".join(overlays)}{"".join(lines)}{"".join(bars)}</svg>'
+        )
+    return "".join(panels) or "<p>No per-frame regret series yet.</p>"
+
+
+def _scatter_svg(records: list[dict]) -> str:
+    signals = (
+        "split_score_mean", "split_accepted_count",
+        "split_changed_pixel_ratio", "split_segment_count_delta",
+    )
+    panels = []
+    for signal in signals:
+        for target in REGRET_FIELDS:
+            pairs = []
+            for row in records:
+                if row.get("config_id") != "layer_atomic_split":
+                    continue
+                x, y = row.get(signal), row.get(target)
+                if x is None or y is None:
+                    continue
+                if np.isfinite(x) and np.isfinite(y):
+                    pairs.append((float(x), float(y)))
+            width, height = 260, 150
+            circles = []
+            if pairs:
+                xs, ys = zip(*pairs, strict=True)
+                xmin, xmax = min(xs), max(xs)
+                ymin, ymax = min(ys), max(ys)
+                for x, y in pairs:
+                    px = 12 + (x - xmin) * (width - 24) / max(xmax - xmin, 1e-9)
+                    py = height - 16 - (y - ymin) * (height - 38) / max(ymax - ymin, 1e-9)
+                    circles.append(
+                        f'<circle cx="{px:.1f}" cy="{py:.1f}" r="2.5" fill="#2459a9"/>'
+                    )
+            panels.append(
+                f'<svg viewBox="0 0 {width} {height}" role="img">'
+                f'<text x="8" y="12" font-size="9">{signal} vs {target}</text>'
+                f'{"".join(circles)}</svg>'
+            )
+    return "".join(panels)
+
+
+def _ranking_tables(summary: dict) -> tuple[str, str]:
+    ranking_rows = "".join(
+        f"<tr><td>{escape(sequence)}</td><td>{rank}</td>"
+        f"<td>{escape(row.get('config_id', ''))}</td><td>{row.get('ate_rmse', '—')}</td></tr>"
+        for sequence, rows in sorted(summary.get("official_ranking", {}).items())
+        for rank, row in enumerate(rows, 1)
+    )
+    aggregate_rows = "".join(
+        f"<tr><td>{escape(config)}</td><td>{values.get('mean_ate', '—')}</td>"
+        f"<td>{values.get('median_ate', '—')}</td><td>{values.get('wins', '—')}</td>"
+        f"<td>{values.get('max_sequence_regression', '—')}</td></tr>"
+        for config, values in summary.get("official_aggregate", {}).items()
+    )
+    return ranking_rows, aggregate_rows
 
 
 def build_report(run_dir: str | Path) -> Path:
@@ -371,15 +556,24 @@ def build_report(run_dir: str | Path) -> Path:
         f'<li><code>{escape(reason)}</code>: {escape(label)}</li>'
         for reason, label in CASE_REASON_LABELS.items()
     )
+    raw_records = _load(run_dir / "selection_records.json", [])
+    selected = _load(run_dir / "selected_intervals.json", [])
+    ranking_rows, aggregate_rows = _ranking_tables(summary)
+    coverage = escape(json.dumps(
+        summary.get("selection_coverage", {}), ensure_ascii=False, indent=2
+    ))
     html = f"""<!doctype html><html><head><meta charset='utf-8'><title>LASER segmentation diagnostics</title><style>{STYLE}</style></head><body><main>
 <h1>LASER segmentation diagnostics</h1>{warning}
 <section class='card'><h2>Official methods</h2><ul>{method_legend}</ul></section>
 <div class='card'><h2>Run provenance &amp; storage budget</h2><pre>{provenance}</pre></div>
 <div class='grid'><section class='card'><h2>Stability Guard</h2><p class='{"ok" if passed else "bad"}'>{guard_text}</p><pre>{escape(json.dumps(guard, ensure_ascii=False, indent=2))}</pre></section><section class='card'><h2>Recovery</h2><pre>{recovery}</pre></section></div>
-<section class='card'><h2>ATE / RPE overview heatmap</h2>{heatmap}<table><tr><th>Config</th><th>Sequence</th><th>RPE trans</th><th>RPE rot deg</th></tr>{rpe_rows}</table><p>One global Sim(3) alignment per sequence; RPE delta=1 frame, all pairs.</p></section>
-<section class='card'><h2>Error timeline and selected intervals</h2>{_timeline_svg(summary)}<p>The ranked cases show trajectory regret alongside segmentation, merge, scale and temporal evidence.</p></section>
-<section class='card'><h2>Selected case ranking</h2><table><tr><th>#</th><th>Case</th><th>Selection score</th><th>split_minus_depth_regret</th><th>split_minus_geometry_regret</th><th>Selection reasons</th></tr>{case_rows}</table><h3>Case reason labels</h3><ul>{reason_legend}</ul></section>
-<section class='card'><h2>Correlation &amp; lag diagnostics</h2><table><tr><th>Regret</th><th>Signal</th><th>Lag</th><th>N</th><th>Pearson</th><th>Spearman</th></tr>{correlation_rows}</table><p>Correlation tables (Pearson/Spearman, lag 0–3) support checking hypotheses; they do not establish causality. Missing rates and sample counts are exported in <a href='correlations.json'>correlations.json</a>.</p></section>
+	<section class='card'><h2>ATE / RPE overview heatmap</h2>{heatmap}<table><tr><th>Config</th><th>Sequence</th><th>RPE trans</th><th>RPE rot deg</th></tr>{rpe_rows}</table><p>One global Sim(3) alignment per sequence; RPE delta=1 frame, all pairs.</p></section>
+	<section class='card'><h2>Official per-sequence ranking</h2><table><tr><th>Sequence</th><th>Rank</th><th>Method</th><th>ATE RMSE</th></tr>{ranking_rows}</table><h3>Aggregate mean / median / wins</h3><table><tr><th>Method</th><th>Mean ATE</th><th>Median ATE</th><th>Wins</th><th>Maximum sequence regression</th></tr>{aggregate_rows}</table></section>
+	<section class='card'><h2>Two regret timelines for every requested sequence</h2>{_timeline_svg(summary, raw_records, selected)}<p>Yellow regions are the selected interval overlay; black bars show split activity aligned in time.</p></section>
+	<section class='card'><h2>Selection coverage</h2><pre>{coverage}</pre></section>
+	<section class='card'><h2>Selected case ranking</h2><table><tr><th>#</th><th>Case</th><th>Selection score</th><th>split_minus_depth_regret</th><th>split_minus_geometry_regret</th><th>Selection reasons</th></tr>{case_rows}</table><h3>Case reason labels</h3><ul>{reason_legend}</ul></section>
+	<section class='card'><h2>Split-specific scatter / correlation evidence</h2><div class='grid'>{_scatter_svg(raw_records)}</div><p>Signals: split_score_mean, split_accepted_count, split_changed_pixel_ratio, and split_segment_count_delta (region growth). Geometry is a comparator, not ground truth.</p></section>
+	<section class='card'><h2>Correlation &amp; lag diagnostics</h2><table><tr><th>Regret</th><th>Signal</th><th>Lag</th><th>N</th><th>Pearson</th><th>Spearman</th></tr>{correlation_rows}</table><p>Correlation tables (Pearson/Spearman, lag 0–3) support checking hypotheses; they do not establish causality. Missing rates and sample counts are exported in <a href='correlations.json'>correlations.json</a>.</p></section>
 <section class='card'><h2>Exports</h2><a href='sequence_metrics.csv'>sequence_metrics.csv</a></section>
 </main></body></html>"""
     index = report_dir / "index.html"

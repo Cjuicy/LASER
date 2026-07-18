@@ -12,6 +12,87 @@ GUARD_SEQUENCES = ("00", "05", "09")
 RECOVERY_SEQUENCES = ("02", "04", "10")
 
 
+def summarize_regret(values: np.ndarray | list[float]) -> dict[str, Any]:
+    array = np.asarray(values, dtype=float).reshape(-1)
+    finite = np.isfinite(array)
+    if not finite.any():
+        return {
+            "valid": False,
+            "invalid_reason": "missing_comparison",
+            "mean": None,
+            "max": None,
+            "positive_area": None,
+            "positive_duration": None,
+            "positive_persistence": None,
+            "change_points": [],
+        }
+    clean = array[finite]
+    positive = finite & (array > 0)
+    longest = current = 0
+    for is_positive in positive:
+        current = current + 1 if is_positive else 0
+        longest = max(longest, current)
+    changes = []
+    for frame_index in range(1, len(array)):
+        if not (finite[frame_index - 1] and finite[frame_index]):
+            continue
+        delta = float(array[frame_index] - array[frame_index - 1])
+        magnitude = abs(delta)
+        if magnitude <= 1e-12:
+            continue
+        changes.append({
+            "frame_index": frame_index,
+            "delta": delta,
+            "magnitude": magnitude,
+        })
+    changes.sort(key=lambda item: (-item["magnitude"], item["frame_index"]))
+    return {
+        "valid": True,
+        "invalid_reason": None if finite.all() else "partial_missing_comparison",
+        "mean": float(np.mean(clean)),
+        "max": float(np.max(clean)),
+        "positive_area": float(np.sum(array[positive])),
+        "positive_duration": int(np.count_nonzero(positive)),
+        "positive_persistence": int(longest),
+        "change_points": changes[:3],
+    }
+
+
+def compute_regret_series(split_errors, reference_errors) -> dict[str, Any]:
+    def coerce(values):
+        if values is None:
+            return np.empty(0, dtype=float)
+        result = []
+        for value in values:
+            try:
+                result.append(float(value))
+            except (TypeError, ValueError):
+                result.append(np.nan)
+        return np.asarray(result, dtype=float)
+
+    split = coerce(split_errors)
+    reference = coerce(reference_errors)
+    length = max(len(split), len(reference))
+    regret = np.full(length, np.nan, dtype=float)
+    overlap = min(len(split), len(reference))
+    if overlap:
+        valid = np.isfinite(split[:overlap]) & np.isfinite(reference[:overlap])
+        regret[:overlap][valid] = split[:overlap][valid] - reference[:overlap][valid]
+    finite_count = int(np.count_nonzero(np.isfinite(regret)))
+    if finite_count == 0:
+        invalid_reason = "missing_comparison"
+    elif finite_count != length:
+        invalid_reason = "partial_missing_comparison"
+    else:
+        invalid_reason = None
+    return {
+        "valid": finite_count > 0,
+        "invalid_reason": invalid_reason,
+        "values": [float(value) if np.isfinite(value) else None for value in regret],
+        "summary": summarize_regret(regret),
+    }
+
+
 def recovery_score(
     depth_ate: float,
     split_ate: float,
@@ -19,6 +100,13 @@ def recovery_score(
     *,
     eps: float = 1e-9,
 ) -> dict:
+    values = np.asarray([depth_ate, split_ate, geometry_ate], dtype=float)
+    if not np.isfinite(values).all():
+        return {
+            "valid": False,
+            "score": None,
+            "invalid_reason": "non_finite_ate_input",
+        }
     denominator = float(depth_ate - geometry_ate)
     if not np.isfinite(denominator) or denominator <= eps:
         return {"valid": False, "score": None, "invalid_reason": "non_positive_recovery_gap"}
@@ -103,7 +191,19 @@ def build_sequence_summary(results: dict[str, dict[str, dict[str, Any]]]) -> dic
             "median_ate": float(np.median(values)) if values else None,
             "valid_sequences": len(values),
             "wins": sum(bool(ranking[seq]) and ranking[seq][0]["config_id"] == config_id for seq in sequences),
+            "max_sequence_regression": None,
         }
+        regressions = []
+        for sequence in sequences:
+            depth = results.get("depth", {}).get(sequence, {}).get("ate_rmse")
+            value = results.get(config_id, {}).get(sequence, {}).get("ate_rmse")
+            if (
+                depth is not None and value is not None
+                and np.isfinite(depth) and np.isfinite(value) and depth > 0
+            ):
+                regressions.append(float(value / depth - 1.0))
+        if regressions:
+            aggregates[config_id]["max_sequence_regression"] = max(regressions)
     recovery = {}
     for sequence in RECOVERY_SEQUENCES:
         depth = results.get("depth", {}).get(sequence, {}).get("ate_rmse")

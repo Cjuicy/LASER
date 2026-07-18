@@ -23,7 +23,11 @@ from inference_engine.diagnostics.schema import (
     SelectedInterval,
 )
 from inference_engine.diagnostics.segmentation import summarize_labels
-from inference_engine.diagnostics.selection import select_intervals
+from inference_engine.diagnostics.selection import (
+    REQUIRED_COVERAGE_REASONS,
+    select_intervals,
+    select_intervals_with_coverage,
+)
 from inference_engine.diagnostics.sink import FileDiagnosticSink
 from inference_engine.diagnostics.storage import (
     FreeSpaceReserveExceeded,
@@ -150,6 +154,10 @@ def _render_case_arrays(
         "pre_split_labels": pre_split_labels, "final_labels": final_labels,
         "changed_mask": changed, "split_score_map": split_trace.score_map,
         "split_decision_map": split_trace.decision_map,
+        "atom_labels": split_trace.parent_map,
+        "atom_scales": np.ones(int(split_trace.parent_map.max()) + 1),
+        "split_parent_map": split_trace.parent_map,
+        "split_child_map": split_trace.child_map,
         "merge_decision": np.where(changed, 2, 0).astype(np.uint8),
         "source_map": np.ones_like(final_labels, dtype=np.uint8),
         "scale_map": np.ones_like(final_labels, dtype=np.float32) * 1.1,
@@ -170,6 +178,19 @@ def main(argv=None) -> int:
     manifest = RunManifest(
         "synthetic", "verification", "not-required", "synthetic-config",
         "synthetic-data", 0, {}, {"max_gib": 50, "warn_gib": 40, "min_free_gib": 10},
+        {
+            "profiles": [
+                {"config_id": method, "effective_parameters": {}}
+                for method in METHODS
+            ],
+            "sequences": ["02"],
+            "window_size": 20,
+            "overlap": 5,
+            "evaluation_signature": {
+                "align": True, "correct_scale": True,
+                "rpe_delta": 1, "all_pairs": True,
+            },
+        },
     )
     assert context.to_dict()["schema_version"] == SCHEMA_VERSION == "2.0"
     assert DiagnosticContext.from_dict(context.to_dict()) == context
@@ -217,8 +238,10 @@ def main(argv=None) -> int:
     _pass("storage")
 
     records = _selection_records()
-    selected = select_intervals(records, limit=48)
+    selected, coverage = select_intervals_with_coverage(records, limit=48)
     assert selected and ALL_REASONS <= {reason for item in selected for reason in item.reasons}
+    assert set(coverage) == set(REQUIRED_COVERAGE_REASONS)
+    assert all(item["available"] and item["selected"] for item in coverage.values())
     assert all(
         "split_minus_depth_regret" in record and "split_minus_geometry_regret" in record
         for record in records
@@ -273,6 +296,31 @@ def main(argv=None) -> int:
         "split_minus_depth_regret": 8.0,
         "split_minus_geometry_regret": 7.2,
         "largest_segment_ratio": summarize_labels(dense_trace.labels)["largest_segment_ratio"],
+        "geometry_split_comparison": {
+            "boundary_disagreement_pre": .4,
+            "boundary_disagreement_post": .2,
+            "boundary_disagreement_delta": -.2,
+        },
+        "split_structural_summary": {
+            "accepted_count": 1,
+            "score_mean": .3,
+            "changed_pixel_ratio": .5,
+            "segment_count_delta": 1,
+            "normal_dispersion_gain_mean": .4,
+        },
+    })
+    atomic_write_json(interval_dir / "trajectory-timeline.json", {
+        "frame_start": 0,
+        "frame_end": 2,
+        "errors": {
+            "depth": [1.0, 1.2, 1.1],
+            "geometry_baseline": [.9, 1.0, 1.0],
+            "layer_atomic_split": [1.1, .8, 1.2],
+        },
+        "regrets": {
+            "split_minus_depth_regret": [.1, -.4, .1],
+            "split_minus_geometry_regret": [.2, -.2, .2],
+        },
     })
     assert (interval_dir / "layer_atomic_split" / "split_decisions.png").is_file()
     assert (interval_dir / "comparison-rendering.json").is_file()
@@ -283,10 +331,23 @@ def main(argv=None) -> int:
     atomic_write_json(output / "manifest.json", manifest.to_dict())
     atomic_write_json(output / "summary.json", {
         "stability_guard": {"passed": True}, "recovery": {"02": {"valid": True, "score": .5}},
+        "selection_coverage": coverage,
+        "official_ranking": {
+            "02": [
+                {"config_id": "layer_atomic_split", "ate_rmse": 1.0},
+                {"config_id": "geometry_baseline", "ate_rmse": 1.1},
+                {"config_id": "depth", "ate_rmse": 1.2},
+            ],
+        },
+        "official_aggregate": {
+            "depth": {"mean_ate": 1.2, "median_ate": 1.2, "wins": 0, "max_sequence_regression": 0.0},
+            "geometry_baseline": {"mean_ate": 1.1, "median_ate": 1.1, "wins": 0, "max_sequence_regression": -.08},
+            "layer_atomic_split": {"mean_ate": 1.0, "median_ate": 1.0, "wins": 1, "max_sequence_regression": -.17},
+        },
         "sequence_metrics": {
-            "depth": {"02": {"ate_rmse": 1.2, "rpe_translation_rmse": .2, "rpe_rotation_rmse_deg": .2}},
-            "geometry_baseline": {"02": {"ate_rmse": 1.1, "rpe_translation_rmse": .15, "rpe_rotation_rmse_deg": .15}},
-            "layer_atomic_split": {"02": {"ate_rmse": 1.0, "rpe_translation_rmse": .1, "rpe_rotation_rmse_deg": .1}},
+            "depth": {"02": {"ate_rmse": 1.2, "rpe_translation_rmse": .2, "rpe_rotation_rmse_deg": .2, "per_frame_translation_error": [1.0, 1.2, 1.1]}},
+            "geometry_baseline": {"02": {"ate_rmse": 1.1, "rpe_translation_rmse": .15, "rpe_rotation_rmse_deg": .15, "per_frame_translation_error": [.9, 1.0, 1.0]}},
+            "layer_atomic_split": {"02": {"ate_rmse": 1.0, "rpe_translation_rmse": .1, "rpe_rotation_rmse_deg": .1, "per_frame_translation_error": [1.1, .8, 1.2]}},
             "geometry_legacy_reference": {"02": {"ate_rmse": .9, "rpe_translation_rmse": .05, "rpe_rotation_rmse_deg": .05}},
         },
     })

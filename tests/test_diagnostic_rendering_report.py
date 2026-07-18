@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from inference_engine.diagnostics.rendering import (
     render_case,
@@ -35,6 +36,10 @@ def _trace(path, *, include_split=True):
         arrays.update(
             pre_split_labels=(x >= 5).astype(np.int32),
             changed_mask=changed,
+            atom_labels=(x // 2).astype(np.int32),
+            atom_scales=np.ones(5),
+            split_parent_map=(x >= 5).astype(np.int32),
+            split_child_map=labels,
             split_score_map=np.where(changed, .35, np.nan).astype(np.float32),
             split_decision_map=np.where(changed, 1, 0).astype(np.uint8),
         )
@@ -51,6 +56,7 @@ def test_renderer_writes_complete_deterministic_headless_case(tmp_path):
         "scale_map", "scale_dispersion", "temporal", "pointcloud_top", "pointcloud_side",
         "pre_split_segments", "split_changed_regions", "split_scores",
         "split_decisions",
+        "split_parent_map", "split_child_map",
     }
     assert expected <= set(first)
     for path in first.values():
@@ -61,6 +67,8 @@ def test_renderer_writes_complete_deterministic_headless_case(tmp_path):
 
     rendering = json.loads((tmp_path / "case" / "rendering.json").read_text())
     assert rendering["availability"]["split_score_map"] is True
+    assert rendering["availability"]["split_parent_map"] is True
+    assert rendering["availability"]["split_child_map"] is True
     assert rendering["legends"]["split_decisions"] == {
         "0": "none",
         "1": "accepted",
@@ -85,6 +93,9 @@ def test_renderer_writes_explicit_unavailable_split_evidence(tmp_path):
     assert rendering["availability"]["changed_mask"] is False
     assert rendering["availability"]["split_score_map"] is False
     assert rendering["availability"]["split_decision_map"] is False
+
+    with pytest.raises(ValueError, match="required split rendering arrays"):
+        render_case(trace, tmp_path / "strict-case", require_split_evidence=True)
 
 
 def test_method_comparison_replaces_stale_scale_ratio_with_unavailable_panel(tmp_path):
@@ -149,6 +160,29 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
         "split_minus_geometry_regret": -.4,
         "selection_reasons": reasons,
         "largest_segment_ratio": .7,
+        "geometry_split_comparison": {
+            "boundary_disagreement_pre": .4,
+            "boundary_disagreement_post": .2,
+            "boundary_disagreement_delta": -.2,
+        },
+        "split_structural_summary": {
+            "accepted_count": 1,
+            "segment_count_delta": 2,
+            "normal_dispersion_gain_mean": .3,
+        },
+    }))
+    (case / "trajectory-timeline.json").write_text(json.dumps({
+        "frame_start": 10,
+        "frame_end": 12,
+        "errors": {
+            "depth": [2.0, 2.5, 3.0],
+            "geometry_baseline": [1.5, 2.0, 2.5],
+            "layer_atomic_split": [2.5, 1.5, 4.0],
+        },
+        "regrets": {
+            "split_minus_depth_regret": [0.5, -1.0, 1.0],
+            "split_minus_geometry_regret": [1.0, -0.5, 1.5],
+        },
     }))
     (tmp_path / "manifest.json").write_text(json.dumps({
         "run_id": "test", "git_commit": "abc", "checkpoint_sha256": "123",
@@ -156,6 +190,15 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
     }))
     (tmp_path / "summary.json").write_text(json.dumps({
         "stability_guard": {"passed": True}, "recovery": {"02": .5},
+        "official_aggregate": {
+            "depth": {"mean_ate": 11, "median_ate": 11, "wins": 0, "max_sequence_regression": 1.0},
+            "geometry_baseline": {"mean_ate": 10.5, "median_ate": 10.5, "wins": 0, "max_sequence_regression": .5},
+            "layer_atomic_split": {"mean_ate": 10, "median_ate": 10, "wins": 1, "max_sequence_regression": 0.0},
+        },
+        "selection_coverage": {
+            reason: {"available": True, "selected": True, "reason": None, "qualifying_window_count": 1}
+            for reason in reasons
+        },
         "official_ranking": {"02": [
             {"config_id": "depth", "ate_rmse": 11.0},
             {"config_id": "geometry_baseline", "ate_rmse": 10.5},
@@ -164,9 +207,9 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
             {"config_id": "layer_atomic", "ate_rmse": 8.0},
         ]},
         "sequence_metrics": {
-            "depth": {"02": {"ate_rmse": 11, "rpe_translation_rmse": .3, "rpe_rotation_rmse_deg": .2}},
-            "geometry_baseline": {"02": {"ate_rmse": 10.5, "rpe_translation_rmse": .25, "rpe_rotation_rmse_deg": .15}},
-            "layer_atomic_split": {"02": {"ate_rmse": 10, "rpe_translation_rmse": .2, "rpe_rotation_rmse_deg": .1}},
+            "depth": {"02": {"ate_rmse": 11, "rpe_translation_rmse": .3, "rpe_rotation_rmse_deg": .2, "per_frame_translation_error": [2, 2.5, 3]}},
+            "geometry_baseline": {"02": {"ate_rmse": 10.5, "rpe_translation_rmse": .25, "rpe_rotation_rmse_deg": .15, "per_frame_translation_error": [1.5, 2, 2.5]}},
+            "layer_atomic_split": {"02": {"ate_rmse": 10, "rpe_translation_rmse": .2, "rpe_rotation_rmse_deg": .1, "per_frame_translation_error": [2.5, 1.5, 4]}},
             "geometry_legacy_reference": {"02": {"ate_rmse": 9}},
             "layer_atomic": {"02": {"ate_rmse": 8}},
         },
@@ -177,6 +220,10 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
             "window_id": 2, "frame_start": 10, "frame_end": 20,
             "split_minus_depth_regret": 1.2,
             "split_minus_geometry_regret": None,
+            "split_score_mean": .25,
+            "split_accepted_count": 2,
+            "split_changed_pixel_ratio": .2,
+            "split_segment_count_delta": 3,
         },
     ]))
     (tmp_path / "selected_intervals.json").write_text(json.dumps([
@@ -194,6 +241,18 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
     assert "ATE / RPE" in html
     assert "Selected case ranking" in html
     assert "Correlation" in html
+    assert "Official per-sequence ranking" in html
+    assert "Aggregate mean / median / wins" in html
+    assert "Maximum sequence regression" in html
+    assert "Two regret timelines for every requested sequence" in html
+    assert "selected interval overlay" in html
+    assert "split activity" in html
+    assert "Split-specific scatter / correlation evidence" in html
+    assert "split_score_mean" in html
+    assert "split_accepted_count" in html
+    assert "split_changed_pixel_ratio" in html
+    assert "split_segment_count_delta" in html
+    assert "Selection coverage" in html
     assert "000010-000020" in html
     assert "layer_atomic_split" in html
     assert "split_minus_depth_regret" in html
@@ -210,6 +269,11 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
     assert "split_changed_regions.png" in detail
     assert "split_minus_depth_regret" in detail
     assert "split_minus_geometry_regret" in detail
+    assert "Aligned local three-error / two-regret timeline" in detail
+    assert "Geometry boundary disagreement pre/post" in detail
+    assert "Structural split summary" in detail
+    assert "split_parent_map.png" in detail
+    assert "split_child_map.png" in detail
     summary_export = json.loads((index.parent / "summary.json").read_text())
     assert set(summary_export["sequence_metrics"]) == {
         "depth", "geometry_baseline", "layer_atomic_split",

@@ -164,13 +164,29 @@ def write_segment_ply(point_map: np.ndarray, labels: np.ndarray, path: str | Pat
     return path
 
 
-def render_case(trace_paths, output_dir: str | Path, *, frame_index: int = 0) -> dict[str, Path]:
+def render_case(
+    trace_paths,
+    output_dir: str | Path,
+    *,
+    frame_index: int = 0,
+    require_split_evidence: bool = False,
+) -> dict[str, Path]:
     arrays = _load_traces(trace_paths)
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
     required = ("final_labels", "initial_labels", "coarse_labels", "rgb", "point_map", "confidence")
     missing_required = [name for name in required if name not in arrays]
     if missing_required:
         raise ValueError("Missing required rendering arrays: " + ", ".join(missing_required))
+    split_required = (
+        "pre_split_labels", "final_labels", "atom_labels", "atom_scales",
+        "changed_mask", "split_parent_map", "split_child_map",
+        "split_score_map", "split_decision_map",
+    )
+    missing_split = [name for name in split_required if name not in arrays]
+    if require_split_evidence and missing_split:
+        raise ValueError(
+            "Missing required split rendering arrays: " + ", ".join(missing_split)
+        )
     labels = np.asarray(arrays["final_labels"])
     if labels.ndim == 3:
         labels = labels[min(max(frame_index, 0), len(labels) - 1)]
@@ -191,7 +207,7 @@ def render_case(trace_paths, output_dir: str | Path, *, frame_index: int = 0) ->
         "merge_decision", "component_growth_map", "source_map", "scale_map",
         "dispersion_map", "propagation_hop_map", "temporal_best_iou_map",
         "pre_split_labels", "changed_mask", "split_score_map",
-        "split_decision_map",
+        "split_decision_map", "split_parent_map", "split_child_map",
     )}
     legends = {}
     depth_rgb, legends["depth"] = _heatmap(depth)
@@ -250,6 +266,16 @@ def render_case(trace_paths, output_dir: str | Path, *, frame_index: int = 0) ->
         pre_split_rgb = _palette(select_frame(arrays["pre_split_labels"]))
     else:
         pre_split_rgb = _unavailable(labels.shape, "pre_split_labels")
+    parent_rgb = (
+        _palette(select_frame(arrays["split_parent_map"]))
+        if availability["split_parent_map"]
+        else _unavailable(labels.shape, "split_parent_map")
+    )
+    child_rgb = (
+        _palette(select_frame(arrays["split_child_map"]))
+        if availability["split_child_map"]
+        else _unavailable(labels.shape, "split_child_map")
+    )
 
     if availability["changed_mask"]:
         changed = select_frame(arrays["changed_mask"]).astype(bool, copy=False)
@@ -299,6 +325,7 @@ def render_case(trace_paths, output_dir: str | Path, *, frame_index: int = 0) ->
         "rgb": rgb, "depth": depth_rgb, "confidence": conf_rgb,
         "initial_atoms": _palette(initial), "coarse_layers": _palette(coarse),
         "pre_split_segments": pre_split_rgb, "final_segments": _palette(labels),
+        "split_parent_map": parent_rgb, "split_child_map": child_rgb,
         "split_changed_regions": changed_rgb, "split_scores": split_score_rgb,
         "split_decisions": split_decision_rgb, "merge_decisions": merge_rgb,
         "component_growth": growth_rgb, "scale_source": source_rgb,

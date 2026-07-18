@@ -147,6 +147,32 @@ def test_trace_records_accepted_parent_evidence(monkeypatch):
     assert set(np.unique(trace.child_map)) == {1, 2}
     assert np.all(trace.score_map >= 0.10)
     assert np.any(trace.changed_mask)
+    evidence = trace.diagnostics.as_dict()
+    assert evidence["split_score_mean"] is not None
+    assert evidence["split_score_max"] is not None
+    assert evidence["split_score_quantiles"] == {
+        "p10": pytest.approx(evidence["split_score_mean"]),
+        "p25": pytest.approx(evidence["split_score_mean"]),
+        "p50": pytest.approx(evidence["split_score_mean"]),
+        "p75": pytest.approx(evidence["split_score_mean"]),
+        "p90": pytest.approx(evidence["split_score_mean"]),
+    }
+    assert evidence["split_score_invalid_reason"] is None
+    assert evidence["split_pre_segment_count"] == 1
+    assert evidence["split_post_segment_count"] == 2
+    assert evidence["split_segment_count_delta"] == 1
+    assert evidence["split_changed_pixel_count"] > 0
+    assert evidence["split_changed_pixel_ratio"] > 0
+    assert evidence["split_child_count_mean"] == 2
+    assert evidence["split_min_child_fraction_min"] == pytest.approx(0.5)
+    assert evidence["split_parent_normal_dispersion_mean"] is not None
+    assert evidence["split_child_normal_dispersion_mean"] is not None
+    assert evidence["split_normal_dispersion_gain_mean"] > 0
+    assert evidence["split_largest_segment_ratio_delta"] < 0
+    assert evidence["split_area_entropy_delta"] > 0
+    assert evidence["split_effective_segment_count_delta"] > 0
+    assert evidence["split_boundary_ratio_delta"] > 0
+    assert evidence["split_fragmentation_signal"] in (True, False)
 
 
 def test_trace_records_rejected_parent_evidence(monkeypatch):
@@ -176,6 +202,15 @@ def test_trace_records_rejected_parent_evidence(monkeypatch):
     assert not np.any(trace.changed_mask)
     assert np.all(trace.score_map == 0.0)
     assert set(np.unique(trace.child_map)) == {1, 2}
+    evidence = trace.diagnostics.as_dict()
+    assert evidence["split_score_mean"] == 0.0
+    assert evidence["split_score_invalid_reason"] is None
+    assert evidence["split_pre_segment_count"] == evidence["split_post_segment_count"] == 1
+    assert evidence["split_segment_count_delta"] == 0
+    assert evidence["split_changed_pixel_count"] == 0
+    assert evidence["split_changed_pixel_ratio"] == 0.0
+    assert evidence["split_child_count_mean"] == 2
+    assert evidence["split_min_child_fraction_min"] == pytest.approx(0.5)
 
 
 def test_trace_records_no_marker_rejection(monkeypatch):
@@ -203,6 +238,47 @@ def test_trace_records_no_marker_rejection(monkeypatch):
     assert np.all(trace.decision_map == 2)
     assert np.all(trace.child_map == -1)
     assert np.all(np.isnan(trace.score_map))
+    evidence = trace.diagnostics.as_dict()
+    assert evidence["split_score_mean"] is None
+    assert evidence["split_score_max"] is None
+    assert evidence["split_score_quantiles"] is None
+    assert evidence["split_score_invalid_reason"] == "no_scored_candidates"
+    assert evidence["split_child_count_mean"] is None
+    assert evidence["split_child_summary_invalid_reason"] == "no_valid_child_proposals"
+
+
+def test_non_finite_split_score_is_rejected_and_reported_as_missing(monkeypatch):
+    points, labels, atoms, rgb = _fixture()
+    normals = np.zeros_like(points)
+    normals[:, :16, 2] = 1.0
+    normals[:, 16:, 0] = 1.0
+    monkeypatch.setattr(
+        pms,
+        "_normal_map",
+        lambda point_map, method: (normals, np.ones(labels.shape, bool)),
+    )
+    monkeypatch.setattr(pms, "_normal_gain", lambda *args, **kwargs: np.nan)
+
+    trace = pms.refine_auto_regions_with_trace(
+        points,
+        rgb,
+        labels,
+        atoms,
+        np.ones(1),
+        seg_min_size=20,
+        normal_method="cross",
+        split_score_thresh=0.10,
+    )
+
+    evidence = trace.diagnostics.as_dict()
+    assert trace.diagnostics.split_accepted_count == 0
+    assert trace.diagnostics.split_reject_low_score == 1
+    assert evidence["split_score_mean"] is None
+    assert evidence["split_score_max"] is None
+    assert evidence["split_score_quantiles"] is None
+    assert evidence["split_score_invalid_reason"] == "non_finite_split_score"
+    assert evidence["split_normal_dispersion_invalid_reason"] == "non_finite_normal_dispersion"
+    assert not np.any(trace.changed_mask)
 
 
 def test_trace_records_small_child_rejection(monkeypatch):

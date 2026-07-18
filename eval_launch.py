@@ -88,7 +88,7 @@ def get_args_parser():
     parser.add_argument('--split_aux_confirmation', default=True,
                         action=argparse.BooleanOptionalAction)
 
-    # Unified entry point for the full four-profile diagnostic workflow.  The
+    # Unified entry point for the strict three-method diagnostic workflow.  The
     # dedicated script exposes the same implementation with shorter flag names.
     parser.add_argument('--diagnostic_dataset_root', type=str)
     parser.add_argument('--diagnostic_output_dir', default='./results/segmentation-diagnostics')

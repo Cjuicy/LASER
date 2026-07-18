@@ -30,6 +30,26 @@ WEIGHTS = {
 }
 RECOVERY = {"02", "04", "10"}
 GUARD = {"00", "05", "09"}
+REQUIRED_COVERAGE_REASONS = (
+    "trajectory_degradation",
+    "trajectory_improvement",
+    "trajectory_change",
+    "split_anomaly",
+    "split_no_trajectory_effect",
+    "matched_control",
+)
+
+
+def _empty_coverage():
+    return {
+        reason: {
+            "available": False,
+            "selected": False,
+            "reason": "no_qualifying_window",
+            "qualifying_window_count": 0,
+        }
+        for reason in REQUIRED_COVERAGE_REASONS
+    }
 
 
 def robust_zscore(values: Iterable[float]) -> np.ndarray:
@@ -90,9 +110,9 @@ def _stride(rows: list[dict]) -> int:
     return max(1, int(rows[0]["frame_end"]) - int(rows[0]["frame_start"]) + 1)
 
 
-def select_intervals(
+def _select_intervals(
     records: list[dict], *, limit: int = 48, context_windows: int = 2,
-) -> list[SelectedInterval]:
+) -> tuple[list[SelectedInterval], dict]:
     if limit <= 0:
         raise ValueError("interval limit must be positive")
 
@@ -130,7 +150,7 @@ def select_intervals(
         )
         windows.append(merged)
     if not windows:
-        return []
+        return [], _empty_coverage()
 
     regret_zscores = [
         np.abs(robust_zscore(_number(row[field]) for row in windows))
@@ -209,7 +229,8 @@ def select_intervals(
                         item[0], -temporal[item[1]]["frame_start"],
                     ),
                 )
-                add(temporal[index], "trajectory_change", 1.0 + delta)
+                if delta > 1e-12:
+                    add(temporal[index], "trajectory_change", 1.0 + delta)
 
         active = [
             row for row in rows if _number(row["split_accepted_count"], -1.0) > 0
@@ -278,8 +299,11 @@ def select_intervals(
         key=lambda row: (-row["split_z"], row["sequence_id"], row["frame_start"]),
     )[:6]:
         if (
+            row["split_z"] > 0
+            and (
             _number(row["split_accepted_count"], -1.0) > 0
             or _number(row["split_changed_pixel_ratio"], -1.0) > 0
+            )
         ):
             add(row, "split_anomaly", 2.0 + row["split_z"])
     for family in FAMILIES:
@@ -409,7 +433,7 @@ def select_intervals(
             + ", ".join(missing)
         )
     chosen.sort(key=lambda item: (item["sequence_id"], item["start"]))
-    return [
+    intervals = [
         SelectedInterval(
             sequence_id=item["sequence_id"],
             start_frame=int(item["start"]),
@@ -419,3 +443,36 @@ def select_intervals(
         )
         for item in chosen
     ]
+    coverage = {}
+    for reason in REQUIRED_COVERAGE_REASONS:
+        qualifying = sum(reason in item["reasons"] for item in candidates.values())
+        selected = any(reason in item.reasons for item in intervals)
+        available = qualifying > 0
+        coverage[reason] = {
+            "available": available,
+            "selected": selected,
+            "reason": (
+                None if selected else (
+                    "selection_limit_excluded" if available
+                    else "no_qualifying_window"
+                )
+            ),
+            "qualifying_window_count": qualifying,
+        }
+    return intervals, coverage
+
+
+def select_intervals(
+    records: list[dict], *, limit: int = 48, context_windows: int = 2,
+) -> list[SelectedInterval]:
+    return _select_intervals(
+        records, limit=limit, context_windows=context_windows
+    )[0]
+
+
+def select_intervals_with_coverage(
+    records: list[dict], *, limit: int = 48, context_windows: int = 2,
+) -> tuple[list[SelectedInterval], dict]:
+    return _select_intervals(
+        records, limit=limit, context_windows=context_windows
+    )

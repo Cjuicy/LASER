@@ -102,6 +102,14 @@ class StreamingWindowEngine(VanillaEngine):
                 raise ValueError("diagnostic_sequence_id is required when diagnostics are enabled")
             if diagnostic_pass not in (1, 2):
                 raise ValueError("diagnostic_pass must be 1 or 2 when diagnostics are enabled")
+            if segment_mode not in ("depth", "geometry", "layer_atomic_split"):
+                raise ValueError(
+                    "diagnostics require one of depth, geometry, or layer_atomic_split"
+                )
+            if segment_mode == "geometry" and geometry_seg_profile != "baseline_params":
+                raise ValueError(
+                    "diagnostics require geometry_seg_profile='baseline_params'"
+                )
         if segment_mode not in SEGMENT_MODES:
             raise ValueError(
                 f"Unknown segment_mode: {segment_mode!r}; expected one of {SEGMENT_MODES}."
@@ -223,11 +231,7 @@ class StreamingWindowEngine(VanillaEngine):
 
         config_id = self.segment_mode
         if self.segment_mode == "geometry":
-            config_id = (
-                "geometry_baseline"
-                if self.geometry_seg_profile == "baseline_params"
-                else "geometry_legacy_reference"
-            )
+            config_id = "geometry_baseline"
         return DiagnosticContext(
             run_id=self.diagnostic_run_id,
             config_id=config_id,

@@ -253,6 +253,51 @@ def trace_segmentation_frame(
             split_score_map=stages.split_trace.score_map,
             split_decision_map=stages.split_trace.decision_map,
         )
+        geometry_stages = segment_geometry_felzenszwalb_rag_stages(
+            depth,
+            conf_map=conf_map,
+            point_map=point_map,
+            top_conf_percentile=top_conf_percentile,
+            depth_merge_thresh=depth_merge_thresh,
+            seg_scale=seg_scale,
+            seg_sigma=seg_sigma,
+            seg_min_size=seg_min_size,
+            normal_method="cross",
+        )
+        pre_geometry = compare_labelings(
+            stages.pre_split_labels, geometry_stages.merged_labels
+        )
+        post_geometry = compare_labelings(
+            stages.final_labels, geometry_stages.merged_labels
+        )
+        if pre_geometry["valid"] and post_geometry["valid"]:
+            pre_boundary = pre_geometry["boundary_disagreement_ratio"]
+            post_boundary = post_geometry["boundary_disagreement_ratio"]
+            pre_vi = pre_geometry["variation_of_information"]
+            post_vi = post_geometry["variation_of_information"]
+            split_metrics.update(
+                geometry_boundary_disagreement_pre=pre_boundary,
+                geometry_boundary_disagreement_post=post_boundary,
+                geometry_boundary_disagreement_delta=post_boundary - pre_boundary,
+                geometry_vi_pre=pre_vi,
+                geometry_vi_post=post_vi,
+                geometry_vi_delta=post_vi - pre_vi,
+                geometry_comparison_invalid_reason=None,
+            )
+        else:
+            split_metrics.update(
+                geometry_boundary_disagreement_pre=None,
+                geometry_boundary_disagreement_post=None,
+                geometry_boundary_disagreement_delta=None,
+                geometry_vi_pre=None,
+                geometry_vi_post=None,
+                geometry_vi_delta=None,
+                geometry_comparison_invalid_reason=(
+                    pre_geometry.get("invalid_reason")
+                    or post_geometry.get("invalid_reason")
+                    or "geometry_comparison_unavailable"
+                ),
+            )
     else:
         raise ValueError(f"unknown segment mode: {segment_mode}")
     labels_match = (

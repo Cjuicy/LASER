@@ -3,7 +3,12 @@ import copy
 import numpy as np
 import pytest
 
-from inference_engine.diagnostics.selection import robust_zscore, select_intervals
+from inference_engine.diagnostics.selection import (
+    REQUIRED_COVERAGE_REASONS,
+    robust_zscore,
+    select_intervals,
+    select_intervals_with_coverage,
+)
 
 
 def _records():
@@ -124,6 +129,13 @@ def test_selector_emits_all_split_trajectory_reasons_deterministically():
         item.end_frame - item.start_frame + 1 <= 30
         for item in first if "matched_control" not in item.reasons
     )
+    _, coverage = select_intervals_with_coverage(
+        records, limit=48, context_windows=2
+    )
+    assert set(coverage) == set(REQUIRED_COVERAGE_REASONS)
+    assert all(item["available"] is True for item in coverage.values())
+    assert all(item["selected"] is True for item in coverage.values())
+    assert all(item["reason"] is None for item in coverage.values())
 
 
 def test_selector_preserves_nontrajectory_family_diversity_and_context_merging():
@@ -256,3 +268,58 @@ def test_selector_does_not_create_matched_control_without_split_treatment():
     selected = select_intervals(records, context_windows=0)
 
     assert all("matched_control" not in item.reasons for item in selected)
+
+
+def test_zero_delta_and_zero_zscore_do_not_claim_change_or_split_anomaly():
+    records = []
+    for window in range(3):
+        records.append({
+            "config_id": "layer_atomic_split",
+            "sequence_id": "01",
+            "frame_start": window * 10,
+            "frame_end": window * 10 + 9,
+            "split_minus_depth_regret": 1.0,
+            "split_minus_geometry_regret": 1.0,
+            "split_accepted_count": 1,
+            "split_changed_pixel_ratio": 0.1,
+            "merge_anomaly": 0.0,
+            "atom_anomaly": 0.0,
+            "scale_dispersion": 0.0,
+            "temporal_churn": 0.0,
+            "gt_speed": 1.0,
+            "gt_turn": 0.0,
+            "confidence": 0.8,
+        })
+
+    selected, coverage = select_intervals_with_coverage(
+        records, context_windows=0
+    )
+    reasons = {reason for item in selected for reason in item.reasons}
+
+    assert "trajectory_change" not in reasons
+    assert "split_anomaly" not in reasons
+    assert coverage["trajectory_change"] == {
+        "available": False,
+        "selected": False,
+        "reason": "no_qualifying_window",
+        "qualifying_window_count": 0,
+    }
+    assert coverage["split_anomaly"] == {
+        "available": False,
+        "selected": False,
+        "reason": "no_qualifying_window",
+        "qualifying_window_count": 0,
+    }
+
+
+def test_empty_evidence_has_explicit_unavailable_coverage_for_all_six_reasons():
+    selected, coverage = select_intervals_with_coverage([], limit=48)
+
+    assert selected == []
+    assert list(coverage) == list(REQUIRED_COVERAGE_REASONS)
+    assert all(item == {
+        "available": False,
+        "selected": False,
+        "reason": "no_qualifying_window",
+        "qualifying_window_count": 0,
+    } for item in coverage.values())
