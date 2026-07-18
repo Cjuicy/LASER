@@ -11,7 +11,7 @@ from inference_engine.diagnostics.rendering import (
     render_method_comparison,
     write_segment_ply,
 )
-from inference_engine.diagnostics.report import build_report
+from inference_engine.diagnostics.report import _correlations, build_report
 
 
 def _trace(path, *, include_split=True):
@@ -315,3 +315,33 @@ def test_static_report_has_overview_guard_recovery_and_case_links(tmp_path):
     assert {row["config_id"] for row in trajectory_rows} == {
         "depth", "geometry_baseline", "layer_atomic_split",
     }
+
+
+def test_split_correlations_count_each_global_window_once(tmp_path):
+    configs = ("depth", "geometry_baseline", "layer_atomic_split")
+    split_scores = (.1, .2, None, .4)
+    records = [
+        {
+            "config_id": config,
+            "sequence_id": "02",
+            "window_id": window_id,
+            "frame_start": window_id * 10,
+            "frame_end": window_id * 10 + 19,
+            "split_score_mean": split_score,
+            "split_minus_depth_regret": float(window_id + 1),
+            "split_minus_geometry_regret": float(window_id + 2),
+        }
+        for window_id, split_score in enumerate(split_scores)
+        for config in configs
+    ]
+    (tmp_path / "selection_records.json").write_text(json.dumps(records))
+
+    correlation = next(
+        row for row in _correlations(tmp_path)
+        if row["target"] == "split_minus_depth_regret"
+        and row["signal"] == "split_score_mean"
+        and row["lag_windows"] == 0
+    )
+
+    assert correlation["sample_count"] == 3
+    assert correlation["missing_rate"] == pytest.approx(.25)

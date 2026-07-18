@@ -271,21 +271,28 @@ def _write_csv(run_dir: Path, summary: dict, selection_diagnostics: dict):
 
 def _correlations(run_dir: Path) -> list[dict]:
     records = _load(run_dir / "selection_records.json", [])
-    signals = (
+    split_signals = (
         "split_score_mean", "split_accepted_count",
         "split_changed_pixel_ratio", "split_segment_count_delta",
+    )
+    signals = split_signals + (
         "merge_anomaly", "atom_anomaly", "scale_dispersion", "temporal_churn",
     )
     grouped: dict[tuple[str, str], list[dict]] = {}
+    split_grouped: dict[tuple[str, str], list[dict]] = {}
     for record in records:
-        grouped.setdefault((record.get("config_id", ""), record.get("sequence_id", "")), []).append(record)
+        key = (record.get("config_id", ""), record.get("sequence_id", ""))
+        grouped.setdefault(key, []).append(record)
+        if record.get("config_id") == "layer_atomic_split":
+            split_grouped.setdefault(key, []).append(record)
     result = []
     for target in REGRET_FIELDS:
         for signal in signals:
             for lag in range(4):
                 left, right = [], []
                 total = 0
-                for rows in grouped.values():
+                source_groups = split_grouped if signal in split_signals else grouped
+                for rows in source_groups.values():
                     rows.sort(key=lambda row: row.get("window_id", 0))
                     if len(rows) <= lag:
                         continue
