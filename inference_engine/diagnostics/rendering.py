@@ -12,6 +12,18 @@ import numpy as np
 from .storage import atomic_write_json
 
 
+COLORS = {
+    "depth": "#087f5b",
+    "geometry_baseline": "#c92a2a",
+    "layer_atomic_split": "#2459a9",
+}
+
+
+def _hex_rgb(value: str) -> np.ndarray:
+    value = value.lstrip("#")
+    return np.asarray([int(value[index:index + 2], 16) for index in (0, 2, 4)], dtype=np.uint8)
+
+
 def _palette(labels: np.ndarray) -> np.ndarray:
     values = labels.astype(np.uint64, copy=False)
     hashed = values * np.uint64(11400714819323198485) + np.uint64(0x9E3779B9)
@@ -178,6 +190,8 @@ def render_case(trace_paths, output_dir: str | Path, *, frame_index: int = 0) ->
     availability = {name: name in arrays for name in (
         "merge_decision", "component_growth_map", "source_map", "scale_map",
         "dispersion_map", "propagation_hop_map", "temporal_best_iou_map",
+        "pre_split_labels", "changed_mask", "split_score_map",
+        "split_decision_map",
     )}
     legends = {}
     depth_rgb, legends["depth"] = _heatmap(depth)
@@ -231,10 +245,62 @@ def render_case(trace_paths, output_dir: str | Path, *, frame_index: int = 0) ->
         temporal_rgb, legends["temporal_iou"] = _heatmap(temporal_values)
     else:
         temporal_rgb = _unavailable(labels.shape, "temporal_best_iou_map")
+
+    if availability["pre_split_labels"]:
+        pre_split_rgb = _palette(select_frame(arrays["pre_split_labels"]))
+    else:
+        pre_split_rgb = _unavailable(labels.shape, "pre_split_labels")
+
+    if availability["changed_mask"]:
+        changed = select_frame(arrays["changed_mask"]).astype(bool, copy=False)
+        changed_rgb = rgb.copy()
+        changed_rgb[changed] = np.round(
+            .35 * changed_rgb[changed] + .65 * np.asarray([235, 65, 65])
+        ).astype(np.uint8)
+        legends["split_changed_regions"] = {
+            "false": "unchanged RGB",
+            "true": "changed after split (red overlay)",
+        }
+    else:
+        changed_rgb = _unavailable(labels.shape, "changed_mask")
+
+    if availability["split_score_map"]:
+        split_scores = np.asarray(select_frame(arrays["split_score_map"]), dtype=float)
+        split_score_rgb, legends["split_scores"] = _heatmap(split_scores)
+        split_score_rgb[~np.isfinite(split_scores)] = [145, 151, 160]
+        legends["split_scores"]["unavailable"] = "NaN"
+    else:
+        split_score_rgb = _unavailable(labels.shape, "split_score_map")
+
+    legends["split_decisions"] = {
+        "0": "none",
+        "1": "accepted",
+        "2": "no-markers",
+        "3": "small-child",
+        "4": "low-score",
+    }
+    if availability["split_decision_map"]:
+        split_decision = np.asarray(select_frame(arrays["split_decision_map"]), dtype=np.int64)
+        split_decision_rgb = rgb.copy()
+        split_decision_colors = np.asarray([
+            [0, 0, 0],
+            [20, 190, 110],
+            [245, 175, 35],
+            [124, 77, 190],
+            [235, 65, 65],
+        ], dtype=np.uint8)
+        for code in range(1, len(split_decision_colors)):
+            split_decision_rgb[split_decision == code] = split_decision_colors[code]
+        split_decision_rgb[(split_decision < 0) | (split_decision > 4)] = [145, 151, 160]
+    else:
+        split_decision_rgb = _unavailable(labels.shape, "split_decision_map")
+
     images = {
         "rgb": rgb, "depth": depth_rgb, "confidence": conf_rgb,
         "initial_atoms": _palette(initial), "coarse_layers": _palette(coarse),
-        "final_segments": _palette(labels), "merge_decisions": merge_rgb,
+        "pre_split_segments": pre_split_rgb, "final_segments": _palette(labels),
+        "split_changed_regions": changed_rgb, "split_scores": split_score_rgb,
+        "split_decisions": split_decision_rgb, "merge_decisions": merge_rgb,
         "component_growth": growth_rgb, "scale_source": source_rgb,
         "scale_map": scale_rgb, "scale_dispersion": dispersion_rgb,
         "propagation_hops": hop_rgb,
@@ -253,29 +319,58 @@ def render_case(trace_paths, output_dir: str | Path, *, frame_index: int = 0) ->
 
 
 def render_method_comparison(
-    left_labels: np.ndarray,
-    right_labels: np.ndarray,
+    method_labels: dict[str, np.ndarray],
     output_dir: str | Path,
     *,
-    left_scale: np.ndarray | None = None,
-    right_scale: np.ndarray | None = None,
+    method_scales: dict[str, np.ndarray] | None = None,
 ) -> dict[str, Path]:
-    """Render partition disagreement and optional log scale ratio."""
+    """Render the strict three-method partition and split/geometry scale comparison."""
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
-    left = np.asarray(left_labels); right = np.asarray(right_labels)
-    if left.shape != right.shape:
+    if set(method_labels) != set(COLORS):
+        raise ValueError(
+            "method comparison requires exactly depth, geometry_baseline, "
+            "and layer_atomic_split"
+        )
+    labels = {
+        name: np.asarray(method_labels[name])
+        for name in COLORS
+    }
+    shapes = {value.shape for value in labels.values()}
+    if len(shapes) != 1:
         raise ValueError("comparison label shapes differ")
-    left_boundary = _boundary(left); right_boundary = _boundary(right)
-    image = np.full((*left.shape, 3), 242, dtype=np.uint8)
-    image[left_boundary & right_boundary] = [35, 160, 120]
-    image[left_boundary & ~right_boundary] = [124, 77, 190]
-    image[~left_boundary & right_boundary] = [235, 80, 65]
+    shape = next(iter(shapes))
+    panels = []
+    for method, values in labels.items():
+        panel = np.full((*shape, 3), 242, dtype=np.uint8)
+        panel[_boundary(values)] = _hex_rgb(COLORS[method])
+        panels.append(panel)
+    image = np.concatenate(panels, axis=1)
     result = {"segmentation_disagreement": _write_png(output / "segmentation_disagreement.png", image)}
+    comparison_manifest = {
+        "methods": list(COLORS),
+        "colors": COLORS,
+    }
+    method_scales = method_scales or {}
+    left_scale = method_scales.get("layer_atomic_split")
+    right_scale = method_scales.get("geometry_baseline")
     if left_scale is not None and right_scale is not None:
-        left_scale = np.asarray(left_scale); right_scale = np.asarray(right_scale)
+        left_scale = np.asarray(left_scale)
+        right_scale = np.asarray(right_scale)
         if left_scale.shape == right_scale.shape:
-            ratio = np.log(np.maximum(left_scale, 1e-9) / np.maximum(right_scale, 1e-9))
+            valid = np.isfinite(left_scale) & np.isfinite(right_scale)
+            ratio = np.full(left_scale.shape, np.nan, dtype=float)
+            ratio[valid] = np.log(
+                np.maximum(left_scale[valid], 1e-9)
+                / np.maximum(right_scale[valid], 1e-9)
+            )
             ratio_rgb, legend = _heatmap(ratio)
+            ratio_rgb[~valid] = [145, 151, 160]
             result["scale_log_ratio"] = _write_png(output / "scale_log_ratio.png", ratio_rgb)
-            atomic_write_json(output / "comparison-rendering.json", {"scale_log_ratio": legend})
+            comparison_manifest["scale_log_ratio"] = {
+                **legend,
+                "numerator": "layer_atomic_split",
+                "denominator": "geometry_baseline",
+                "unavailable": "NaN",
+            }
+    atomic_write_json(output / "comparison-rendering.json", comparison_manifest)
     return result

@@ -492,6 +492,19 @@ def build_cases(
     stride = args.window_size - args.overlap
     for interval in intervals:
         center = (interval.start_frame + interval.end_frame) // 2
+        trace_dirs = {
+            config: (
+                run_dir / "artifacts" / config / interval.sequence_id
+                / "pass2" / "traces"
+            )
+            for config in DIAGNOSTIC_PROFILES
+        }
+        missing_dirs = [path for path in trace_dirs.values() if not path.is_dir()]
+        if missing_dirs:
+            raise FileNotFoundError(
+                "Missing selected trace directories: "
+                + ", ".join(map(str, missing_dirs))
+            )
         comparison_data: dict[str, dict[str, np.ndarray]] = {}
         interval_root = run_dir / "cases" / interval.sequence_id / f"{interval.start_frame:06d}-{interval.end_frame:06d}"
         combined_arrays: dict[str, np.ndarray] = {}
@@ -501,9 +514,7 @@ def build_cases(
             "configs": {},
         }
         for config in DIAGNOSTIC_PROFILES:
-            trace_dir = run_dir / "artifacts" / config / interval.sequence_id / "pass2" / "traces"
-            if not trace_dir.is_dir():
-                raise FileNotFoundError(f"Missing selected trace directory: {trace_dir}")
+            trace_dir = trace_dirs[config]
             required = [
                 trace_dir / f"inputs-frame-{center:06d}.npz",
                 trace_dir / f"segmentation-frame-{center:06d}.npz",
@@ -558,10 +569,13 @@ def build_cases(
             artifact_manifest["configs"][config] = config_artifacts
             comparison_data[config] = values
             matching = [row for row in records if row["config_id"] == config and row["sequence_id"] == interval.sequence_id and row["frame_start"] <= center <= row["frame_end"]]
-            metrics = {"interval": interval.to_dict(), "config_id": config, **(matching[0] if matching else {})}
+            metrics = {
+                "interval": interval.to_dict(),
+                "selection_reasons": list(interval.reasons),
+                "config_id": config,
+                **(matching[0] if matching else {}),
+            }
             atomic_write_json(case_dir / "metrics.json", metrics)
-        atomic = comparison_data.get("layer_atomic_split", {})
-        geometry = comparison_data.get("geometry_baseline", {})
         if len(comparison_data) != len(DIAGNOSTIC_PROFILES):
             raise RuntimeError(f"Incomplete method comparison for {interval.sequence_id}/{center}")
         if budget is not None:
@@ -569,11 +583,20 @@ def build_cases(
         atomic_write_npz(interval_root / "trace.npz", **combined_arrays)
         if budget is not None:
             budget.enforce()
-        if "final_labels" in atomic and "final_labels" in geometry:
-            comparison_metrics = compare_labelings(atomic["final_labels"], geometry["final_labels"])
+        comparable = {
+            config: values["final_labels"]
+            for config, values in comparison_data.items()
+            if "final_labels" in values
+        }
+        if len(comparable) == len(DIAGNOSTIC_PROFILES):
             render_method_comparison(
-                atomic["final_labels"], geometry["final_labels"], interval_root,
-                left_scale=atomic.get("scale_map"), right_scale=geometry.get("scale_map"),
+                comparable,
+                interval_root,
+                method_scales={
+                    config: values["scale_map"]
+                    for config, values in comparison_data.items()
+                    if "scale_map" in values
+                },
             )
             center_records = [
                 row for row in records
@@ -591,13 +614,27 @@ def build_cases(
             geometry_regret = (
                 center_record.get("split_minus_geometry_regret") if center_record else None
             )
+            pairwise_comparisons = {
+                "depth_vs_geometry_baseline": compare_labelings(
+                    comparable["depth"], comparable["geometry_baseline"]
+                ),
+                "depth_vs_layer_atomic_split": compare_labelings(
+                    comparable["depth"], comparable["layer_atomic_split"]
+                ),
+                "geometry_baseline_vs_layer_atomic_split": compare_labelings(
+                    comparable["geometry_baseline"],
+                    comparable["layer_atomic_split"],
+                ),
+            }
             atomic_write_json(interval_root / "metrics.json", {
-                "comparison": "layer_atomic_split_vs_geometry_baseline",
+                "comparison": "depth_vs_geometry_baseline_vs_layer_atomic_split",
                 "interval": interval.to_dict(),
                 "selection_score": interval.score,
+                "selection_reasons": list(interval.reasons),
                 "split_minus_depth_regret": depth_regret,
                 "split_minus_geometry_regret": geometry_regret,
-                **comparison_metrics,
+                "pairwise_comparisons": pairwise_comparisons,
+                **pairwise_comparisons["geometry_baseline_vs_layer_atomic_split"],
             })
         else:
             raise RuntimeError(
@@ -628,7 +665,10 @@ def _validate_case_artifacts(interval_root: Path) -> tuple[bool, str]:
     }
     if actual != set(inventory):
         return False, "generated_artifact_set_mismatch"
-    required = {"trace.npz", "metrics.json", "segmentation_disagreement.png"}
+    required = {
+        "trace.npz", "metrics.json", "segmentation_disagreement.png",
+        "comparison-rendering.json",
+    }
     for config in DIAGNOSTIC_PROFILES:
         required.update({
             f"{config}/rendering.json",
@@ -642,7 +682,7 @@ def _validate_case_artifacts(interval_root: Path) -> tuple[bool, str]:
         except (FileNotFoundError, json.JSONDecodeError):
             return False, f"invalid_rendering_manifest:{config}"
         artifacts = rendering.get("artifacts", {})
-        if not isinstance(artifacts, dict) or len(artifacts) != 15:
+        if not isinstance(artifacts, dict) or len(artifacts) != 19:
             return False, f"incomplete_rendering_manifest:{config}"
         required.update(f"{config}/{filename}" for filename in artifacts.values())
     if not required <= set(inventory):

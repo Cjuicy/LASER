@@ -291,6 +291,12 @@ def test_build_cases_requires_all_methods_and_namespaces_complete_trace(tmp_path
             trace / "segmentation-frame-000001.npz",
             initial_labels=labels, coarse_labels=labels, final_labels=labels,
             normalized_gap_map=np.ones((height, width)),
+            **({
+                "pre_split_labels": labels,
+                "changed_mask": np.zeros((height, width), dtype=bool),
+                "split_score_map": np.full((height, width), np.nan, dtype=np.float32),
+                "split_decision_map": np.zeros((height, width), dtype=np.uint8),
+            } if config == "layer_atomic_split" else {}),
         )
         np.savez_compressed(
             trace / "scale-window-000000.npz",
@@ -317,9 +323,38 @@ def test_build_cases_requires_all_methods_and_namespaces_complete_trace(tmp_path
     assert metrics["selection_score"] == 3.0
     assert metrics["split_minus_depth_regret"] == 1.5
     assert metrics["split_minus_geometry_regret"] == 1.25
+    assert metrics["selection_reasons"] == ["trajectory_degradation"]
+    comparison = json.loads((root / "comparison-rendering.json").read_text())
+    assert comparison["methods"] == [
+        "depth", "geometry_baseline", "layer_atomic_split",
+    ]
+    for config in DIAGNOSTIC_PROFILES:
+        rendering = json.loads((root / config / "rendering.json").read_text())
+        assert len(rendering["artifacts"]) == 19
+        assert rendering["availability"]["pre_split_labels"] is (
+            config == "layer_atomic_split"
+        )
     assert (root / "artifact-manifest.json").is_file()
     assert _validate_case_artifacts(root) == (True, "complete")
     (root / "layer_atomic_split" / "scale_map.png").write_bytes(b"corrupt")
     valid, reason = _validate_case_artifacts(root)
     assert valid is False
     assert "mismatch" in reason or "unreadable" in reason
+
+
+def test_build_cases_checks_all_method_directories_before_writing(tmp_path):
+    interval = SelectedInterval("02", 0, 2, ("matched_control",), 1.0)
+    for config in ("depth", "layer_atomic_split"):
+        (tmp_path / "artifacts" / config / "02" / "pass2" / "traces").mkdir(
+            parents=True
+        )
+
+    with pytest.raises(FileNotFoundError, match="geometry_baseline"):
+        build_cases(
+            tmp_path,
+            [interval],
+            [],
+            argparse.Namespace(window_size=3, overlap=1),
+        )
+
+    assert not (tmp_path / "cases").exists()

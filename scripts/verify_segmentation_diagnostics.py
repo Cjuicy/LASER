@@ -79,7 +79,7 @@ def main(argv=None) -> int:
         ("trajectory_degradation", "merge", "immutable_atom", "scale", "temporal"),
         8.0,
     )
-    context2 = DiagnosticContext("synthetic", "layer_atomic", "02", 2, 0, 0)
+    context2 = DiagnosticContext("synthetic", "layer_atomic_split", "02", 2, 0, 0)
     sink2 = FileDiagnosticSink(output / "artifacts", selected_intervals=[selected_case], budget=budget)
     rgb = np.zeros((1, 4, 6, 3), dtype=np.float32)
     rgb[0, ..., 0] = np.linspace(0, 1, 6)
@@ -95,10 +95,19 @@ def main(argv=None) -> int:
         "dispersion_map": np.ones((1, 4, 6), np.float32) * .03,
     })
     sink2.close()
-    trace_dir = output / "artifacts" / "layer_atomic" / "02" / "pass2" / "traces"
-    case_dir = output / "cases" / "02" / "000000-000020" / "layer_atomic"
+    trace_dir = output / "artifacts" / "layer_atomic_split" / "02" / "pass2" / "traces"
+    interval_dir = output / "cases" / "02" / "000000-000020"
+    case_dir = interval_dir / "layer_atomic_split"
     render_case(sorted(trace_dir.glob("*.npz")), case_dir)
-    atomic_write_json(case_dir / "metrics.json", {"trajectory_regret": 8.0, "largest_segment_ratio": summarize_labels(formal)["largest_segment_ratio"]})
+    case_metrics = {
+        "selection_score": 8.0,
+        "selection_reasons": list(selected_case.reasons),
+        "split_minus_depth_regret": 8.0,
+        "split_minus_geometry_regret": 7.2,
+        "largest_segment_ratio": summarize_labels(formal)["largest_segment_ratio"],
+    }
+    atomic_write_json(case_dir / "metrics.json", case_metrics)
+    atomic_write_json(interval_dir / "metrics.json", case_metrics)
     assert (case_dir / "final_segments.png").exists() and (case_dir / "segments.ply").exists()
     _pass("rendering")
 
@@ -108,7 +117,11 @@ def main(argv=None) -> int:
     })
     atomic_write_json(output / "summary.json", {
         "stability_guard": {"passed": True}, "recovery": {"02": .5},
-        "sequence_metrics": {"layer_atomic": {"02": {"ate_rmse": 1.0, "rpe_translation_rmse": .1, "rpe_rotation_rmse_deg": .1}}},
+        "sequence_metrics": {
+            "depth": {"02": {"ate_rmse": 1.2, "rpe_translation_rmse": .2, "rpe_rotation_rmse_deg": .2}},
+            "geometry_baseline": {"02": {"ate_rmse": 1.1, "rpe_translation_rmse": .15, "rpe_rotation_rmse_deg": .15}},
+            "layer_atomic_split": {"02": {"ate_rmse": 1.0, "rpe_translation_rmse": .1, "rpe_rotation_rmse_deg": .1}},
+        },
     })
     report = build_report(output)
     html = report.read_text(encoding="utf-8")
