@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from inference_engine.diagnostics.metrics import (
     build_sequence_summary,
@@ -46,32 +47,46 @@ def test_invalid_trajectory_returns_missing_metrics_not_zero():
     assert result["invalid_reason"] == "at_least_two_poses_required"
 
 
-def test_stability_guard_and_recovery_metrics():
-    baseline = {seq: value for seq, value in zip([f"{i:02d}" for i in range(11)], range(10, 21))}
-    candidate = {seq: value for seq, value in baseline.items()}
-    guard = evaluate_stability_guard(candidate, baseline)
+def test_stability_guard_uses_depth_as_its_baseline_and_recovery_is_depth_to_geometry():
+    depth_ates = {seq: value for seq, value in zip([f"{i:02d}" for i in range(11)], range(10, 21))}
+    split_ates = {seq: value for seq, value in depth_ates.items()}
+    guard = evaluate_stability_guard(
+        split_ates, depth_ates, expected_sequences=("00", "05", "09")
+    )
     assert guard["passed"] is True
-    candidate["00"] *= 1.11
-    assert evaluate_stability_guard(candidate, baseline)["passed"] is False
-    missing = dict(baseline); missing.pop("08")
+    assert guard["baseline_config"] == "depth"
+    split_ates["00"] *= 1.11
+    assert evaluate_stability_guard(split_ates, depth_ates)["passed"] is False
+    missing = dict(depth_ates); missing.pop("08")
     expected_guard = evaluate_stability_guard(
-        missing, missing, expected_sequences=tuple(baseline)
+        missing, missing, expected_sequences=tuple(depth_ates)
     )
     assert expected_guard["passed"] is False
     assert "sequence_08_missing" in expected_guard["failure_reasons"]
 
-    assert recovery_score(87.0, 78.0, 69.0)["score"] == 0.5
+    assert recovery_score(87.0, 78.0, 69.0)["score"] == pytest.approx(0.5)
     assert recovery_score(70.0, 60.0, 75.0)["valid"] is False
 
 
-def test_sequence_summary_keeps_legacy_out_of_official_ranking():
+def test_sequence_summary_is_strict_three_method_contract_with_recovery_scores():
     values = {
-        "depth": {"00": {"ate_rmse": 3.0, "valid": True}},
-        "geometry_baseline": {"00": {"ate_rmse": 2.0, "valid": True}},
-        "layer_atomic": {"00": {"ate_rmse": 1.0, "valid": True}},
-        "geometry_legacy_reference": {"00": {"ate_rmse": .5, "valid": True}},
+        "depth": {
+            sequence: {"ate_rmse": 87.0, "valid": True}
+            for sequence in ("02", "04", "10")
+        },
+        "geometry_baseline": {
+            sequence: {"ate_rmse": 69.0, "valid": True}
+            for sequence in ("02", "04", "10")
+        },
+        "layer_atomic_split": {
+            sequence: {"ate_rmse": 78.0, "valid": True}
+            for sequence in ("02", "04", "10")
+        },
     }
     summary = build_sequence_summary(values)
-    assert summary["official_ranking"]["00"][0]["config_id"] == "layer_atomic"
-    assert all(row["config_id"] != "geometry_legacy_reference" for row in summary["official_ranking"]["00"])
-    assert summary["legacy_reference"]["00"] == .5
+    assert set(summary["official_aggregate"]) == {
+        "depth", "geometry_baseline", "layer_atomic_split"
+    }
+    assert "legacy_reference" not in summary
+    assert "recovery_gap" not in summary
+    assert summary["recovery"]["02"]["score"] == pytest.approx(0.5)

@@ -2,13 +2,13 @@ import json
 
 import numpy as np
 
-from inference_engine.diagnostics.schema import DiagnosticContext, SelectedInterval
+from inference_engine.diagnostics.schema import SCHEMA_VERSION, DiagnosticContext, SelectedInterval
 from inference_engine.diagnostics.sink import FileDiagnosticSink, NullDiagnosticSink
 from inference_engine.diagnostics.storage import StorageBudget
 
 
 def _context(pass_id):
-    return DiagnosticContext("run", "layer_atomic", "02", pass_id, 3, 12)
+    return DiagnosticContext("run", "layer_atomic_split", "02", pass_id, 3, 12)
 
 
 def test_null_sink_is_safe_for_every_event():
@@ -27,7 +27,7 @@ def test_pass1_writes_scalar_jsonl_but_no_dense_arrays(tmp_path):
     assert len(records) == 1
     assert json.loads(records[0].read_text().splitlines()[0])["metrics"]["segments"] == 3
     stored = json.loads(records[0].read_text().splitlines()[0])
-    assert stored["schema_version"] == "1.0"
+    assert stored["schema_version"] == SCHEMA_VERSION
     assert stored["run_id"] == "run"
     assert not list(tmp_path.rglob("*.npz"))
 

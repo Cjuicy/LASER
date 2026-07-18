@@ -7,18 +7,27 @@ from typing import Any
 import numpy as np
 
 
-OFFICIAL_CONFIGS = ("depth", "geometry_baseline", "layer_atomic")
-LEGACY_CONFIG = "geometry_legacy_reference"
+OFFICIAL_CONFIGS = ("depth", "geometry_baseline", "layer_atomic_split")
 GUARD_SEQUENCES = ("00", "05", "09")
 RECOVERY_SEQUENCES = ("02", "04", "10")
 
 
-def recovery_score(layer_atomic_ate: float, candidate_ate: float, geometry_reference_ate: float, *, eps: float = 1e-9) -> dict:
-    denominator = float(layer_atomic_ate - geometry_reference_ate)
+def recovery_score(
+    depth_ate: float,
+    split_ate: float,
+    geometry_ate: float,
+    *,
+    eps: float = 1e-9,
+) -> dict:
+    denominator = float(depth_ate - geometry_ate)
     if not np.isfinite(denominator) or denominator <= eps:
         return {"valid": False, "score": None, "invalid_reason": "non_positive_recovery_gap"}
-    score = (float(layer_atomic_ate) - float(candidate_ate)) / denominator
-    return {"valid": bool(np.isfinite(score)), "score": float(score) if np.isfinite(score) else None, "invalid_reason": None if np.isfinite(score) else "non_finite_score"}
+    score = (float(depth_ate) - float(split_ate)) / denominator
+    return {
+        "valid": bool(np.isfinite(score)),
+        "score": float(score),
+        "invalid_reason": None,
+    }
 
 
 def evaluate_stability_guard(
@@ -66,6 +75,7 @@ def evaluate_stability_guard(
             reasons.append(f"guard_{seq}_regression")
     return {
         "passed": not reasons,
+        "baseline_config": "depth",
         "failure_reasons": sorted(set(reasons)),
         "mean_regression": mean_regression,
         "median_regression": median_regression,
@@ -77,7 +87,6 @@ def evaluate_stability_guard(
 def build_sequence_summary(results: dict[str, dict[str, dict[str, Any]]]) -> dict:
     sequences = sorted({sequence for config in results.values() for sequence in config})
     ranking: dict[str, list[dict[str, Any]]] = {}
-    legacy: dict[str, float | None] = {}
     for sequence in sequences:
         rows = []
         for config_id in OFFICIAL_CONFIGS:
@@ -86,8 +95,6 @@ def build_sequence_summary(results: dict[str, dict[str, dict[str, Any]]]) -> dic
             if metric.get("valid") and ate is not None and np.isfinite(ate):
                 rows.append({"config_id": config_id, "ate_rmse": float(ate)})
         ranking[sequence] = sorted(rows, key=lambda row: (row["ate_rmse"], row["config_id"]))
-        legacy_metric = results.get(LEGACY_CONFIG, {}).get(sequence, {})
-        legacy[sequence] = float(legacy_metric["ate_rmse"]) if legacy_metric.get("valid") and legacy_metric.get("ate_rmse") is not None else None
     aggregates = {}
     for config_id in OFFICIAL_CONFIGS:
         values = [row["ate_rmse"] for sequence in sequences for row in ranking[sequence] if row["config_id"] == config_id]
@@ -99,7 +106,19 @@ def build_sequence_summary(results: dict[str, dict[str, dict[str, Any]]]) -> dic
         }
     recovery = {}
     for sequence in RECOVERY_SEQUENCES:
-        atomic = results.get("layer_atomic", {}).get(sequence, {}).get("ate_rmse")
-        reference = results.get("geometry_baseline", {}).get(sequence, {}).get("ate_rmse")
-        recovery[sequence] = None if atomic is None or reference is None else float(atomic - reference)
-    return {"official_ranking": ranking, "official_aggregate": aggregates, "legacy_reference": legacy, "recovery_gap": recovery}
+        depth = results.get("depth", {}).get(sequence, {}).get("ate_rmse")
+        split = results.get("layer_atomic_split", {}).get(sequence, {}).get("ate_rmse")
+        geometry = results.get("geometry_baseline", {}).get(sequence, {}).get("ate_rmse")
+        if depth is None or split is None or geometry is None:
+            recovery[sequence] = {
+                "valid": False,
+                "score": None,
+                "invalid_reason": "missing_ate",
+            }
+        else:
+            recovery[sequence] = recovery_score(depth, split, geometry)
+    return {
+        "official_ranking": ranking,
+        "official_aggregate": aggregates,
+        "recovery": recovery,
+    }

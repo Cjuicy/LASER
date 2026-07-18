@@ -39,8 +39,14 @@ from .storage import (
 DIAGNOSTIC_PROFILES = {
     "depth": {"segment_mode": "depth", "geometry_seg_profile": "baseline_params", "official": True},
     "geometry_baseline": {"segment_mode": "geometry", "geometry_seg_profile": "baseline_params", "official": True},
-    "layer_atomic": {"segment_mode": "layer_atomic", "geometry_seg_profile": "baseline_params", "official": True},
-    "geometry_legacy_reference": {"segment_mode": "geometry", "geometry_seg_profile": "legacy", "official": False},
+    "layer_atomic_split": {
+        "segment_mode": "layer_atomic_split",
+        "geometry_seg_profile": "baseline_params",
+        "normal_method": "cross",
+        "split_score_thresh": 0.10,
+        "split_aux_confirmation": True,
+        "official": True,
+    },
 }
 DEFAULT_SEQUENCES = tuple(f"{index:02d}" for index in range(11))
 
@@ -380,13 +386,12 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
         for sequence in args.sequences:
             evaluation = trajectory_results.get(config, {}).get(sequence, {})
             errors = np.asarray(evaluation.get("per_frame_translation_error") or [], dtype=float)
-            atomic_errors = np.asarray(trajectory_results.get("layer_atomic", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
+            split_errors = np.asarray(trajectory_results.get("layer_atomic_split", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
             geometry_errors = np.asarray(trajectory_results.get("geometry_baseline", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
             depth_errors = np.asarray(trajectory_results.get("depth", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
-            legacy_errors = np.asarray(trajectory_results.get("geometry_legacy_reference", {}).get(sequence, {}).get("per_frame_translation_error") or [], dtype=float)
             gt_positions = np.empty((0, 3), dtype=float)
             gt_rotations = np.empty((0, 3, 3), dtype=float)
-            trajectory_npz = Path(run_dir) / "trajectory" / "layer_atomic" / f"{sequence}.npz"
+            trajectory_npz = Path(run_dir) / "trajectory" / "layer_atomic_split" / f"{sequence}.npz"
             if trajectory_npz.exists():
                 with np.load(trajectory_npz) as data:
                     ground_truth = data["ground_truth"]
@@ -403,9 +408,9 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
             for window_id in range(window_count):
                 start = window_id * stride; end = min(start + args.window_size - 1, max(len(errors) - 1, start))
                 frame_slice = errors[start:end + 1]
-                atomic_slice = atomic_errors[start:end + 1]
+                split_slice = split_errors[start:end + 1]
                 reference_slice = geometry_errors[start:end + 1] if geometry_errors.size else np.asarray([])
-                regret = float(np.nanmean(atomic_slice - reference_slice)) if atomic_slice.size and reference_slice.size == atomic_slice.size else 0.0
+                regret = float(np.nanmean(split_slice - reference_slice)) if split_slice.size and reference_slice.size == split_slice.size else 0.0
                 frame_metrics = by_window.get(window_id, [])
                 final_metrics = [item["metrics"].get("final", {}) for item in frame_metrics]
                 merge_metrics = [item["metrics"].get("merge", {}) for item in frame_metrics]
@@ -430,7 +435,7 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
                     turn_angles.append(float(np.arccos(cosine)))
                 def mean_regret(reference):
                     reference_values = reference[start:end + 1]
-                    return float(np.nanmean(atomic_slice - reference_values)) if atomic_slice.size and len(reference_values) == len(atomic_slice) else None
+                    return float(np.nanmean(split_slice - reference_values)) if split_slice.size and len(reference_values) == len(split_slice) else None
                 records.append({
                     "config_id": config, "sequence_id": sequence, "window_id": window_id,
                     "frame_start": start, "frame_end": end, "trajectory_regret": regret,
@@ -438,9 +443,8 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
                     "atom_anomaly": lsr + np.log1p(growth),
                     "scale_dispersion": float(scale_p90),
                     "temporal_churn": float(temporal_item.get("segment_churn_ratio") or temporal_item.get("unmatched_area_ratio") or 0),
-                    "layer_atomic_minus_depth_regret": mean_regret(depth_errors),
-                    "layer_atomic_minus_geometry_regret": regret,
-                    "layer_atomic_minus_legacy_regret": mean_regret(legacy_errors),
+                    "layer_atomic_split_minus_depth_regret": mean_regret(depth_errors),
+                    "layer_atomic_split_minus_geometry_regret": regret,
                     "gt_speed": speed,
                     "gt_turn": float(np.mean(turn_angles)) if turn_angles else 0.0,
                     "confidence": float(np.mean(confidence_values)) if confidence_values else 0.0,
@@ -527,7 +531,7 @@ def build_cases(
             matching = [row for row in records if row["config_id"] == config and row["sequence_id"] == interval.sequence_id and row["frame_start"] <= center <= row["frame_end"]]
             metrics = {"interval": interval.to_dict(), "config_id": config, **(matching[0] if matching else {})}
             atomic_write_json(case_dir / "metrics.json", metrics)
-        atomic = comparison_data.get("layer_atomic", {})
+        atomic = comparison_data.get("layer_atomic_split", {})
         geometry = comparison_data.get("geometry_baseline", {})
         if len(comparison_data) != len(DIAGNOSTIC_PROFILES):
             raise RuntimeError(f"Incomplete method comparison for {interval.sequence_id}/{center}")
@@ -544,7 +548,7 @@ def build_cases(
             )
             center_records = [
                 row for row in records
-                if row["config_id"] == "layer_atomic"
+                if row["config_id"] == "layer_atomic_split"
                 and row["sequence_id"] == interval.sequence_id
                 and row["frame_start"] <= center <= row["frame_end"]
             ]
@@ -554,7 +558,7 @@ def build_cases(
             ) if center_records else None
             actual_regret = center_record.get("trajectory_regret") if center_record else None
             atomic_write_json(interval_root / "metrics.json", {
-                "comparison": "layer_atomic_vs_geometry_baseline",
+                "comparison": "layer_atomic_split_vs_geometry_baseline",
                 "interval": interval.to_dict(),
                 "selection_score": interval.score,
                 "trajectory_regret": actual_regret,
@@ -736,11 +740,11 @@ def run_master(args, *, runner=subprocess.run) -> int:
             for index, config in enumerate(DIAGNOSTIC_PROFILES, 1):
                 pass1_valid, pass1_failures = config_complete(1, config, args.sequences)
                 if _phase_done(manifest, "pass1", config) and pass1_valid:
-                    print(f"[phase pass1 {index}/4] {config}: resume skip")
+                    print(f"[phase pass1 {index}/{len(DIAGNOSTIC_PROFILES)}] {config}: resume skip")
                     continue
                 if _phase_done(manifest, "pass1", config) and not pass1_valid:
-                    print(f"[phase pass1 {index}/4] {config}: invalid resume state ({'; '.join(pass1_failures)}); rerunning")
-                print(f"[phase pass1 {index}/4] {config}: starting")
+                    print(f"[phase pass1 {index}/{len(DIAGNOSTIC_PROFILES)}] {config}: invalid resume state ({'; '.join(pass1_failures)}); rerunning")
+                print(f"[phase pass1 {index}/{len(DIAGNOSTIC_PROFILES)}] {config}: starting")
                 enforce_budget()
                 runner(_worker_command(args, pass_id=1, config_id=config, run_id=manifest.run_id), check=True)
                 pass1_valid, pass1_failures = config_complete(1, config, args.sequences)
@@ -766,14 +770,13 @@ def run_master(args, *, runner=subprocess.run) -> int:
                     + ", ".join(invalid_results)
                 )
             summary = build_sequence_summary(trajectory)
-            layer_ates = {seq: value["ate_rmse"] for seq, value in trajectory.get("layer_atomic", {}).items() if value.get("valid")}
+            split_ates = {seq: value["ate_rmse"] for seq, value in trajectory.get("layer_atomic_split", {}).items() if value.get("valid")}
             summary["stability_guard"] = evaluate_stability_guard(
-                layer_ates,
-                layer_ates,
+                split_ates,
+                {seq: value["ate_rmse"] for seq, value in trajectory.get("depth", {}).items() if value.get("valid")},
                 expected_sequences=args.sequences,
-            ) if layer_ates else {"passed": False, "failure_reasons": ["missing_layer_atomic"]}
+            ) if split_ates else {"passed": False, "baseline_config": "depth", "failure_reasons": ["missing_layer_atomic_split"]}
             summary["sequence_metrics"] = trajectory
-            summary["recovery"] = summary.get("recovery_gap", {})
             atomic_write_json(output / "summary.json", summary)
             records = build_selection_records(output, trajectory, args)
             atomic_write_json(output / "selection_records.json", records)
@@ -799,8 +802,8 @@ def run_master(args, *, runner=subprocess.run) -> int:
                 if not selected_sequences or (_phase_done(manifest, "pass2", config) and pass2_valid):
                     continue
                 if _phase_done(manifest, "pass2", config) and not pass2_valid:
-                    print(f"[phase pass2 {index}/4] {config}: invalid resume state ({'; '.join(pass2_failures)}); rerunning")
-                print(f"[phase pass2 {index}/4] {config}: full rerun of {','.join(selected_sequences)}; dense writes selected only")
+                    print(f"[phase pass2 {index}/{len(DIAGNOSTIC_PROFILES)}] {config}: invalid resume state ({'; '.join(pass2_failures)}); rerunning")
+                print(f"[phase pass2 {index}/{len(DIAGNOSTIC_PROFILES)}] {config}: full rerun of {','.join(selected_sequences)}; dense writes selected only")
                 enforce_budget()
                 runner(_worker_command(pass2_args, pass_id=2, config_id=config, run_id=manifest.run_id, selected=selected_path), check=True)
                 pass2_valid, pass2_failures = config_complete(
@@ -966,6 +969,9 @@ def run_worker(args) -> int:
                 window_size=args.window_size, overlap=args.overlap, depth_refine=True,
                 cache_root=str(cache_root), benchmark_latency=False,
                 segment_mode=profile["segment_mode"], geometry_seg_profile=profile["geometry_seg_profile"],
+                normal_method=profile.get("normal_method", "cross"),
+                split_score_thresh=profile.get("split_score_thresh", 0.10),
+                split_aux_confirmation=profile.get("split_aux_confirmation", True),
                 diagnostic_sink=sink, diagnostic_run_id=args.run_id,
                 diagnostic_sequence_id=sequence, diagnostic_pass=args.pass_id,
                 cache_policy="metrics-only",

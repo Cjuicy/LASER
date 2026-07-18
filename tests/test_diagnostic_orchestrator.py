@@ -51,10 +51,20 @@ def _args(tmp_path, **overrides):
     return argparse.Namespace(**values)
 
 
-def test_profiles_are_fixed_and_legacy_is_not_official():
-    assert list(DIAGNOSTIC_PROFILES) == ["depth", "geometry_baseline", "layer_atomic", "geometry_legacy_reference"]
-    assert DIAGNOSTIC_PROFILES["geometry_legacy_reference"]["official"] is False
-    assert all(DIAGNOSTIC_PROFILES[name]["official"] for name in ("depth", "geometry_baseline", "layer_atomic"))
+def test_profiles_are_the_strict_three_method_contract():
+    assert list(DIAGNOSTIC_PROFILES) == [
+        "depth",
+        "geometry_baseline",
+        "layer_atomic_split",
+    ]
+    assert DIAGNOSTIC_PROFILES["layer_atomic_split"] == {
+        "segment_mode": "layer_atomic_split",
+        "geometry_seg_profile": "baseline_params",
+        "normal_method": "cross",
+        "split_score_thresh": 0.10,
+        "split_aux_confirmation": True,
+        "official": True,
+    }
 
 
 def test_preflight_validates_layout_hashes_checkpoint_and_fingerprints_data(tmp_path):
@@ -211,14 +221,14 @@ def test_build_cases_requires_all_methods_and_namespaces_complete_trace(tmp_path
     build_cases(tmp_path, [interval], records, args)
     root = tmp_path / "cases" / "02" / "000000-000002"
     with np.load(root / "trace.npz") as data:
-        assert "layer_atomic__segmentation__normalized_gap_map" in data
+        assert "layer_atomic_split__segmentation__normalized_gap_map" in data
         assert "geometry_baseline__temporal__temporal_best_iou_map" in data
     metrics = json.loads((root / "metrics.json").read_text())
     assert metrics["selection_score"] == 3.0
     assert metrics["trajectory_regret"] == 1.25
     assert (root / "artifact-manifest.json").is_file()
     assert _validate_case_artifacts(root) == (True, "complete")
-    (root / "layer_atomic" / "scale_map.png").write_bytes(b"corrupt")
+    (root / "layer_atomic_split" / "scale_map.png").write_bytes(b"corrupt")
     valid, reason = _validate_case_artifacts(root)
     assert valid is False
     assert "mismatch" in reason or "unreadable" in reason

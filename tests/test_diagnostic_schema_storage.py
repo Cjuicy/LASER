@@ -28,7 +28,7 @@ from inference_engine.diagnostics.storage import (
 def test_diagnostic_context_round_trip_and_frame_ids():
     context = DiagnosticContext(
         run_id="run-1",
-        config_id="layer_atomic",
+        config_id="layer_atomic_split",
         sequence_id="02",
         pass_id=2,
         window_id=3,
@@ -39,7 +39,25 @@ def test_diagnostic_context_round_trip_and_frame_ids():
 
     assert restored == context
     assert restored.frame_id(4) == 49
+    assert SCHEMA_VERSION == "2.0"
     assert restored.to_dict()["schema_version"] == SCHEMA_VERSION
+
+
+def test_schema_version_1_manifest_cannot_resume_under_contract_2():
+    data = {
+        "schema_version": "1.0",
+        "run_id": "run-1",
+        "git_commit": "abc123",
+        "checkpoint_sha256": "f" * 64,
+        "config_hash": "c" * 64,
+        "dataset_fingerprint": "d" * 64,
+        "seed": 0,
+        "environment": {},
+        "budget": {},
+    }
+
+    with pytest.raises(ValueError, match="Unsupported schema_version"):
+        RunManifest.from_dict(data)
 
 
 @pytest.mark.parametrize("pass_id", [0, 3])
@@ -77,12 +95,12 @@ def test_run_manifest_round_trip_and_status_updates():
         environment={"python": "3.11"},
         budget={"max_temp_gib": 50},
     )
-    manifest.mark("pass1", "layer_atomic", "02", "complete")
+    manifest.mark("pass1", "layer_atomic_split", "02", "complete")
 
     restored = RunManifest.from_dict(manifest.to_dict())
 
     assert restored.to_dict() == manifest.to_dict()
-    assert restored.state["pass1"]["layer_atomic"]["02"] == "complete"
+    assert restored.state["pass1"]["layer_atomic_split"]["02"] == "complete"
 
 
 def test_atomic_json_and_jsonl_are_readable(tmp_path):
