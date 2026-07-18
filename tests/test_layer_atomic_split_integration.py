@@ -1,4 +1,9 @@
+from pathlib import Path
+import sys
+
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from inference_engine.utils import layer_atomic_geometry as lag
 

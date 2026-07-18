@@ -1,5 +1,10 @@
+from pathlib import Path
+import sys
+
 import numpy as np
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from inference_engine.utils import post_merge_split as pms
 

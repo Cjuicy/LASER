@@ -1,6 +1,11 @@
+from pathlib import Path
+import sys
+
 import numpy as np
 import pytest
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from inference_engine import streaming_window_engine as swe_module
 from inference_engine.streaming_window_engine import StreamingWindowEngine
