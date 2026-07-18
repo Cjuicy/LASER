@@ -16,6 +16,7 @@ from inference_engine.diagnostics.orchestrator import (
     checkpoint_sha256,
     dataset_fingerprint,
     build_cases,
+    build_selection_records,
     preflight,
     run_master,
 )
@@ -195,8 +196,82 @@ def test_sequence_checkpoint_detects_missing_or_tampered_artifact(tmp_path):
     assert "artifact_" in reason
 
 
+def test_selection_records_expose_two_regrets_and_only_split_profile_activity(tmp_path):
+    args = SimpleNamespace(
+        sequences=["01"], window_size=2, overlap=0,
+    )
+    trajectory_results = {
+        "depth": {"01": {"per_frame_translation_error": [1.0, 1.0, 2.0, 2.0]}},
+        "geometry_baseline": {"01": {"per_frame_translation_error": [2.0, 2.0, 4.0, 4.0]}},
+        "layer_atomic_split": {"01": {"per_frame_translation_error": [3.0, 5.0, 8.0, 10.0]}},
+    }
+    trajectory = tmp_path / "trajectory" / "layer_atomic_split"
+    trajectory.mkdir(parents=True)
+    ground_truth = np.repeat(np.eye(4)[None], 4, axis=0)
+    np.savez_compressed(trajectory / "01.npz", ground_truth=ground_truth)
+
+    for config in DIAGNOSTIC_PROFILES:
+        artifact = tmp_path / "artifacts" / config / "01" / "pass1"
+        artifact.mkdir(parents=True)
+        split_values = (
+            [(1, 0.1), (0, 0.3), (2, 0.4), (1, 0.6)]
+            if config == "layer_atomic_split"
+            else [(99, 0.99)] * 4
+        )
+        rows = []
+        for frame, (accepted, changed) in enumerate(split_values):
+            rows.append(json.dumps({
+                "context": {"window_id": frame // 2},
+                "metrics": {
+                    "confidence_mean": 0.8,
+                    "initial": {},
+                    "final": {},
+                    "merge": {},
+                    "split": {
+                        "split_accepted_count": accepted,
+                        "split_changed_pixel_ratio": changed,
+                    },
+                },
+            }))
+        (artifact / "segmentation.jsonl").write_text("\n".join(rows) + "\n")
+
+    records = build_selection_records(tmp_path, trajectory_results, args)
+    record = next(
+        row for row in records
+        if row["config_id"] == "layer_atomic_split" and row["window_id"] == 0
+    )
+    assert record["split_minus_depth_regret"] == pytest.approx(3.0)
+    assert record["split_minus_geometry_regret"] == pytest.approx(2.0)
+    assert record["split_accepted_count"] == 1
+    assert record["split_changed_pixel_ratio"] == pytest.approx(0.2)
+    assert "trajectory_regret" not in record
+    assert "layer_atomic_split_minus_depth_regret" not in record
+
+
+def test_selection_records_preserve_missing_split_evidence(tmp_path):
+    args = SimpleNamespace(sequences=["01"], window_size=1, overlap=0)
+    trajectory_results = {
+        config: {"01": {"per_frame_translation_error": [1.0]}}
+        for config in DIAGNOSTIC_PROFILES
+    }
+    artifact = tmp_path / "artifacts" / "layer_atomic_split" / "01" / "pass1"
+    artifact.mkdir(parents=True)
+    (artifact / "segmentation.jsonl").write_text(json.dumps({
+        "context": {"window_id": 0},
+        "metrics": {"confidence_mean": 0.8, "split": {}},
+    }) + "\n")
+
+    records = build_selection_records(tmp_path, trajectory_results, args)
+    record = next(
+        row for row in records if row["config_id"] == "layer_atomic_split"
+    )
+
+    assert record["split_accepted_count"] is None
+    assert record["split_changed_pixel_ratio"] is None
+
+
 def test_build_cases_requires_all_methods_and_namespaces_complete_trace(tmp_path):
-    interval = SelectedInterval("02", 0, 2, ("trajectory",), 3.0)
+    interval = SelectedInterval("02", 0, 2, ("trajectory_degradation",), 3.0)
     height, width = 3, 4
     y, x = np.mgrid[:height, :width]
     labels = (x > 1).astype(np.int32)
@@ -226,7 +301,8 @@ def test_build_cases_requires_all_methods_and_namespaces_complete_trace(tmp_path
         )
     records = [{
         "config_id": config, "sequence_id": "02", "frame_start": 0,
-        "frame_end": 2, "trajectory_regret": 1.25,
+        "frame_end": 2, "split_minus_depth_regret": 1.5,
+        "split_minus_geometry_regret": 1.25,
     } for config in DIAGNOSTIC_PROFILES]
     args = argparse.Namespace(window_size=3, overlap=1)
     build_cases(tmp_path, [interval], records, args)
@@ -236,7 +312,8 @@ def test_build_cases_requires_all_methods_and_namespaces_complete_trace(tmp_path
         assert "geometry_baseline__temporal__temporal_best_iou_map" in data
     metrics = json.loads((root / "metrics.json").read_text())
     assert metrics["selection_score"] == 3.0
-    assert metrics["trajectory_regret"] == 1.25
+    assert metrics["split_minus_depth_regret"] == 1.5
+    assert metrics["split_minus_geometry_regret"] == 1.25
     assert (root / "artifact-manifest.json").is_file()
     assert _validate_case_artifacts(root) == (True, "complete")
     (root / "layer_atomic_split" / "scale_map.png").write_bytes(b"corrupt")

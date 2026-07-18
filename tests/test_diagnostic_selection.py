@@ -8,19 +8,54 @@ from inference_engine.diagnostics.selection import robust_zscore, select_interva
 
 def _records():
     records = []
-    for seq in ("00", "02", "04", "05", "09", "10"):
-        for window in range(8):
-            spike = 10.0 if window == (2 if seq in {"02", "04", "10"} else 5) else 0.1 * window
-            records.append({
-                "config_id": "layer_atomic", "sequence_id": seq,
-                "window_id": window, "frame_start": window * 5, "frame_end": window * 5 + 9,
-                "trajectory_regret": spike,
-                "merge_anomaly": spike * .8,
-                "atom_anomaly": spike * .7,
-                "scale_dispersion": spike * .6,
-                "temporal_churn": spike * .4,
-                "gt_speed": window + 1, "gt_turn": window * .1, "confidence": .9 - window * .01,
-            })
+    for sequence in ("00", "02", "04", "05", "09", "10"):
+        regrets = [
+            (-4.0, -2.0),
+            (0.0, 0.0),
+            (5.0, 3.0),
+            (5.2, 3.1),
+            (0.1, 0.1),
+            (0.2, 0.2),
+            (1.0, 0.8),
+            (0.3, 0.3),
+        ]
+        split_activity = [
+            (0, 0.0),
+            (0, 0.0),
+            (1, 0.15),
+            (0, 0.0),
+            (2, 0.35),
+            (0, 0.0),
+            (10, 0.90),
+            (0, 0.0),
+        ]
+        for window, ((depth_regret, geometry_regret), (accepted, changed)) in enumerate(
+            zip(regrets, split_activity, strict=True)
+        ):
+            common = {
+                "sequence_id": sequence,
+                "window_id": window,
+                "frame_start": window * 5,
+                "frame_end": window * 5 + 9,
+                "split_minus_depth_regret": depth_regret,
+                "split_minus_geometry_regret": geometry_regret,
+                "merge_anomaly": 0.1 * window,
+                "atom_anomaly": 0.08 * window,
+                "scale_dispersion": 0.06 * window,
+                "temporal_churn": 0.04 * window,
+                "gt_speed": window + 1,
+                "gt_turn": window * 0.1,
+                "confidence": 0.9 - window * 0.01,
+            }
+            for config in ("depth", "geometry_baseline", "layer_atomic_split"):
+                # Split evidence from baseline rows must never influence selection.
+                is_split = config == "layer_atomic_split"
+                records.append({
+                    **common,
+                    "config_id": config,
+                    "split_accepted_count": accepted if is_split else 100,
+                    "split_changed_pixel_ratio": changed if is_split else 1.0,
+                })
     return records
 
 
@@ -31,45 +66,101 @@ def test_robust_zscore_is_finite_for_constant_and_outlier_inputs():
     assert values[-1] > values[0]
 
 
-def test_selector_rejects_zero_limit_and_controls_obey_both_medians():
+def test_selector_rejects_zero_limit_and_matches_controls_with_no_accepted_splits():
     with pytest.raises(ValueError, match="positive"):
         select_intervals(_records(), limit=0)
+
     records = _records()
-    selected = select_intervals(records, limit=12)
+    selected = select_intervals(records, limit=48)
     for item in selected:
-        if "control" not in item.reasons:
+        if "matched_control" not in item.reasons:
             continue
-        rows = [row for row in records if row["sequence_id"] == item.sequence_id]
-        control_rows = [
-            row for row in rows
-            if row["frame_start"] == item.start_frame and row["frame_end"] == item.end_frame
+        split_rows = [
+            row for row in records
+            if row["config_id"] == "layer_atomic_split"
+            and row["sequence_id"] == item.sequence_id
+            and row["frame_start"] == item.start_frame
+            and row["frame_end"] == item.end_frame
         ]
-        assert control_rows
-        assert control_rows[0]["trajectory_regret"] <= np.median(
-            [row["trajectory_regret"] for row in rows]
-        )
+        assert split_rows
+        assert split_rows[0]["split_accepted_count"] == 0
 
 
-def test_selector_is_deterministic_bounded_expanded_and_reason_preserving():
+def test_selector_emits_all_split_trajectory_reasons_deterministically():
     records = _records()
-    first = select_intervals(records, limit=12, context_windows=2)
-    second = select_intervals(copy.deepcopy(records), limit=12, context_windows=2)
+    first = select_intervals(records, limit=48, context_windows=2)
+    second = select_intervals(copy.deepcopy(records), limit=48, context_windows=2)
+
     assert [item.to_dict() for item in first] == [item.to_dict() for item in second]
-    assert len(first) <= 12
+    assert len(first) <= 48
     assert {item.sequence_id for item in first} >= {"00", "02", "04", "05", "09", "10"}
+    reasons = {reason for item in first for reason in item.reasons}
+    assert {
+        "trajectory_degradation",
+        "trajectory_improvement",
+        "trajectory_change",
+        "split_anomaly",
+        "split_no_trajectory_effect",
+        "matched_control",
+    } <= reasons
+    exact = select_intervals(records, limit=48, context_windows=0)
+    expected_starts = {
+        "trajectory_improvement": 0,
+        "trajectory_change": 20,
+        "trajectory_degradation": 15,
+        "split_no_trajectory_effect": 20,
+        "split_anomaly": 30,
+        "matched_control": 25,
+    }
+    for reason, start in expected_starts.items():
+        assert any(
+            item.sequence_id == "02"
+            and item.start_frame == start
+            and reason in item.reasons
+            for item in exact
+        )
     assert all(item.reasons for item in first)
     assert all(
         item.end_frame - item.start_frame + 1 <= 30
-        for item in first if "control" not in item.reasons
+        for item in first if "matched_control" not in item.reasons
     )
-    # Original spike at frame 10 is expanded two five-frame strides to frame 0.
-    assert any(item.sequence_id == "02" and item.start_frame == 0 for item in first)
 
 
-def test_selector_unions_configs_and_keeps_family_diversity():
-    records = _records()
-    duplicate = [{**row, "config_id": "geometry_baseline"} for row in records]
-    selected = select_intervals(records + duplicate, limit=48)
+def test_selector_preserves_nontrajectory_family_diversity_and_context_merging():
+    selected = select_intervals(_records(), limit=48)
     reasons = {reason for item in selected for reason in item.reasons}
-    assert {"trajectory", "merge", "immutable_atom", "scale", "temporal", "control"} <= reasons
+    assert {"merge", "immutable_atom", "scale", "temporal"} <= reasons
+    assert any(len(item.reasons) > 1 for item in selected)
     assert len(selected) <= 48
+
+
+def test_selector_does_not_treat_missing_split_count_as_a_matched_control():
+    records = []
+    for window, (accepted, changed, speed) in enumerate([
+        (2, 0.5, 1.0),
+        (None, None, 1.01),
+        (0, 0.0, 3.0),
+    ]):
+        records.append({
+            "config_id": "layer_atomic_split",
+            "sequence_id": "01",
+            "frame_start": window * 10,
+            "frame_end": window * 10 + 9,
+            "split_minus_depth_regret": 2.0 if window == 0 else 0.0,
+            "split_minus_geometry_regret": 1.0 if window == 0 else 0.0,
+            "split_accepted_count": accepted,
+            "split_changed_pixel_ratio": changed,
+            "merge_anomaly": 0.0,
+            "atom_anomaly": 0.0,
+            "scale_dispersion": 0.0,
+            "temporal_churn": 0.0,
+            "gt_speed": speed,
+            "gt_turn": 0.0,
+            "confidence": 0.8,
+        })
+
+    selected = select_intervals(records, context_windows=0)
+
+    controls = [item for item in selected if "matched_control" in item.reasons]
+    assert len(controls) == 1
+    assert controls[0].start_frame == 20

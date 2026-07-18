@@ -11,15 +11,22 @@ from .schema import SelectedInterval
 
 
 FAMILIES = {
-    "trajectory": "trajectory_regret",
     "merge": "merge_anomaly",
     "immutable_atom": "atom_anomaly",
     "scale": "scale_dispersion",
     "temporal": "temporal_churn",
 }
+REGRET_FIELDS = (
+    "split_minus_depth_regret",
+    "split_minus_geometry_regret",
+)
 WEIGHTS = {
-    "trajectory": .40, "merge": .10, "immutable_atom": .10,
-    "scale": .25, "temporal": .15,
+    "trajectory": .35,
+    "split": .20,
+    "merge": .10,
+    "immutable_atom": .10,
+    "scale": .15,
+    "temporal": .10,
 }
 RECOVERY = {"02", "04", "10"}
 GUARD = {"00", "05", "09"}
@@ -47,6 +54,26 @@ def robust_zscore(values: Iterable[float]) -> np.ndarray:
     return result
 
 
+def _finite_values(rows: list[dict], field: str) -> list[float]:
+    values = []
+    for row in rows:
+        try:
+            value = float(row.get(field, np.nan))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            values.append(value)
+    return values
+
+
+def _number(value, default=np.nan) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return result if np.isfinite(result) else float(default)
+
+
 def _stride(rows: list[dict]) -> int:
     starts = sorted({int(row["frame_start"]) for row in rows})
     differences = np.diff(starts)
@@ -56,38 +83,79 @@ def _stride(rows: list[dict]) -> int:
     return max(1, int(rows[0]["frame_end"]) - int(rows[0]["frame_start"]) + 1)
 
 
-def select_intervals(records: list[dict], *, limit: int = 48, context_windows: int = 2) -> list[SelectedInterval]:
+def select_intervals(
+    records: list[dict], *, limit: int = 48, context_windows: int = 2,
+) -> list[SelectedInterval]:
     if limit <= 0:
         raise ValueError("interval limit must be positive")
-    # Union configurations at the same global window so every method gets identical cases.
+
+    # Union configurations at the same global window so every method gets
+    # identical cases. Split activity is sourced exclusively from the split
+    # profile; baseline structural maxima must not manufacture split events.
     grouped: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
     for record in records:
-        grouped[(str(record["sequence_id"]), int(record["frame_start"]), int(record["frame_end"]))].append(record)
+        grouped[(
+            str(record["sequence_id"]),
+            int(record["frame_start"]),
+            int(record["frame_end"]),
+        )].append(record)
     windows = []
     for (sequence, start, end), rows in sorted(grouped.items()):
         merged = {"sequence_id": sequence, "frame_start": start, "frame_end": end}
-        for family, field in FAMILIES.items():
-            values = [float(row.get(field, np.nan)) for row in rows]
-            finite = [value for value in values if np.isfinite(value)]
-            merged[field] = max(finite) if finite else 0.0
+        for field in REGRET_FIELDS:
+            values = _finite_values(rows, field)
+            merged[field] = float(np.mean(values)) if values else 0.0
+        for field in FAMILIES.values():
+            values = _finite_values(rows, field)
+            merged[field] = max(values) if values else 0.0
         for field in ("gt_speed", "gt_turn", "confidence"):
-            values = [float(row.get(field, np.nan)) for row in rows]
-            finite = [value for value in values if np.isfinite(value)]
-            merged[field] = float(np.mean(finite)) if finite else 0.0
+            values = _finite_values(rows, field)
+            merged[field] = float(np.mean(values)) if values else 0.0
+        split_rows = [row for row in rows if row.get("config_id") == "layer_atomic_split"]
+        accepted = _finite_values(split_rows, "split_accepted_count")
+        changed = _finite_values(split_rows, "split_changed_pixel_ratio")
+        merged["split_accepted_count"] = max(accepted) if accepted else None
+        merged["split_changed_pixel_ratio"] = max(changed) if changed else None
+        merged["split_activity"] = (
+            _number(merged["split_accepted_count"], 0.0)
+            + _number(merged["split_changed_pixel_ratio"], 0.0)
+            if accepted or changed else None
+        )
         windows.append(merged)
     if not windows:
         return []
+
+    regret_zscores = [
+        np.abs(robust_zscore(row[field] for row in windows))
+        for field in REGRET_FIELDS
+    ]
+    accepted_z = robust_zscore(
+        _number(row["split_accepted_count"]) for row in windows
+    )
+    changed_z = robust_zscore(
+        _number(row["split_changed_pixel_ratio"]) for row in windows
+    )
+    for index, row in enumerate(windows):
+        row["trajectory_z"] = max(float(values[index]) for values in regret_zscores)
+        row["split_z"] = max(0.0, float(accepted_z[index]), float(changed_z[index]))
     for family, field in FAMILIES.items():
-        z = robust_zscore(row[field] for row in windows)
-        for row, value in zip(windows, z, strict=True):
+        zscores = robust_zscore(row[field] for row in windows)
+        for row, value in zip(windows, zscores, strict=True):
             row[f"{family}_z"] = max(0.0, float(value))
     for row in windows:
-        row["score"] = sum(WEIGHTS[family] * row[f"{family}_z"] for family in FAMILIES)
+        row["score"] = (
+            WEIGHTS["trajectory"] * row["trajectory_z"]
+            + WEIGHTS["split"] * row["split_z"]
+            + sum(WEIGHTS[family] * row[f"{family}_z"] for family in FAMILIES)
+        )
 
     candidates: dict[tuple[str, int, int], dict] = {}
+
     def add(row, reason, bonus=0.0):
         key = (row["sequence_id"], row["frame_start"], row["frame_end"])
-        item = candidates.setdefault(key, {**row, "reasons": set(), "priority": row["score"]})
+        item = candidates.setdefault(
+            key, {**row, "reasons": set(), "priority": row["score"]},
+        )
         item["reasons"].add(reason)
         item["priority"] = max(item["priority"], row["score"] + bonus)
 
@@ -95,57 +163,126 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
     for row in windows:
         by_sequence[row["sequence_id"]].append(row)
     for sequence, rows in by_sequence.items():
-        if sequence in GUARD:
-            # Negative layer_atomic-minus-geometry regret is the stability
-            # success we need to preserve on 00/05/09.
-            ordered = sorted(rows, key=lambda row: (row["trajectory_regret"], row["frame_start"]))
-        else:
-            ordered = sorted(rows, key=lambda row: (-row["trajectory_z"], row["frame_start"]))
         count = 3 if sequence in RECOVERY else 2 if sequence in GUARD else 1
-        for row in ordered[:count]:
-            reason = "guard_success" if sequence in GUARD else "trajectory"
-            add(row, reason, 3.0 if sequence in RECOVERY | GUARD else 0.0)
-        # Matched low-anomaly control nearest in speed, turn and confidence to the strongest event.
-        anchor = ordered[0]
-        median_score = np.median([row["score"] for row in rows])
-        median_regret = np.median([row["trajectory_regret"] for row in rows])
-        pool = [
-            row for row in rows
-            if row["score"] <= median_score
-            and row["trajectory_regret"] <= median_regret
-            and row is not anchor
-        ]
-        if pool:
-            scales = {field: max(np.std([row[field] for row in rows]), 1e-6) for field in ("gt_speed", "gt_turn", "confidence")}
-            control = min(pool, key=lambda row: (
-                sum(abs(row[field] - anchor[field]) / scales[field] for field in scales), row["frame_start"]
-            ))
-            add(control, "control", 1.0)
-        # Largest trajectory change point.
+        degradation = sorted(
+            (row for row in rows if max(row[field] for field in REGRET_FIELDS) > 0),
+            key=lambda row: (
+                -max(row[field] for field in REGRET_FIELDS), row["frame_start"],
+            ),
+        )
+        improvement = sorted(
+            (row for row in rows if min(row[field] for field in REGRET_FIELDS) < 0),
+            key=lambda row: (
+                min(row[field] for field in REGRET_FIELDS), row["frame_start"],
+            ),
+        )
+        focus_bonus = 3.0 if sequence in RECOVERY | GUARD else 0.0
+        for row in degradation[:count]:
+            add(row, "trajectory_degradation", focus_bonus + 2.0)
+        for row in improvement[:count]:
+            add(row, "trajectory_improvement", focus_bonus + 2.0)
+
         temporal = sorted(rows, key=lambda row: row["frame_start"])
         if len(temporal) > 1:
-            index = max(range(1, len(temporal)), key=lambda i: (abs(temporal[i]["trajectory_regret"] - temporal[i - 1]["trajectory_regret"]), -temporal[i]["frame_start"]))
-            add(temporal[index], "trajectory_change")
+            deltas = [
+                max(
+                    abs(temporal[index][field] - temporal[index - 1][field])
+                    for field in REGRET_FIELDS
+                )
+                for index in range(1, len(temporal))
+            ]
+            index = max(
+                range(1, len(temporal)),
+                key=lambda value: (
+                    deltas[value - 1], -temporal[value]["frame_start"],
+                ),
+            )
+            add(temporal[index], "trajectory_change", 1.0 + deltas[index - 1])
+
+        active = [
+            row for row in rows if _number(row["split_accepted_count"], -1.0) > 0
+        ]
+        if active:
+            observed_activity = [
+                _number(row["split_activity"])
+                for row in rows if np.isfinite(_number(row["split_activity"]))
+            ]
+            median_activity = float(np.median(observed_activity))
+            median_regret = float(np.median([
+                max(abs(row[field]) for field in REGRET_FIELDS) for row in rows
+            ]))
+            no_effect = [
+                row for row in active
+                if row["split_activity"] > median_activity
+                and max(abs(row[field]) for field in REGRET_FIELDS) <= median_regret
+            ]
+            if no_effect:
+                row = min(
+                    no_effect,
+                    key=lambda item: (
+                        max(abs(item[field]) for field in REGRET_FIELDS),
+                        -item["split_activity"], item["frame_start"],
+                    ),
+                )
+                add(row, "split_no_trajectory_effect", 1.5 + row["split_z"])
+
+        anchor = max(
+            rows,
+            key=lambda row: (
+                row["split_z"], _number(row["split_accepted_count"], -1.0),
+                _number(row["split_changed_pixel_ratio"], -1.0),
+                -row["frame_start"],
+            ),
+        )
+        pool = [
+            row for row in rows
+            if _number(row["split_accepted_count"], -1.0) == 0 and row is not anchor
+        ]
+        if pool:
+            scales = {
+                field: max(float(np.std([row[field] for row in rows])), 1e-6)
+                for field in ("gt_speed", "gt_turn", "confidence")
+            }
+            control = min(pool, key=lambda row: (
+                sum(abs(row[field] - anchor[field]) / scales[field] for field in scales),
+                row["frame_start"],
+            ))
+            add(control, "matched_control", 1.0)
+
+    for row in sorted(
+        windows,
+        key=lambda row: (-row["split_z"], row["sequence_id"], row["frame_start"]),
+    )[:6]:
+        if (
+            _number(row["split_accepted_count"], -1.0) > 0
+            or _number(row["split_changed_pixel_ratio"], -1.0) > 0
+        ):
+            add(row, "split_anomaly", 2.0 + row["split_z"])
     for family in FAMILIES:
-        for row in sorted(windows, key=lambda row: (-row[f"{family}_z"], row["sequence_id"], row["frame_start"]))[:6]:
+        for row in sorted(
+            windows,
+            key=lambda row: (-row[f"{family}_z"], row["sequence_id"], row["frame_start"]),
+        )[:6]:
             add(row, family, 2.0)
 
     expanded = []
     for item in candidates.values():
         stride = _stride(by_sequence[item["sequence_id"]])
-        is_control = "control" in item["reasons"]
+        is_control = "matched_control" in item["reasons"]
         expanded.append({
             **item,
-            "start": item["frame_start"] if is_control else max(0, item["frame_start"] - context_windows * stride),
-            "end": item["frame_end"] if is_control else item["frame_end"] + context_windows * stride,
+            "start": item["frame_start"] if is_control else max(
+                0, item["frame_start"] - context_windows * stride,
+            ),
+            "end": item["frame_end"] if is_control else (
+                item["frame_end"] + context_windows * stride
+            ),
             "stride": stride,
         })
     expanded.sort(key=lambda item: (item["sequence_id"], item["start"], item["end"]))
     merged_intervals: list[dict] = []
-    # Controls remain distinct comparison cases even when their context overlaps
-    # an anomaly interval.  Anomaly candidates still obey the normal merge rule.
-    controls = [item for item in expanded if "control" in item["reasons"]]
-    for item in (item for item in expanded if "control" not in item["reasons"]):
+    controls = [item for item in expanded if "matched_control" in item["reasons"]]
+    for item in (item for item in expanded if "matched_control" not in item["reasons"]):
         max_span = (
             int(item["frame_end"]) - int(item["frame_start"]) + 1
             + 2 * context_windows * int(item["stride"])
@@ -170,10 +307,12 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
             current["priority"] = max(current["priority"], item["priority"])
         else:
             merged_intervals.append({**item, "reasons": set(item["reasons"])})
-    merged_intervals.extend({**item, "reasons": set(item["reasons"])} for item in controls)
+    merged_intervals.extend(
+        {**item, "reasons": set(item["reasons"])} for item in controls
+    )
 
-    # Reserve mandatory sequence, signal-family, and control coverage before
-    # filling the remaining weighted-ranking slots.
+    # Reserve required sequence and signal-family coverage before filling the
+    # remaining weighted-ranking slots.
     mandatory = RECOVERY | GUARD
     ranked = sorted(
         merged_intervals,
@@ -181,6 +320,7 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
     )
     chosen: list[dict] = []
     chosen_ids: set[tuple[str, int, int]] = set()
+
     def reserve(items, count=1):
         if count <= 0:
             return 0
@@ -188,35 +328,49 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
         for item in items:
             identity = (item["sequence_id"], item["start"], item["end"])
             if identity not in chosen_ids and len(chosen) < limit:
-                chosen.append(item); chosen_ids.add(identity)
+                chosen.append(item)
+                chosen_ids.add(identity)
                 added += 1
                 if added == count:
                     break
         return added
+
     for sequence in sorted(mandatory):
         reserve(
             item for item in ranked
-            if item["sequence_id"] == sequence and "control" not in item["reasons"]
+            if item["sequence_id"] == sequence
+            and "matched_control" not in item["reasons"]
         )
         reserve(
             item for item in ranked
-            if item["sequence_id"] == sequence and "control" in item["reasons"]
+            if item["sequence_id"] == sequence
+            and "matched_control" in item["reasons"]
         )
-    for reason in ("merge", "immutable_atom", "scale", "temporal"):
+    for reason in (
+        "trajectory_degradation", "trajectory_improvement", "trajectory_change",
+        "split_anomaly", "split_no_trajectory_effect", "matched_control",
+    ):
+        reserve(item for item in ranked if reason in item["reasons"])
+    for reason in FAMILIES:
         already = sum(reason in item["reasons"] for item in chosen)
-        reserve((item for item in ranked if reason in item["reasons"]), max(0, 2 - already))
+        reserve(
+            (item for item in ranked if reason in item["reasons"]),
+            max(0, 2 - already),
+        )
     for item in ranked:
         identity = (item["sequence_id"], item["start"], item["end"])
         if identity not in chosen_ids and len(chosen) < limit:
-            chosen.append(item); chosen_ids.add(identity)
+            chosen.append(item)
+            chosen_ids.add(identity)
+
     missing = []
     for sequence in sorted(mandatory & set(by_sequence)):
         sequence_items = [item for item in chosen if item["sequence_id"] == sequence]
-        if not any("control" not in item["reasons"] for item in sequence_items):
+        if not any("matched_control" not in item["reasons"] for item in sequence_items):
             missing.append(f"{sequence}:event")
-        if not any("control" in item["reasons"] for item in sequence_items):
+        if not any("matched_control" in item["reasons"] for item in sequence_items):
             missing.append(f"{sequence}:control")
-    for reason in ("merge", "immutable_atom", "scale", "temporal"):
+    for reason in FAMILIES:
         available = sum(reason in item["reasons"] for item in ranked)
         required = min(2, available)
         actual = sum(reason in item["reasons"] for item in chosen)
@@ -230,8 +384,10 @@ def select_intervals(records: list[dict], *, limit: int = 48, context_windows: i
     chosen.sort(key=lambda item: (item["sequence_id"], item["start"]))
     return [
         SelectedInterval(
-            sequence_id=item["sequence_id"], start_frame=int(item["start"]),
-            end_frame=int(item["end"]), reasons=tuple(sorted(item["reasons"])),
+            sequence_id=item["sequence_id"],
+            start_frame=int(item["start"]),
+            end_frame=int(item["end"]),
+            reasons=tuple(sorted(item["reasons"])),
             score=float(item["priority"]),
         )
         for item in chosen

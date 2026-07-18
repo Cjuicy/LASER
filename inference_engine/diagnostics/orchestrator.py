@@ -399,19 +399,26 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
                 gt_rotations = ground_truth[:, :3, :3]
             base = Path(run_dir) / "artifacts" / config / sequence / "pass1"
             segmentation = _read_jsonl(base / "segmentation.jsonl")
+            split_segmentation = _read_jsonl(
+                Path(run_dir) / "artifacts" / "layer_atomic_split" / sequence
+                / "pass1" / "segmentation.jsonl"
+            )
             scale = {item["context"]["window_id"]: item for item in _read_jsonl(base / "scale.jsonl")}
             temporal = {item["context"]["window_id"]: item for item in _read_jsonl(base / "temporal.jsonl")}
             by_window: dict[int, list[dict]] = {}
             for item in segmentation:
                 by_window.setdefault(int(item["context"]["window_id"]), []).append(item)
+            split_by_window: dict[int, list[dict]] = {}
+            for item in split_segmentation:
+                split_by_window.setdefault(
+                    int(item["context"]["window_id"]), [],
+                ).append(item)
             window_count = max(1, int(np.ceil(max(len(errors) - args.overlap, 1) / stride)))
             for window_id in range(window_count):
                 start = window_id * stride; end = min(start + args.window_size - 1, max(len(errors) - 1, start))
-                frame_slice = errors[start:end + 1]
                 split_slice = split_errors[start:end + 1]
-                reference_slice = geometry_errors[start:end + 1] if geometry_errors.size else np.asarray([])
-                regret = float(np.nanmean(split_slice - reference_slice)) if split_slice.size and reference_slice.size == split_slice.size else 0.0
                 frame_metrics = by_window.get(window_id, [])
+                split_frame_metrics = split_by_window.get(window_id, [])
                 final_metrics = [item["metrics"].get("final", {}) for item in frame_metrics]
                 merge_metrics = [item["metrics"].get("merge", {}) for item in frame_metrics]
                 lsr = max((float(item.get("largest_segment_ratio") or 0) for item in final_metrics), default=0.0)
@@ -436,15 +443,37 @@ def build_selection_records(run_dir: Path, trajectory_results: dict, args) -> li
                 def mean_regret(reference):
                     reference_values = reference[start:end + 1]
                     return float(np.nanmean(split_slice - reference_values)) if split_slice.size and len(reference_values) == len(split_slice) else None
+                split_metrics = [
+                    item.get("metrics", {}).get("split", {})
+                    for item in split_frame_metrics
+                ]
+                accepted_values = [
+                    int(metrics["split_accepted_count"])
+                    for metrics in split_metrics
+                    if metrics.get("split_accepted_count") is not None
+                ]
+                changed_values = [
+                    float(metrics["split_changed_pixel_ratio"])
+                    for metrics in split_metrics
+                    if metrics.get("split_changed_pixel_ratio") is not None
+                ]
+                depth_regret = mean_regret(depth_errors)
+                geometry_regret = mean_regret(geometry_errors)
                 records.append({
                     "config_id": config, "sequence_id": sequence, "window_id": window_id,
-                    "frame_start": start, "frame_end": end, "trajectory_regret": regret,
+                    "frame_start": start, "frame_end": end,
+                    "split_minus_depth_regret": depth_regret,
+                    "split_minus_geometry_regret": geometry_regret,
+                    "split_accepted_count": (
+                        int(sum(accepted_values)) if accepted_values else None
+                    ),
+                    "split_changed_pixel_ratio": (
+                        float(np.mean(changed_values)) if changed_values else None
+                    ),
                     "merge_anomaly": cross,
                     "atom_anomaly": lsr + np.log1p(growth),
                     "scale_dispersion": float(scale_p90),
                     "temporal_churn": float(temporal_item.get("segment_churn_ratio") or temporal_item.get("unmatched_area_ratio") or 0),
-                    "layer_atomic_split_minus_depth_regret": mean_regret(depth_errors),
-                    "layer_atomic_split_minus_geometry_regret": regret,
                     "gt_speed": speed,
                     "gt_turn": float(np.mean(turn_angles)) if turn_angles else 0.0,
                     "confidence": float(np.mean(confidence_values)) if confidence_values else 0.0,
@@ -556,12 +585,18 @@ def build_cases(
                 center_records,
                 key=lambda row: abs((row["frame_start"] + row["frame_end"]) / 2 - center),
             ) if center_records else None
-            actual_regret = center_record.get("trajectory_regret") if center_record else None
+            depth_regret = (
+                center_record.get("split_minus_depth_regret") if center_record else None
+            )
+            geometry_regret = (
+                center_record.get("split_minus_geometry_regret") if center_record else None
+            )
             atomic_write_json(interval_root / "metrics.json", {
                 "comparison": "layer_atomic_split_vs_geometry_baseline",
                 "interval": interval.to_dict(),
                 "selection_score": interval.score,
-                "trajectory_regret": actual_regret,
+                "split_minus_depth_regret": depth_regret,
+                "split_minus_geometry_regret": geometry_regret,
                 **comparison_metrics,
             })
         else:
