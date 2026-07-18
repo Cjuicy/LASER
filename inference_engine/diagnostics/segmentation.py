@@ -174,16 +174,23 @@ def trace_segmentation_frame(
     seg_sigma: float = 1.1,
     seg_min_size: int = 500,
     normal_method: str = "cross",
+    rgb_image: np.ndarray | None = None,
+    split_score_thresh: float = .10,
+    split_aux_confirmation: bool = True,
 ) -> dict[str, Any]:
     """Recompute diagnostic stages and assert parity with an already-used result."""
     from .merge import DiagnosticParityError, analyze_layer_atomic_merge
     from inference_engine.utils.depth import segment_depth_felzenszwalb_rag_stages
     from inference_engine.utils.geometry_segmentation import segment_geometry_felzenszwalb_rag_stages
+    from inference_engine.utils.layer_atomic_geometry import (
+        segment_point_map_layer_atomic_split_stages,
+    )
 
     point_map = np.asarray(point_map)
     depth = point_map[..., -1]
     arrays: dict[str, np.ndarray] = {"final_labels": np.asarray(formal_labels)}
     merge_trace = None
+    split_metrics = None
     if segment_mode in {"depth", "layer_atomic"}:
         depth_conf = None if conf_map is None else np.asarray(conf_map)[None]
         initial, coarse, merge_threshold = segment_depth_felzenszwalb_rag_stages(
@@ -209,6 +216,38 @@ def trace_segmentation_frame(
         initial, recomputed = stages.initial_labels, stages.merged_labels
         merge_threshold = None
         arrays.update(initial_labels=initial, coarse_labels=recomputed)
+    elif segment_mode == "layer_atomic_split":
+        split_conf = None if conf_map is None else np.asarray(conf_map)[None]
+        stages = segment_point_map_layer_atomic_split_stages(
+            point_map,
+            depth_merge_thresh,
+            rgb_images=rgb_image,
+            normal_method=normal_method,
+            split_score_thresh=split_score_thresh,
+            split_aux_confirmation=split_aux_confirmation,
+            conf_map=split_conf,
+            top_conf_percentile=top_conf_percentile,
+            seg_scale=seg_scale,
+            seg_sigma=seg_sigma,
+            seg_min_size=seg_min_size,
+            batch_idx=0,
+        )
+        initial, recomputed = stages.initial_labels, stages.final_labels
+        merge_threshold = None
+        split_metrics = stages.split_trace.diagnostics.as_dict()
+        arrays.update(
+            initial_labels=stages.initial_labels,
+            coarse_labels=stages.coarse_labels,
+            pre_split_labels=stages.pre_split_labels,
+            final_labels=stages.final_labels,
+            atom_labels=stages.atom_labels,
+            atom_scales=stages.atom_scales,
+            changed_mask=stages.split_trace.changed_mask,
+            split_parent_map=stages.split_trace.parent_map,
+            split_child_map=stages.split_trace.child_map,
+            split_score_map=stages.split_trace.score_map,
+            split_decision_map=stages.split_trace.decision_map,
+        )
     else:
         raise ValueError(f"unknown segment mode: {segment_mode}")
     if not np.array_equal(_compact(recomputed)[1], _compact(formal_labels)[1]):
@@ -236,4 +275,6 @@ def trace_segmentation_frame(
         arrays["normalized_gap_map"] = merge_trace.normalized_gap_map
         arrays["threshold_margin_map"] = merge_trace.threshold_margin_map
         arrays["component_growth_map"] = merge_trace.component_growth_map
+    if split_metrics is not None:
+        metrics["split"] = split_metrics
     return {"metrics": metrics, "arrays": arrays, "merge_trace": merge_trace}

@@ -158,16 +158,31 @@ def make_sp_graph(
 
         point_maps_array = np.asarray(point_maps)
         conf_array = None if conf_map is None else np.asarray(conf_map)
+        rgb_array = None if rgb_images is None else np.asarray(rgb_images)
         for local_index, formal_labels in enumerate(labels):
+            rgb_frame = None
+            if segment_mode == "layer_atomic_split" and rgb_array is not None:
+                rgb_frame = rgb_array[local_index] if rgb_array.ndim == 4 else rgb_array
+                if rgb_frame.shape == (3, *point_maps_array.shape[1:3]):
+                    rgb_frame = np.moveaxis(rgb_frame, 0, -1)
+            trace_kwargs = {
+                "segment_mode": segment_mode,
+                "depth_merge_thresh": depth_merge_thresh,
+                "conf_map": None if conf_array is None else conf_array[local_index],
+                "top_conf_percentile": top_conf_percentile,
+                "normal_method": normal_method,
+                **params,
+            }
+            if segment_mode == "layer_atomic_split":
+                trace_kwargs.update(
+                    rgb_image=rgb_frame,
+                    split_score_thresh=split_score_thresh,
+                    split_aux_confirmation=split_aux_confirmation,
+                )
             trace = trace_segmentation_frame(
                 point_maps_array[local_index],
                 formal_labels,
-                segment_mode=segment_mode,
-                depth_merge_thresh=depth_merge_thresh,
-                conf_map=None if conf_array is None else conf_array[local_index],
-                top_conf_percentile=top_conf_percentile,
-                normal_method=normal_method,
-                **params,
+                **trace_kwargs,
             )
             arrays = dict(trace["arrays"])
             if trace["merge_trace"] is not None:

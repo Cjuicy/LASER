@@ -51,6 +51,30 @@ def test_pass2_only_saves_selected_dense_arrays_and_compacts_types(tmp_path):
         assert data["mask__shape"].tolist() == [2, 2]
 
 
+def test_split_trace_arrays_remain_scalar_only_in_pass1_and_selected_in_pass2(tmp_path):
+    arrays = {
+        "final_labels": np.arange(4).reshape(2, 2),
+        "pre_split_labels": np.arange(4).reshape(2, 2),
+        "changed_mask": np.array([[1, 0], [0, 1]], dtype=bool),
+        "split_score_map": np.ones((2, 2), dtype=np.float64),
+    }
+    budget = StorageBudget(tmp_path, max_bytes=1_000_000, warn_bytes=900_000, min_free_bytes=0)
+    pass1 = FileDiagnosticSink(tmp_path / "pass1", budget=budget)
+    pass1.emit_segmentation(_context(1), 0, {"split": {"split_accepted_count": 1}}, arrays)
+    assert not list((tmp_path / "pass1").rglob("*.npz"))
+
+    selected = [SelectedInterval("02", 12, 12, ("split",), 1.0)]
+    pass2 = FileDiagnosticSink(tmp_path / "pass2", selected_intervals=selected)
+    pass2.emit_segmentation(_context(2), 0, {"split": {"split_accepted_count": 1}}, arrays)
+    traces = list((tmp_path / "pass2").rglob("*.npz"))
+    assert len(traces) == 1
+    with np.load(traces[0]) as data:
+        assert set(data.files) == {
+            "final_labels", "pre_split_labels", "changed_mask__packed",
+            "changed_mask__shape", "split_score_map",
+        }
+
+
 def test_input_capture_uses_selected_frames(tmp_path):
     sink = FileDiagnosticSink(tmp_path, selected_intervals=[SelectedInterval("02", 12, 12, ("control",), 1.0)])
     context = _context(2)

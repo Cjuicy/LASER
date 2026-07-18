@@ -1,10 +1,14 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
+from inference_engine.diagnostics import segmentation as diagnostic_segmentation
+from inference_engine.diagnostics import temporal as diagnostic_temporal
 from inference_engine.streaming_window_engine import StreamingWindowEngine
 from inference_engine.streaming_window_engine_lc import StreamingWindowEngineLC
+from inference_engine.utils import lsa
 
 
 def _engine(tmp_path, **kwargs):
@@ -104,3 +108,54 @@ def test_background_inference_exception_is_raised_by_end(tmp_path):
     engine(torch.zeros((1, 3, 2, 2)))
     with pytest.raises(RuntimeError, match="synthetic worker failure"):
         engine.end()
+
+
+def test_split_diagnostic_observation_uses_hwc_rgb_and_active_split_profile(monkeypatch):
+    points = np.zeros((2, 4, 5, 3), dtype=np.float32)
+    confidence = np.ones((2, 4, 5), dtype=np.float32)
+    rgb = np.arange(2 * 3 * 4 * 5, dtype=np.float32).reshape(2, 3, 4, 5)
+    observations = []
+
+    class Recorder:
+        def emit_segmentation(self, *args):
+            observations.append(args)
+
+        def emit_temporal(self, *args):
+            return None
+
+    def fake_trace(point_map, formal_labels, *, rgb_image, **kwargs):
+        observations.append((point_map, formal_labels, rgb_image, kwargs))
+        return {"metrics": {}, "arrays": {}, "merge_trace": None}
+
+    monkeypatch.setattr(
+        lsa,
+        "batched_image_op_wrapper",
+        lambda images, op_func, **kwargs: np.zeros(images.shape[:3], dtype=np.intp),
+    )
+    monkeypatch.setattr(lsa, "match_segmentation_seq", lambda labels, iou_thresh: [])
+    monkeypatch.setattr(diagnostic_segmentation, "trace_segmentation_frame", fake_trace)
+    monkeypatch.setattr(
+        diagnostic_temporal,
+        "trace_temporal_graph",
+        lambda graphs: {"metrics": {}, "arrays": {}},
+    )
+
+    lsa.make_sp_graph(
+        points,
+        conf_map=confidence,
+        segment_mode="layer_atomic_split",
+        rgb_images=rgb,
+        normal_method="sobel",
+        split_score_thresh=.17,
+        split_aux_confirmation=False,
+        diagnostic_sink=Recorder(),
+        diagnostic_context=object(),
+    )
+
+    trace_calls = [call for call in observations if isinstance(call[0], np.ndarray)]
+    assert len(trace_calls) == 2
+    for local_index, (_, _, rgb_image, kwargs) in enumerate(trace_calls):
+        np.testing.assert_array_equal(rgb_image, np.moveaxis(rgb[local_index], 0, -1))
+        assert kwargs["normal_method"] == "sobel"
+        assert kwargs["split_score_thresh"] == .17
+        assert kwargs["split_aux_confirmation"] is False

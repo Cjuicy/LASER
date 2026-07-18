@@ -8,6 +8,9 @@ from inference_engine.diagnostics.segmentation import (
     trace_segmentation_frame,
 )
 from inference_engine.utils.depth import segment_depth_felzenszwalb_rag
+from inference_engine.utils.layer_atomic_geometry import (
+    segment_point_map_layer_atomic_split_stages,
+)
 
 
 def test_label_summary_reports_area_boundaries_entropy_and_atom_growth():
@@ -74,3 +77,36 @@ def test_depth_trace_handles_single_frame_confidence_with_batch_equivalent_seman
         top_conf_percentile=.5, seg_scale=2, seg_sigma=0, seg_min_size=2,
     )
     assert trace["metrics"]["final"]["valid"] is True
+
+
+def test_layer_atomic_split_trace_matches_staged_formal_labels_and_emits_evidence():
+    height, width = 8, 10
+    yy, xx = np.mgrid[:height, :width].astype(np.float32)
+    points = np.stack((xx, yy, 1.0 + xx / width), axis=-1)
+    rgb = np.stack((xx / width, yy / height, np.zeros_like(xx)), axis=-1)
+    confidence = np.linspace(0, 1, height * width).reshape(height, width)
+
+    stages = segment_point_map_layer_atomic_split_stages(
+        points, .1, rgb_images=rgb, conf_map=confidence[None],
+        top_conf_percentile=.5, seg_scale=2, seg_sigma=0, seg_min_size=2,
+        batch_idx=0,
+    )
+    trace = trace_segmentation_frame(
+        points,
+        stages.final_labels,
+        segment_mode="layer_atomic_split",
+        rgb_image=rgb,
+        conf_map=confidence,
+        top_conf_percentile=.5,
+        seg_scale=2,
+        seg_sigma=0,
+        seg_min_size=2,
+        normal_method="cross",
+        split_score_thresh=.10,
+        split_aux_confirmation=True,
+    )
+
+    np.testing.assert_array_equal(trace["arrays"]["final_labels"], stages.final_labels)
+    np.testing.assert_array_equal(trace["arrays"]["pre_split_labels"], stages.pre_split_labels)
+    np.testing.assert_array_equal(trace["arrays"]["changed_mask"], stages.split_trace.changed_mask)
+    assert trace["metrics"]["split"]["split_aux_confirmation"] is True
