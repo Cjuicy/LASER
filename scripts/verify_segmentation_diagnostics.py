@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 import numpy as np
 
@@ -35,7 +36,6 @@ from inference_engine.utils.layer_atomic_geometry import (
     segment_point_map_layer_atomic_split,
     segment_point_map_layer_atomic_split_stages,
 )
-from inference_engine.utils.post_merge_split import refine_auto_regions_with_trace
 
 
 METHODS = ("depth", "geometry_baseline", "layer_atomic_split")
@@ -81,33 +81,62 @@ def _selection_records() -> list[dict]:
     return records
 
 
-def _split_fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    height, width = 8, 10
-    y, x = np.mgrid[:height, :width].astype(np.float32)
-    points = np.stack((x, y, 1.0 + x / width), axis=-1)
-    rgb = np.stack((x / width, y / height, np.full_like(x, .5)), axis=-1)
-    confidence = np.linspace(0, 1, height * width, dtype=np.float32).reshape(height, width)
-    return points, rgb, confidence
-
-
-def _accepted_split_fixture():
-    """Create a real, high-normal-contrast split accepted by production code."""
+def _accepted_staged_split_fixture():
+    """Create a deterministic accepted split through both production entry points."""
     height, width = 24, 32
     y, x = np.mgrid[:height, :width].astype(np.float32)
-    depth = np.zeros_like(x)
-    depth[:, width // 2:] = (x[:, width // 2:] - width // 2) * 5.0
-    points = np.stack((x, y, depth), axis=-1)
+    points = np.stack((x, y, np.ones_like(x)), axis=-1)
     rgb = np.zeros((height, width, 3), dtype=np.float32)
     rgb[:, width // 2:] = 1.0
-    labels = np.zeros((height, width), dtype=np.int32)
-    trace = refine_auto_regions_with_trace(
-        points, rgb, labels, labels, np.ones(1), seg_min_size=20,
-        normal_method="cross", split_score_thresh=.10, split_aux_confirmation=True,
-    )
-    assert trace.diagnostics.split_accepted_count >= 1
-    assert np.any(trace.changed_mask)
-    assert np.any(trace.decision_map == 1)
-    return points, rgb, np.ones((height, width), dtype=np.float32), labels, trace
+    normals = np.zeros_like(points)
+    normals[:, : width // 2, 2] = 1.0
+    normals[:, width // 2 :, 0] = 1.0
+    kwargs = {
+        "depth_merge_thresh": .1,
+        "rgb_images": rgb,
+        "seg_scale": 300,
+        "seg_sigma": 1.1,
+        "seg_min_size": 20,
+        "normal_method": "cross",
+        "split_score_thresh": .10,
+        "split_aux_confirmation": True,
+    }
+    with patch(
+        "inference_engine.utils.post_merge_split._normal_map",
+        return_value=(normals, np.ones((height, width), dtype=bool)),
+    ):
+        stages = segment_point_map_layer_atomic_split_stages(points, **kwargs)
+        public = segment_point_map_layer_atomic_split(points, **kwargs)
+    np.testing.assert_array_equal(stages.final_labels, public)
+    assert stages.split_trace.diagnostics.split_accepted_count > 0
+    assert np.any(stages.split_trace.changed_mask)
+    assert np.any(stages.split_trace.decision_map == 1)
+    return points, rgb, np.ones((height, width), dtype=np.float32), stages
+
+
+def _single_regret_records(field: str) -> list[dict]:
+    if field not in {
+        "split_minus_depth_regret", "split_minus_geometry_regret",
+    }:
+        raise ValueError(f"unexpected regret field: {field}")
+    records = []
+    for window, extreme in enumerate((0.0, 20.0, 0.0)):
+        for config_id in METHODS:
+            records.append({
+                "config_id": config_id, "sequence_id": "01", "window_id": window,
+                "frame_start": window * 10, "frame_end": window * 10 + 9,
+                "split_minus_depth_regret": (
+                    extreme if field == "split_minus_depth_regret" else 0.0
+                ),
+                "split_minus_geometry_regret": (
+                    extreme if field == "split_minus_geometry_regret" else 0.0
+                ),
+                "split_accepted_count": 0, "split_changed_pixel_ratio": 0.0,
+                "merge_anomaly": 0.0, "atom_anomaly": 0.0,
+                "scale_dispersion": 0.0, "temporal_churn": 0.0,
+                "gt_speed": 1.0, "gt_turn": 0.0, "confidence": .9,
+            })
+    return records
 
 
 def _render_case_arrays(
@@ -155,18 +184,10 @@ def main(argv=None) -> int:
     merge_trace = analyze_layer_atomic_merge(merge_points, atoms, coarse, .1, merged)
     np.testing.assert_array_equal(merge_trace.final_labels, merged)
 
-    points, rgb, confidence = _split_fixture()
-    stages = segment_point_map_layer_atomic_split_stages(
-        points, .1, rgb_images=rgb, conf_map=confidence[None], top_conf_percentile=.5,
-        seg_scale=2, seg_sigma=0, seg_min_size=2, normal_method="cross",
-        split_score_thresh=.10, split_aux_confirmation=True, batch_idx=0,
-    )
-    public = segment_point_map_layer_atomic_split(
-        points, .1, rgb_images=rgb, conf_map=confidence[None], top_conf_percentile=.5,
-        seg_scale=2, seg_sigma=0, seg_min_size=2, normal_method="cross",
-        split_score_thresh=.10, split_aux_confirmation=True, batch_idx=0,
-    )
-    np.testing.assert_array_equal(stages.final_labels, public)
+    dense_points, dense_rgb, dense_confidence, dense_stages = _accepted_staged_split_fixture()
+    dense_trace = dense_stages.split_trace
+    dense_initial = dense_stages.initial_labels
+    print("Verified accepted staged/public split parity.")
     _pass("parity")
 
     budget = StorageBudget(output, max_bytes=100, warn_bytes=40, min_free_bytes=10)
@@ -184,11 +205,10 @@ def main(argv=None) -> int:
         pass
     else:
         raise AssertionError("free-space reserve was not enforced")
-    dense_points, dense_rgb, dense_confidence, dense_initial, dense_trace = _accepted_split_fixture()
     dense_arrays = _render_case_arrays(
         points=dense_points, rgb=dense_rgb, confidence=dense_confidence,
-        initial_labels=dense_initial, coarse_labels=dense_initial,
-        pre_split_labels=dense_initial, final_labels=dense_trace.labels,
+        initial_labels=dense_initial, coarse_labels=dense_stages.coarse_labels,
+        pre_split_labels=dense_stages.pre_split_labels, final_labels=dense_trace.labels,
         split_trace=dense_trace,
     )
     sink = FileDiagnosticSink(output / "artifacts", budget=StorageBudget(output, max_bytes=50_000_000, warn_bytes=40_000_000, min_free_bytes=0))
@@ -203,24 +223,21 @@ def main(argv=None) -> int:
         "split_minus_depth_regret" in record and "split_minus_geometry_regret" in record
         for record in records
     )
-    geometry_only = []
-    for window, geometry_regret in enumerate((0.0, 20.0, 0.0)):
-        for config_id in METHODS:
-            geometry_only.append({
-                "config_id": config_id, "sequence_id": "01", "window_id": window,
-                "frame_start": window * 10, "frame_end": window * 10 + 9,
-                "split_minus_depth_regret": 0.0,
-                "split_minus_geometry_regret": geometry_regret,
-                "split_accepted_count": 0, "split_changed_pixel_ratio": 0.0,
-                "merge_anomaly": 0.0, "atom_anomaly": 0.0,
-                "scale_dispersion": 0.0, "temporal_churn": 0.0,
-                "gt_speed": 1.0, "gt_turn": 0.0, "confidence": .9,
-            })
-    geometry_selected = select_intervals(geometry_only, context_windows=0)
+    geometry_selected = select_intervals(
+        _single_regret_records("split_minus_geometry_regret"), context_windows=0
+    )
     assert any(
         item.start_frame == 10 and "trajectory_degradation" in item.reasons
         for item in geometry_selected
     )
+    depth_selected = select_intervals(
+        _single_regret_records("split_minus_depth_regret"), context_windows=0
+    )
+    assert any(
+        item.start_frame == 10 and "trajectory_degradation" in item.reasons
+        for item in depth_selected
+    )
+    print("Verified depth-only regret selection.")
     atomic_write_json(output / "selection_records.json", records)
     atomic_write_json(output / "selected_intervals.json", [item.to_dict() for item in selected])
     _pass("selection")

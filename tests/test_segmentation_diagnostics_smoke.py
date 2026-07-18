@@ -13,6 +13,8 @@ def test_cpu_only_diagnostic_verifier(tmp_path):
     assert "schema 2.0" in result.stdout
     assert "three methods: depth, geometry_baseline, layer_atomic_split" in result.stdout
     assert "accepted split dense evidence" in result.stdout
+    assert "accepted staged/public split parity" in result.stdout
+    assert "depth-only regret selection" in result.stdout
     assert "strict report rejects an injected fourth method" in result.stdout
     assert "four profiles" not in result.stdout
     assert (tmp_path / "verify" / "report" / "index.html").is_file()
