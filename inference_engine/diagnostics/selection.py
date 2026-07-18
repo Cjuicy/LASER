@@ -74,6 +74,13 @@ def _number(value, default=np.nan) -> float:
     return result if np.isfinite(result) else float(default)
 
 
+def _observed_regrets(row: dict) -> list[float]:
+    return [
+        value for field in REGRET_FIELDS
+        if np.isfinite(value := _number(row.get(field)))
+    ]
+
+
 def _stride(rows: list[dict]) -> int:
     starts = sorted({int(row["frame_start"]) for row in rows})
     differences = np.diff(starts)
@@ -104,7 +111,7 @@ def select_intervals(
         merged = {"sequence_id": sequence, "frame_start": start, "frame_end": end}
         for field in REGRET_FIELDS:
             values = _finite_values(rows, field)
-            merged[field] = float(np.mean(values)) if values else 0.0
+            merged[field] = float(np.mean(values)) if values else None
         for field in FAMILIES.values():
             values = _finite_values(rows, field)
             merged[field] = max(values) if values else 0.0
@@ -126,7 +133,7 @@ def select_intervals(
         return []
 
     regret_zscores = [
-        np.abs(robust_zscore(row[field] for row in windows))
+        np.abs(robust_zscore(_number(row[field]) for row in windows))
         for field in REGRET_FIELDS
     ]
     accepted_z = robust_zscore(
@@ -160,20 +167,21 @@ def select_intervals(
         item["priority"] = max(item["priority"], row["score"] + bonus)
 
     by_sequence: dict[str, list[dict]] = defaultdict(list)
+    treatment_sequences: set[str] = set()
     for row in windows:
         by_sequence[row["sequence_id"]].append(row)
     for sequence, rows in by_sequence.items():
         count = 3 if sequence in RECOVERY else 2 if sequence in GUARD else 1
         degradation = sorted(
-            (row for row in rows if max(row[field] for field in REGRET_FIELDS) > 0),
+            (row for row in rows if _observed_regrets(row) and max(_observed_regrets(row)) > 0),
             key=lambda row: (
-                -max(row[field] for field in REGRET_FIELDS), row["frame_start"],
+                -max(_observed_regrets(row)), row["frame_start"],
             ),
         )
         improvement = sorted(
-            (row for row in rows if min(row[field] for field in REGRET_FIELDS) < 0),
+            (row for row in rows if _observed_regrets(row) and min(_observed_regrets(row)) < 0),
             key=lambda row: (
-                min(row[field] for field in REGRET_FIELDS), row["frame_start"],
+                min(_observed_regrets(row)), row["frame_start"],
             ),
         )
         focus_bonus = 3.0 if sequence in RECOVERY | GUARD else 0.0
@@ -184,20 +192,24 @@ def select_intervals(
 
         temporal = sorted(rows, key=lambda row: row["frame_start"])
         if len(temporal) > 1:
-            deltas = [
-                max(
-                    abs(temporal[index][field] - temporal[index - 1][field])
+            comparable_changes = []
+            for index in range(1, len(temporal)):
+                deltas = [
+                    abs(current - previous)
                     for field in REGRET_FIELDS
+                    if np.isfinite(current := _number(temporal[index].get(field)))
+                    and np.isfinite(previous := _number(temporal[index - 1].get(field)))
+                ]
+                if deltas:
+                    comparable_changes.append((max(deltas), index))
+            if comparable_changes:
+                delta, index = max(
+                    comparable_changes,
+                    key=lambda item: (
+                        item[0], -temporal[item[1]]["frame_start"],
+                    ),
                 )
-                for index in range(1, len(temporal))
-            ]
-            index = max(
-                range(1, len(temporal)),
-                key=lambda value: (
-                    deltas[value - 1], -temporal[value]["frame_start"],
-                ),
-            )
-            add(temporal[index], "trajectory_change", 1.0 + deltas[index - 1])
+                add(temporal[index], "trajectory_change", 1.0 + delta)
 
         active = [
             row for row in rows if _number(row["split_accepted_count"], -1.0) > 0
@@ -208,46 +220,58 @@ def select_intervals(
                 for row in rows if np.isfinite(_number(row["split_activity"]))
             ]
             median_activity = float(np.median(observed_activity))
-            median_regret = float(np.median([
-                max(abs(row[field]) for field in REGRET_FIELDS) for row in rows
-            ]))
+            observed_effects = [
+                max(abs(value) for value in _observed_regrets(row))
+                for row in rows if _observed_regrets(row)
+            ]
+            median_regret = (
+                float(np.median(observed_effects)) if observed_effects else None
+            )
             no_effect = [
                 row for row in active
                 if row["split_activity"] > median_activity
-                and max(abs(row[field]) for field in REGRET_FIELDS) <= median_regret
+                and _observed_regrets(row)
+                and median_regret is not None
+                and max(abs(value) for value in _observed_regrets(row)) <= median_regret
             ]
             if no_effect:
                 row = min(
                     no_effect,
                     key=lambda item: (
-                        max(abs(item[field]) for field in REGRET_FIELDS),
+                        max(abs(value) for value in _observed_regrets(item)),
                         -item["split_activity"], item["frame_start"],
                     ),
                 )
                 add(row, "split_no_trajectory_effect", 1.5 + row["split_z"])
 
-        anchor = max(
-            rows,
-            key=lambda row: (
-                row["split_z"], _number(row["split_accepted_count"], -1.0),
-                _number(row["split_changed_pixel_ratio"], -1.0),
-                -row["frame_start"],
-            ),
-        )
-        pool = [
-            row for row in rows
-            if _number(row["split_accepted_count"], -1.0) == 0 and row is not anchor
+        treatment = [
+            row for row in rows if _number(row["split_activity"], -1.0) > 0
         ]
-        if pool:
-            scales = {
-                field: max(float(np.std([row[field] for row in rows])), 1e-6)
-                for field in ("gt_speed", "gt_turn", "confidence")
-            }
-            control = min(pool, key=lambda row: (
-                sum(abs(row[field] - anchor[field]) / scales[field] for field in scales),
-                row["frame_start"],
-            ))
-            add(control, "matched_control", 1.0)
+        if treatment:
+            treatment_sequences.add(sequence)
+            anchor = max(
+                treatment,
+                key=lambda row: (
+                    row["split_z"], _number(row["split_accepted_count"], -1.0),
+                    _number(row["split_changed_pixel_ratio"], -1.0),
+                    -row["frame_start"],
+                ),
+            )
+            pool = [
+                row for row in rows
+                if _number(row["split_accepted_count"], -1.0) == 0
+                and row is not anchor
+            ]
+            if pool:
+                scales = {
+                    field: max(float(np.std([row[field] for row in rows])), 1e-6)
+                    for field in ("gt_speed", "gt_turn", "confidence")
+                }
+                control = min(pool, key=lambda row: (
+                    sum(abs(row[field] - anchor[field]) / scales[field] for field in scales),
+                    row["frame_start"],
+                ))
+                add(control, "matched_control", 1.0)
 
     for row in sorted(
         windows,
@@ -368,7 +392,10 @@ def select_intervals(
         sequence_items = [item for item in chosen if item["sequence_id"] == sequence]
         if not any("matched_control" not in item["reasons"] for item in sequence_items):
             missing.append(f"{sequence}:event")
-        if not any("matched_control" in item["reasons"] for item in sequence_items):
+        if (
+            sequence in treatment_sequences
+            and not any("matched_control" in item["reasons"] for item in sequence_items)
+        ):
             missing.append(f"{sequence}:control")
     for reason in FAMILIES:
         available = sum(reason in item["reasons"] for item in ranked)

@@ -164,3 +164,95 @@ def test_selector_does_not_treat_missing_split_count_as_a_matched_control():
     controls = [item for item in selected if "matched_control" in item.reasons]
     assert len(controls) == 1
     assert controls[0].start_frame == 20
+
+
+def test_selector_does_not_infer_trajectory_effects_from_all_missing_regrets():
+    records = []
+    for window, accepted in enumerate((2, 0, 0)):
+        records.append({
+            "config_id": "layer_atomic_split",
+            "sequence_id": "01",
+            "frame_start": window * 10,
+            "frame_end": window * 10 + 9,
+            "split_minus_depth_regret": None,
+            "split_minus_geometry_regret": None,
+            "split_accepted_count": accepted,
+            "split_changed_pixel_ratio": 0.5 if accepted else 0.0,
+            "merge_anomaly": 0.0,
+            "atom_anomaly": 0.0,
+            "scale_dispersion": 0.0,
+            "temporal_churn": 0.0,
+            "gt_speed": float(window),
+            "gt_turn": 0.0,
+            "confidence": 0.8,
+        })
+
+    selected = select_intervals(records, context_windows=0)
+    reasons = {reason for item in selected for reason in item.reasons}
+
+    assert "split_anomaly" in reasons
+    assert "matched_control" in reasons
+    assert not {
+        "trajectory_degradation",
+        "trajectory_improvement",
+        "trajectory_change",
+        "split_no_trajectory_effect",
+    } & reasons
+
+
+def test_selector_change_uses_only_adjacent_comparable_finite_regrets():
+    records = []
+    for window, (depth_regret, geometry_regret) in enumerate([
+        (0.0, None),
+        (1.0, None),
+        (None, 100.0),
+    ]):
+        records.append({
+            "config_id": "layer_atomic_split",
+            "sequence_id": "01",
+            "frame_start": window * 10,
+            "frame_end": window * 10 + 9,
+            "split_minus_depth_regret": depth_regret,
+            "split_minus_geometry_regret": geometry_regret,
+            "split_accepted_count": 0,
+            "split_changed_pixel_ratio": 0.0,
+            "merge_anomaly": 0.0,
+            "atom_anomaly": 0.0,
+            "scale_dispersion": 0.0,
+            "temporal_churn": 0.0,
+            "gt_speed": float(window),
+            "gt_turn": 0.0,
+            "confidence": 0.8,
+        })
+
+    selected = select_intervals(records, context_windows=0)
+    changes = [item for item in selected if "trajectory_change" in item.reasons]
+
+    assert len(changes) == 1
+    assert changes[0].start_frame == 10
+
+
+def test_selector_does_not_create_matched_control_without_split_treatment():
+    records = []
+    for window in range(3):
+        records.append({
+            "config_id": "layer_atomic_split",
+            "sequence_id": "01",
+            "frame_start": window * 10,
+            "frame_end": window * 10 + 9,
+            "split_minus_depth_regret": float(window),
+            "split_minus_geometry_regret": float(window),
+            "split_accepted_count": 0,
+            "split_changed_pixel_ratio": 0.0,
+            "merge_anomaly": 0.0,
+            "atom_anomaly": 0.0,
+            "scale_dispersion": 0.0,
+            "temporal_churn": 0.0,
+            "gt_speed": float(window),
+            "gt_turn": 0.0,
+            "confidence": 0.8,
+        })
+
+    selected = select_intervals(records, context_windows=0)
+
+    assert all("matched_control" not in item.reasons for item in selected)

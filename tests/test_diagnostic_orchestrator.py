@@ -251,8 +251,9 @@ def test_selection_records_expose_two_regrets_and_only_split_profile_activity(tm
 def test_selection_records_preserve_missing_split_evidence(tmp_path):
     args = SimpleNamespace(sequences=["01"], window_size=1, overlap=0)
     trajectory_results = {
-        config: {"01": {"per_frame_translation_error": [1.0]}}
-        for config in DIAGNOSTIC_PROFILES
+        "depth": {"01": {"per_frame_translation_error": []}},
+        "geometry_baseline": {"01": {"per_frame_translation_error": []}},
+        "layer_atomic_split": {"01": {"per_frame_translation_error": [1.0]}},
     }
     artifact = tmp_path / "artifacts" / "layer_atomic_split" / "01" / "pass1"
     artifact.mkdir(parents=True)
@@ -268,6 +269,8 @@ def test_selection_records_preserve_missing_split_evidence(tmp_path):
 
     assert record["split_accepted_count"] is None
     assert record["split_changed_pixel_ratio"] is None
+    assert record["split_minus_depth_regret"] is None
+    assert record["split_minus_geometry_regret"] is None
 
 
 def test_build_cases_requires_all_methods_and_namespaces_complete_trace(tmp_path):
