@@ -10,6 +10,7 @@ from inference_engine.diagnostics.segmentation import (
     trace_segmentation_frame,
 )
 from inference_engine.utils.depth import segment_depth_felzenszwalb_rag
+from inference_engine.utils import post_merge_split as pms
 from inference_engine.utils.layer_atomic_geometry import (
     segment_point_map_layer_atomic_split_stages,
 )
@@ -79,6 +80,7 @@ def test_depth_trace_handles_single_frame_confidence_with_batch_equivalent_seman
         top_conf_percentile=.5, seg_scale=2, seg_sigma=0, seg_min_size=2,
     )
     assert trace["metrics"]["final"]["valid"] is True
+    assert "split" not in trace["metrics"]
 
 
 def test_layer_atomic_split_trace_matches_staged_formal_labels_and_emits_evidence():
@@ -112,6 +114,55 @@ def test_layer_atomic_split_trace_matches_staged_formal_labels_and_emits_evidenc
     np.testing.assert_array_equal(trace["arrays"]["pre_split_labels"], stages.pre_split_labels)
     np.testing.assert_array_equal(trace["arrays"]["changed_mask"], stages.split_trace.changed_mask)
     assert trace["metrics"]["split"]["split_aux_confirmation"] is True
+    changed_mask = trace["arrays"]["changed_mask"]
+    ratio = trace["metrics"]["split"]["split_changed_pixel_ratio"]
+    assert isinstance(ratio, float)
+    assert np.isfinite(ratio)
+    assert 0.0 <= ratio <= 1.0
+    assert ratio == np.count_nonzero(changed_mask) / changed_mask.size
+    assert np.count_nonzero(changed_mask) == 0
+    assert ratio == 0.0
+
+
+def test_layer_atomic_split_trace_reports_observed_changed_pixel_ratio(monkeypatch):
+    height, width = 24, 32
+    yy, xx = np.mgrid[:height, :width].astype(np.float32)
+    points = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    rgb = np.zeros((height, width, 3), dtype=np.float32)
+    rgb[:, width // 2:] = 1.0
+    normals = np.zeros_like(points)
+    normals[:, :width // 2, 2] = 1.0
+    normals[:, width // 2:, 0] = 1.0
+    monkeypatch.setattr(
+        pms,
+        "_normal_map",
+        lambda point_map, method: (normals, np.ones((height, width), dtype=bool)),
+    )
+    stages = segment_point_map_layer_atomic_split_stages(
+        points,
+        .1,
+        rgb_images=rgb,
+        seg_min_size=20,
+        normal_method="cross",
+        split_score_thresh=.10,
+    )
+
+    trace = trace_segmentation_frame(
+        points,
+        stages.final_labels,
+        segment_mode="layer_atomic_split",
+        rgb_image=rgb,
+        seg_min_size=20,
+        normal_method="cross",
+        split_score_thresh=.10,
+    )
+
+    changed_mask = trace["arrays"]["changed_mask"]
+    ratio = trace["metrics"]["split"]["split_changed_pixel_ratio"]
+    assert isinstance(ratio, float)
+    assert np.isfinite(ratio)
+    assert 0.0 < ratio <= 1.0
+    assert ratio == np.count_nonzero(changed_mask) / changed_mask.size
 
 
 def test_layer_atomic_split_trace_rejects_partition_equivalent_relabeling():

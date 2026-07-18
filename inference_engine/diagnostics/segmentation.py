@@ -235,6 +235,11 @@ def trace_segmentation_frame(
         initial, recomputed = stages.initial_labels, stages.final_labels
         merge_threshold = None
         split_metrics = stages.split_trace.diagnostics.as_dict()
+        changed_mask = np.asarray(stages.split_trace.changed_mask, dtype=bool)
+        if changed_mask.size:
+            split_metrics["split_changed_pixel_ratio"] = float(
+                np.count_nonzero(changed_mask) / changed_mask.size
+            )
         arrays.update(
             initial_labels=stages.initial_labels,
             coarse_labels=stages.coarse_labels,
@@ -242,7 +247,7 @@ def trace_segmentation_frame(
             final_labels=stages.final_labels,
             atom_labels=stages.atom_labels,
             atom_scales=stages.atom_scales,
-            changed_mask=stages.split_trace.changed_mask,
+            changed_mask=changed_mask,
             split_parent_map=stages.split_trace.parent_map,
             split_child_map=stages.split_trace.child_map,
             split_score_map=stages.split_trace.score_map,
