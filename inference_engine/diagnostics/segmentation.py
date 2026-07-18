@@ -250,7 +250,12 @@ def trace_segmentation_frame(
         )
     else:
         raise ValueError(f"unknown segment mode: {segment_mode}")
-    if not np.array_equal(_compact(recomputed)[1], _compact(formal_labels)[1]):
+    labels_match = (
+        np.array_equal(recomputed, formal_labels)
+        if segment_mode == "layer_atomic_split"
+        else np.array_equal(_compact(recomputed)[1], _compact(formal_labels)[1])
+    )
+    if not labels_match:
         raise DiagnosticParityError("diagnostic recomputation differs from formal labels")
     metrics = {
         "mode": segment_mode,
