@@ -35,6 +35,7 @@ from inference_engine.utils.layer_atomic_geometry import (
     segment_point_map_layer_atomic_split,
     segment_point_map_layer_atomic_split_stages,
 )
+from inference_engine.utils.post_merge_split import refine_auto_regions_with_trace
 
 
 METHODS = ("depth", "geometry_baseline", "layer_atomic_split")
@@ -89,18 +90,41 @@ def _split_fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return points, rgb, confidence
 
 
-def _render_case_arrays(stages, points, rgb, confidence) -> dict[str, np.ndarray]:
-    changed = stages.split_trace.changed_mask.astype(np.uint8)
+def _accepted_split_fixture():
+    """Create a real, high-normal-contrast split accepted by production code."""
+    height, width = 24, 32
+    y, x = np.mgrid[:height, :width].astype(np.float32)
+    depth = np.zeros_like(x)
+    depth[:, width // 2:] = (x[:, width // 2:] - width // 2) * 5.0
+    points = np.stack((x, y, depth), axis=-1)
+    rgb = np.zeros((height, width, 3), dtype=np.float32)
+    rgb[:, width // 2:] = 1.0
+    labels = np.zeros((height, width), dtype=np.int32)
+    trace = refine_auto_regions_with_trace(
+        points, rgb, labels, labels, np.ones(1), seg_min_size=20,
+        normal_method="cross", split_score_thresh=.10, split_aux_confirmation=True,
+    )
+    assert trace.diagnostics.split_accepted_count >= 1
+    assert np.any(trace.changed_mask)
+    assert np.any(trace.decision_map == 1)
+    return points, rgb, np.ones((height, width), dtype=np.float32), labels, trace
+
+
+def _render_case_arrays(
+    *, points, rgb, confidence, initial_labels, coarse_labels,
+    pre_split_labels, final_labels, split_trace,
+) -> dict[str, np.ndarray]:
+    changed = split_trace.changed_mask.astype(np.uint8)
     return {
         "rgb": rgb, "point_map": points[None], "confidence": confidence[None],
-        "initial_labels": stages.initial_labels, "coarse_labels": stages.coarse_labels,
-        "pre_split_labels": stages.pre_split_labels, "final_labels": stages.final_labels,
-        "changed_mask": changed, "split_score_map": stages.split_trace.score_map,
-        "split_decision_map": stages.split_trace.decision_map,
+        "initial_labels": initial_labels, "coarse_labels": coarse_labels,
+        "pre_split_labels": pre_split_labels, "final_labels": final_labels,
+        "changed_mask": changed, "split_score_map": split_trace.score_map,
+        "split_decision_map": split_trace.decision_map,
         "merge_decision": np.where(changed, 2, 0).astype(np.uint8),
-        "source_map": np.ones_like(stages.final_labels, dtype=np.uint8),
-        "scale_map": np.ones_like(stages.final_labels, dtype=np.float32) * 1.1,
-        "dispersion_map": np.ones_like(stages.final_labels, dtype=np.float32) * .03,
+        "source_map": np.ones_like(final_labels, dtype=np.uint8),
+        "scale_map": np.ones_like(final_labels, dtype=np.float32) * 1.1,
+        "dispersion_map": np.ones_like(final_labels, dtype=np.float32) * .03,
     }
 
 
@@ -160,8 +184,15 @@ def main(argv=None) -> int:
         pass
     else:
         raise AssertionError("free-space reserve was not enforced")
+    dense_points, dense_rgb, dense_confidence, dense_initial, dense_trace = _accepted_split_fixture()
+    dense_arrays = _render_case_arrays(
+        points=dense_points, rgb=dense_rgb, confidence=dense_confidence,
+        initial_labels=dense_initial, coarse_labels=dense_initial,
+        pre_split_labels=dense_initial, final_labels=dense_trace.labels,
+        split_trace=dense_trace,
+    )
     sink = FileDiagnosticSink(output / "artifacts", budget=StorageBudget(output, max_bytes=50_000_000, warn_bytes=40_000_000, min_free_bytes=0))
-    sink.emit_segmentation(context, 0, summarize_labels(stages.final_labels, stages.initial_labels), _render_case_arrays(stages, points, rgb, confidence))
+    sink.emit_segmentation(context, 0, summarize_labels(dense_trace.labels, dense_initial), dense_arrays)
     sink.close()
     _pass("storage")
 
@@ -172,16 +203,34 @@ def main(argv=None) -> int:
         "split_minus_depth_regret" in record and "split_minus_geometry_regret" in record
         for record in records
     )
+    geometry_only = []
+    for window, geometry_regret in enumerate((0.0, 20.0, 0.0)):
+        for config_id in METHODS:
+            geometry_only.append({
+                "config_id": config_id, "sequence_id": "01", "window_id": window,
+                "frame_start": window * 10, "frame_end": window * 10 + 9,
+                "split_minus_depth_regret": 0.0,
+                "split_minus_geometry_regret": geometry_regret,
+                "split_accepted_count": 0, "split_changed_pixel_ratio": 0.0,
+                "merge_anomaly": 0.0, "atom_anomaly": 0.0,
+                "scale_dispersion": 0.0, "temporal_churn": 0.0,
+                "gt_speed": 1.0, "gt_turn": 0.0, "confidence": .9,
+            })
+    geometry_selected = select_intervals(geometry_only, context_windows=0)
+    assert any(
+        item.start_frame == 10 and "trajectory_degradation" in item.reasons
+        for item in geometry_selected
+    )
     atomic_write_json(output / "selection_records.json", records)
     atomic_write_json(output / "selected_intervals.json", [item.to_dict() for item in selected])
     _pass("selection")
 
     selected_case = SelectedInterval("02", 0, 20, tuple(sorted(ALL_REASONS)), 8.0)
     interval_dir = output / "cases" / "02" / "000000-000020"
-    arrays = _render_case_arrays(stages, points, rgb, confidence)
+    arrays = dense_arrays
     for index, method in enumerate(METHODS):
         method_arrays = dict(arrays)
-        method_arrays["final_labels"] = (stages.final_labels + index).astype(np.int32)
+        method_arrays["final_labels"] = (dense_trace.labels + index).astype(np.int32)
         trace_path = output / "artifacts" / method / "02" / "pass2" / "traces" / "000000.npz"
         trace_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(trace_path, **method_arrays)
@@ -194,11 +243,11 @@ def main(argv=None) -> int:
             "split_minus_geometry_regret": 7.2,
         })
     render_method_comparison(
-        {method: stages.final_labels + index for index, method in enumerate(METHODS)},
+        {method: dense_trace.labels + index for index, method in enumerate(METHODS)},
         interval_dir,
         method_scales={
-            "geometry_baseline": np.ones_like(stages.final_labels, dtype=float),
-            "layer_atomic_split": np.ones_like(stages.final_labels, dtype=float) * 1.1,
+            "geometry_baseline": np.ones_like(dense_trace.labels, dtype=float),
+            "layer_atomic_split": np.ones_like(dense_trace.labels, dtype=float) * 1.1,
         },
     )
     atomic_write_json(interval_dir / "metrics.json", {
@@ -206,10 +255,11 @@ def main(argv=None) -> int:
         "selection_reasons": list(selected_case.reasons),
         "split_minus_depth_regret": 8.0,
         "split_minus_geometry_regret": 7.2,
-        "largest_segment_ratio": summarize_labels(stages.final_labels)["largest_segment_ratio"],
+        "largest_segment_ratio": summarize_labels(dense_trace.labels)["largest_segment_ratio"],
     })
     assert (interval_dir / "layer_atomic_split" / "split_decisions.png").is_file()
     assert (interval_dir / "comparison-rendering.json").is_file()
+    print("Verified accepted split dense evidence.")
     _pass("rendering")
 
     manifest.status = "complete"
@@ -220,6 +270,7 @@ def main(argv=None) -> int:
             "depth": {"02": {"ate_rmse": 1.2, "rpe_translation_rmse": .2, "rpe_rotation_rmse_deg": .2}},
             "geometry_baseline": {"02": {"ate_rmse": 1.1, "rpe_translation_rmse": .15, "rpe_rotation_rmse_deg": .15}},
             "layer_atomic_split": {"02": {"ate_rmse": 1.0, "rpe_translation_rmse": .1, "rpe_rotation_rmse_deg": .1}},
+            "geometry_legacy_reference": {"02": {"ate_rmse": .9, "rpe_translation_rmse": .05, "rpe_rotation_rmse_deg": .05}},
         },
     })
     report = build_report(output)
@@ -228,6 +279,7 @@ def main(argv=None) -> int:
     assert set(report_summary["sequence_metrics"]) == set(METHODS)
     assert all(method in html for method in METHODS)
     assert "geometry_legacy_reference" not in html and ">layer_atomic<" not in html
+    print("Verified strict report rejects an injected fourth method.")
     _pass("report")
     print(f"Synthetic three-method verification complete (schema {SCHEMA_VERSION}; three methods: {', '.join(METHODS)}).")
     print("Budget defaults for cloud runs: warning=40 GiB, hard=50 GiB, free-space reserve=10 GiB.")
