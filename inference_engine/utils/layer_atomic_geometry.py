@@ -3,7 +3,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from .depth import segment_depth_felzenszwalb_rag_stages
-from .post_merge_split import SplitDiagnostics, refine_auto_regions
+from .post_merge_split import (
+    SplitDiagnostics,
+    SplitTrace,
+    refine_auto_regions_with_trace,
+)
 
 
 @dataclass(frozen=True)
@@ -11,6 +15,17 @@ class AtomMergeResult:
     labels: np.ndarray
     atom_labels: np.ndarray
     atom_scales: np.ndarray
+
+
+@dataclass(frozen=True)
+class LayerAtomicSplitResult:
+    initial_labels: np.ndarray
+    coarse_labels: np.ndarray
+    pre_split_labels: np.ndarray
+    final_labels: np.ndarray
+    atom_labels: np.ndarray
+    atom_scales: np.ndarray
+    split_trace: SplitTrace
 
 
 def _compact_labels(labels):
@@ -213,7 +228,7 @@ def segment_point_map_layer_atomic(
     )
 
 
-def segment_point_map_layer_atomic_split(
+def segment_point_map_layer_atomic_split_stages(
     point_map,
     depth_merge_thresh,
     rgb_images=None,
@@ -254,7 +269,7 @@ def segment_point_map_layer_atomic_split(
         point_map.shape[0],
         point_map.shape[1],
     )
-    refined, _ = refine_auto_regions(
+    split_trace = refine_auto_regions_with_trace(
         point_map,
         rgb_image,
         merged.labels,
@@ -265,4 +280,43 @@ def segment_point_map_layer_atomic_split(
         split_score_thresh=split_score_thresh,
         split_aux_confirmation=split_aux_confirmation,
     )
-    return refined
+    return LayerAtomicSplitResult(
+        initial_labels=initial_labels,
+        coarse_labels=coarse_labels,
+        pre_split_labels=merged.labels,
+        final_labels=split_trace.labels,
+        atom_labels=merged.atom_labels,
+        atom_scales=merged.atom_scales,
+        split_trace=split_trace,
+    )
+
+
+def segment_point_map_layer_atomic_split(
+    point_map,
+    depth_merge_thresh,
+    rgb_images=None,
+    normal_method="cross",
+    split_score_thresh=0.10,
+    split_aux_confirmation=True,
+    conf_map=None,
+    top_conf_percentile=None,
+    seg_scale=300,
+    seg_sigma=1.1,
+    seg_min_size=500,
+    batch_idx=None,
+) -> np.ndarray:
+    """Return final split labels through the established public API."""
+    return segment_point_map_layer_atomic_split_stages(
+        point_map,
+        depth_merge_thresh,
+        rgb_images=rgb_images,
+        normal_method=normal_method,
+        split_score_thresh=split_score_thresh,
+        split_aux_confirmation=split_aux_confirmation,
+        conf_map=conf_map,
+        top_conf_percentile=top_conf_percentile,
+        seg_scale=seg_scale,
+        seg_sigma=seg_sigma,
+        seg_min_size=seg_min_size,
+        batch_idx=batch_idx,
+    ).final_labels

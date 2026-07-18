@@ -112,6 +112,127 @@ def test_one_pass_can_create_two_children(monkeypatch):
     assert stats.split_added_regions == 1
 
 
+def test_trace_records_accepted_parent_evidence(monkeypatch):
+    points, labels, atoms, rgb = _fixture()
+    rgb[:, 16:] = 1.0
+    normals = np.zeros_like(points)
+    normals[:, :16, 2] = 1.0
+    normals[:, 16:, 0] = 1.0
+    monkeypatch.setattr(
+        pms,
+        "_normal_map",
+        lambda point_map, method: (normals, np.ones(labels.shape, bool)),
+    )
+
+    trace = pms.refine_auto_regions_with_trace(
+        points,
+        rgb,
+        labels,
+        atoms,
+        np.ones(1),
+        seg_min_size=20,
+        normal_method="cross",
+        split_score_thresh=0.10,
+    )
+
+    assert trace.labels.shape == labels.shape
+    assert trace.changed_mask.dtype == np.bool_
+    assert trace.parent_map.shape == labels.shape
+    assert trace.child_map.shape == labels.shape
+    assert trace.score_map.shape == labels.shape
+    assert trace.decision_map.shape == labels.shape
+    assert trace.diagnostics.split_accepted_count == 1
+    assert np.all(trace.decision_map == 1)
+    assert np.all(trace.parent_map == 0)
+    assert np.all(trace.score_map >= 0.10)
+    assert np.any(trace.changed_mask)
+
+
+def test_trace_records_rejected_parent_evidence(monkeypatch):
+    points, labels, atoms, rgb = _fixture()
+    normals = np.zeros_like(points)
+    normals[:, :16, 2] = 1.0
+    normals[:, 16:, 0] = 1.0
+    monkeypatch.setattr(
+        pms,
+        "_normal_map",
+        lambda point_map, method: (normals, np.ones(labels.shape, bool)),
+    )
+
+    trace = pms.refine_auto_regions_with_trace(
+        points,
+        rgb,
+        labels,
+        atoms,
+        np.ones(1),
+        seg_min_size=20,
+        normal_method="cross",
+        split_score_thresh=0.10,
+    )
+
+    assert trace.diagnostics.split_reject_low_score == 1
+    assert np.all(trace.decision_map == 4)
+    assert not np.any(trace.changed_mask)
+    assert np.all(trace.score_map == 0.0)
+
+
+def test_trace_records_no_marker_rejection(monkeypatch):
+    points, labels, atoms, rgb = _fixture()
+    normals = np.zeros_like(points)
+    normals[..., 2] = 1.0
+    monkeypatch.setattr(
+        pms,
+        "_normal_map",
+        lambda point_map, method: (normals, np.ones(labels.shape, bool)),
+    )
+
+    trace = pms.refine_auto_regions_with_trace(
+        points,
+        rgb,
+        labels,
+        atoms,
+        np.ones(1),
+        seg_min_size=20,
+        normal_method="cross",
+        split_score_thresh=0.10,
+    )
+
+    assert trace.diagnostics.split_reject_no_markers == 1
+    assert np.all(trace.decision_map == 2)
+
+
+def test_trace_records_small_child_rejection(monkeypatch):
+    points, labels, atoms, rgb = _fixture(height=10, width=10)
+    normals = np.zeros_like(points)
+    normals[..., 2] = 1.0
+    markers = np.zeros_like(labels, dtype=np.int32)
+    markers[:, :5] = 1
+    markers[:, 5:] = 2
+    candidate = np.ones_like(labels, dtype=np.int32)
+    candidate[:, -1] = 2
+    monkeypatch.setattr(
+        pms,
+        "_normal_map",
+        lambda point_map, method: (normals, np.ones(labels.shape, bool)),
+    )
+    monkeypatch.setattr(pms, "_markers", lambda *args: (markers, 2))
+    monkeypatch.setattr(pms, "watershed", lambda *args, **kwargs: candidate)
+
+    trace = pms.refine_auto_regions_with_trace(
+        points,
+        rgb,
+        labels,
+        atoms,
+        np.ones(1),
+        seg_min_size=20,
+        normal_method="cross",
+        split_score_thresh=0.10,
+    )
+
+    assert trace.diagnostics.split_reject_small_child == 1
+    assert np.all(trace.decision_map == 3)
+
+
 def test_one_pass_never_exceeds_four_children(monkeypatch):
     points, labels, atoms, rgb = _fixture(height=30, width=40)
     normals = np.zeros_like(points)

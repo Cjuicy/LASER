@@ -39,6 +39,17 @@ class SplitDiagnostics:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class SplitTrace:
+    labels: np.ndarray
+    diagnostics: SplitDiagnostics
+    changed_mask: np.ndarray
+    parent_map: np.ndarray
+    child_map: np.ndarray
+    score_map: np.ndarray
+    decision_map: np.ndarray
+
+
 def _normal_map(point_map, normal_method):
     if normal_method == "cross":
         normals = compute_normals_cross_np(point_map)
@@ -288,7 +299,7 @@ def _validate_inputs(point_map, rgb_image, auto_labels, atom_labels, atom_scales
     )
 
 
-def refine_auto_regions(
+def refine_auto_regions_with_trace(
     point_map,
     rgb_image,
     auto_labels,
@@ -299,7 +310,7 @@ def refine_auto_regions(
     split_score_thresh,
     split_aux_confirmation=True,
 ):
-    """Split eligible Auto regions once, returning compact labels and diagnostics."""
+    """Split eligible Auto regions once, returning compact labels and evidence."""
     start = time.perf_counter()
     if not np.isfinite(split_score_thresh) or split_score_thresh < 0:
         raise ValueError("split_score_thresh must be finite and non-negative")
@@ -313,6 +324,10 @@ def refine_auto_regions(
     edge_fields = None
 
     result = labels.copy()
+    parent_map = labels.copy()
+    child_map = labels.copy()
+    score_map = np.zeros(labels.shape, dtype=np.float32)
+    decision_map = np.zeros(labels.shape, dtype=np.uint8)
     next_label = int(result.max()) + 1 if result.size else 0
     parent_count = proposed_count = accepted_count = added_regions = 0
     reject_no_markers = reject_small_child = reject_low_score = 0
@@ -342,6 +357,7 @@ def refine_auto_regions(
         )
         if marker_count < 2:
             reject_no_markers += 1
+            decision_map[crop][crop_parent] = 2
             continue
         proposed_count += 1
 
@@ -367,6 +383,8 @@ def refine_auto_regions(
             or np.any(child_sizes < min_child_area)
         ):
             reject_small_child += 1
+            child_map[crop][crop_parent] = candidate[crop_parent]
+            decision_map[crop][crop_parent] = 3
             continue
 
         crop_normals = normals[crop]
@@ -376,6 +394,9 @@ def refine_auto_regions(
         if normal_gain < split_score_thresh:
             scores.append(normal_gain)
             reject_low_score += 1
+            child_map[crop][crop_parent] = candidate[crop_parent]
+            score_map[crop][crop_parent] = normal_gain
+            decision_map[crop][crop_parent] = 4
             continue
 
         if split_aux_confirmation and edge_fields is None:
@@ -399,9 +420,15 @@ def refine_auto_regions(
         scores.append(score)
         if score < split_score_thresh:
             reject_low_score += 1
+            child_map[crop][crop_parent] = candidate[crop_parent]
+            score_map[crop][crop_parent] = score
+            decision_map[crop][crop_parent] = 4
             continue
 
         accepted_count += 1
+        child_map[crop][crop_parent] = candidate[crop_parent]
+        score_map[crop][crop_parent] = score
+        decision_map[crop][crop_parent] = 1
         # Keep one child on the parent's label and append the others globally.
         ordered_children = sorted(
             zip(child_ids.tolist(), child_sizes.tolist(), strict=True),
@@ -429,4 +456,18 @@ def refine_auto_regions(
         split_runtime_ms=runtime_ms,
         split_aux_confirmation=bool(split_aux_confirmation),
     )
-    return result, diagnostics
+    return SplitTrace(
+        labels=result,
+        diagnostics=diagnostics,
+        changed_mask=result != labels,
+        parent_map=parent_map,
+        child_map=child_map,
+        score_map=score_map,
+        decision_map=decision_map,
+    )
+
+
+def refine_auto_regions(*args, **kwargs):
+    """Compatibility wrapper returning the established labels/diagnostics tuple."""
+    trace = refine_auto_regions_with_trace(*args, **kwargs)
+    return trace.labels, trace.diagnostics

@@ -1,4 +1,5 @@
 from pathlib import Path
+import inspect
 import sys
 
 import numpy as np
@@ -32,9 +33,17 @@ def test_split_entry_runs_after_merge_and_passes_only_geometry_rgb_and_scales(
 
     def fake_refine(point_map, rgb_image, auto_labels, atom_labels, scales, **kwargs):
         calls.append((point_map, rgb_image, auto_labels, atom_labels, scales, kwargs))
-        return auto_labels.copy(), lag.SplitDiagnostics()
+        return lag.SplitTrace(
+            labels=auto_labels.copy(),
+            diagnostics=lag.SplitDiagnostics(),
+            changed_mask=np.zeros(auto_labels.shape, dtype=bool),
+            parent_map=auto_labels.copy(),
+            child_map=auto_labels.copy(),
+            score_map=np.zeros(auto_labels.shape, dtype=np.float32),
+            decision_map=np.zeros(auto_labels.shape, dtype=np.uint8),
+        )
 
-    monkeypatch.setattr(lag, "refine_auto_regions", fake_refine)
+    monkeypatch.setattr(lag, "refine_auto_regions_with_trace", fake_refine)
 
     result = lag.segment_point_map_layer_atomic_split(
         points,
@@ -61,6 +70,38 @@ def test_split_entry_runs_after_merge_and_passes_only_geometry_rgb_and_scales(
         "split_aux_confirmation",
     }
     assert kwargs["split_aux_confirmation"] is False
+
+
+def test_staged_split_result_matches_public_final_labels():
+    height, width = 24, 32
+    yy, xx = np.mgrid[:height, :width].astype(np.float32)
+    points = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
+    rgb = np.zeros((height, width, 3), dtype=np.float32)
+
+    stages = lag.segment_point_map_layer_atomic_split_stages(
+        points,
+        depth_merge_thresh=0.1,
+        rgb_images=rgb,
+        seg_min_size=20,
+    )
+    formal = lag.segment_point_map_layer_atomic_split(
+        points,
+        depth_merge_thresh=0.1,
+        rgb_images=rgb,
+        seg_min_size=20,
+    )
+
+    np.testing.assert_array_equal(stages.final_labels, formal)
+    np.testing.assert_array_equal(
+        stages.split_trace.changed_mask,
+        stages.pre_split_labels != stages.final_labels,
+    )
+
+
+def test_public_split_signature_matches_staged_entry_point():
+    assert inspect.signature(lag.segment_point_map_layer_atomic_split) == inspect.signature(
+        lag.segment_point_map_layer_atomic_split_stages
+    )
 
 
 def test_old_public_merger_matches_metadata_labels():
