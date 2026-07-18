@@ -232,7 +232,7 @@ def test_small_child_rejects_entire_parent_split(monkeypatch):
     refined, stats = _run(points, labels, atoms, rgb)
 
     assert np.unique(refined).size == 1
-    assert stats.split_reject_small_child == 1
+    assert stats.split_reject_no_markers == 1
 
 
 def test_invalid_points_still_receive_compact_deterministic_labels(monkeypatch):

@@ -33,7 +33,11 @@ def make_fixture(frames=2, height=48, width=64):
         frames * height * width,
         dtype=np.float32,
     ).reshape(frames, height, width)
-    return point_maps, confidence
+    rgb = np.zeros((frames, 3, height, width), dtype=np.float32)
+    rgb[:, 0] = xx / max(width - 1, 1)
+    rgb[:, 1] = yy / max(height - 1, 1)
+    rgb[:, 2] = 0.5
+    return point_maps, confidence, rgb
 
 
 def verify_partition(graph, shape):
@@ -57,7 +61,7 @@ def verify_partition(graph, shape):
 
 
 def main():
-    point_maps, confidence = make_fixture()
+    point_maps, confidence, rgb = make_fixture()
     for mode in SEGMENT_MODES:
         graph = make_sp_graph(
             point_maps,
@@ -66,6 +70,7 @@ def main():
             segment_mode=mode,
             normal_method="cross",
             geometry_seg_profile="baseline_params",
+            rgb_images=rgb,
         )
         verify_partition(graph, point_maps.shape[1:3])
         params = get_felzenszwalb_params(mode, "baseline_params")

@@ -39,12 +39,6 @@ class SplitDiagnostics:
         return asdict(self)
 
 
-def _compact_labels(labels):
-    labels = np.asarray(labels)
-    _, inverse = np.unique(labels, return_inverse=True)
-    return inverse.reshape(labels.shape).astype(np.intp, copy=False)
-
-
 def _normal_map(point_map, normal_method):
     if normal_method == "cross":
         normals = compute_normals_cross_np(point_map)
@@ -56,13 +50,18 @@ def _normal_map(point_map, normal_method):
     valid = np.isfinite(point_map).all(axis=-1)
     valid &= np.isfinite(normals).all(axis=-1)
     valid &= np.linalg.norm(normals, axis=-1) > EPS
-    filtered = np.stack(
-        [
-            ndimage.median_filter(normals[..., channel], size=3, mode="nearest")
-            for channel in range(3)
-        ],
-        axis=-1,
-    )
+    try:
+        import cv2
+
+        filtered = cv2.medianBlur(normals.astype(np.float32, copy=False), 3)
+    except ImportError:
+        filtered = np.stack(
+            [
+                ndimage.median_filter(normals[..., channel], size=3, mode="nearest")
+                for channel in range(3)
+            ],
+            axis=-1,
+        )
     norm = np.linalg.norm(filtered, axis=-1, keepdims=True)
     filtered = np.divide(
         filtered,
@@ -119,7 +118,7 @@ def _minimum_child_area(parent_area, seg_min_size):
     return max(int(seg_min_size), int(np.ceil(MIN_CHILD_FRACTION * parent_area)))
 
 
-def _markers(parent_mask, valid, normal_edge):
+def _markers(parent_mask, valid, normal_edge, min_marker_area):
     seed_mask = parent_mask & valid & (normal_edge < NORMAL_BARRIER_RAD)
     components, count = ndimage.label(seed_mask)
     if count < 2:
@@ -127,6 +126,11 @@ def _markers(parent_mask, valid, normal_edge):
 
     sizes = np.bincount(components.reshape(-1), minlength=count + 1)[1:]
     component_ids = np.arange(1, count + 1)
+    eligible = sizes >= min_marker_area
+    sizes = sizes[eligible]
+    component_ids = component_ids[eligible]
+    if component_ids.size < 2:
+        return np.zeros(parent_mask.shape, dtype=np.int32), component_ids.size
     # Stable ordering makes equal-area candidates deterministic.
     order = np.lexsort((component_ids, -sizes))[:MAX_LEAVES]
     selected = component_ids[order]
@@ -143,8 +147,9 @@ def _rgb_float(rgb_image, shape):
     if rgb.shape != (*shape, 3):
         raise ValueError("rgb_image must have shape (H, W, 3)")
     rgb = rgb.astype(np.float32, copy=False)
-    finite = rgb[np.isfinite(rgb)]
-    if finite.size and float(np.max(finite)) > 1.0:
+    with np.errstate(invalid="ignore"):
+        max_value = float(np.nanmax(rgb)) if rgb.size else 0.0
+    if max_value > 1.0:
         rgb = rgb / 255.0
     return rgb
 
@@ -229,8 +234,16 @@ def _normal_gain(normals, valid, parent_mask, candidate):
     return float(np.clip((parent_dispersion - after) / parent_dispersion, 0.0, 1.0))
 
 
-def _split_score(normals, valid, parent_mask, candidate, edge_fields):
-    normal_gain = _normal_gain(normals, valid, parent_mask, candidate)
+def _split_score(
+    normals,
+    valid,
+    parent_mask,
+    candidate,
+    edge_fields,
+    normal_gain=None,
+):
+    if normal_gain is None:
+        normal_gain = _normal_gain(normals, valid, parent_mask, candidate)
     if edge_fields is None:
         return normal_gain
     rgb_contrast = _field_contrast(
@@ -257,14 +270,22 @@ def _validate_inputs(point_map, rgb_image, auto_labels, atom_labels, atom_scales
         raise ValueError("point_map must have shape (H, W, 3)")
     if auto_labels.shape != point_map.shape[:2]:
         raise ValueError("auto_labels must have shape (H, W)")
+    if auto_labels.size and np.min(auto_labels) < 0:
+        raise ValueError("auto_labels must be non-negative")
     if atom_labels.shape != point_map.shape[:2]:
         raise ValueError("atom_labels must have shape (H, W)")
     if atom_labels.size and (
         np.min(atom_labels) < 0 or np.max(atom_labels) >= atom_scales.size
     ):
         raise ValueError("atom_scales must contain one entry per compact atom label")
-    _rgb_float(rgb_image, point_map.shape[:2])
-    return point_map, _compact_labels(auto_labels), atom_labels.astype(np.intp), atom_scales
+    if rgb_image is not None and np.asarray(rgb_image).shape != (*point_map.shape[:2], 3):
+        raise ValueError("rgb_image must have shape (H, W, 3)")
+    return (
+        point_map,
+        auto_labels.astype(np.intp, copy=False),
+        atom_labels.astype(np.intp, copy=False),
+        atom_scales,
+    )
 
 
 def refine_auto_regions(
@@ -289,11 +310,7 @@ def refine_auto_regions(
     )
     normals, valid = _normal_map(point_map, normal_method)
     normal_edge = _normal_edge_map(normals, valid)
-    edge_fields = (
-        _edge_fields(point_map, rgb_image, atom_labels, atom_scales)
-        if split_aux_confirmation
-        else None
-    )
+    edge_fields = None
 
     result = labels.copy()
     next_label = int(result.max()) + 1 if result.size else 0
@@ -302,25 +319,44 @@ def refine_auto_regions(
     scores = []
 
     # Iterate over the original Auto labels only: newly created leaves are never revisited.
-    for parent_id in np.unique(labels):
-        parent_mask = labels == parent_id
-        parent_area = int(np.count_nonzero(parent_mask))
+    parent_areas = np.bincount(labels.reshape(-1))
+    # ndimage reserves zero for background; offset compact Auto labels by one.
+    parent_crops = ndimage.find_objects(labels + 1)
+    for parent_id, crop in enumerate(parent_crops):
+        if crop is None:
+            continue
+        parent_area = int(parent_areas[parent_id])
         min_child_area = _minimum_child_area(parent_area, seg_min_size)
         if parent_area < 2 * min_child_area:
             continue
         parent_count += 1
 
-        markers, marker_count = _markers(parent_mask, valid, normal_edge)
+        crop_parent = labels[crop] == parent_id
+        crop_valid = valid[crop]
+        crop_edge = normal_edge[crop]
+        markers, marker_count = _markers(
+            crop_parent,
+            crop_valid,
+            crop_edge,
+            min_child_area,
+        )
         if marker_count < 2:
             reject_no_markers += 1
             continue
         proposed_count += 1
 
-        elevation = normal_edge.copy()
-        elevation[parent_mask & ~valid] = NORMAL_BARRIER_RAD
-        candidate = watershed(elevation, markers=markers, mask=parent_mask)
+        elevation = crop_edge.copy()
+        invalid_crop = crop_parent & ~crop_valid
+        valid_elevation = elevation[crop_parent & crop_valid]
+        invalid_level = (
+            float(np.max(valid_elevation))
+            if valid_elevation.size
+            else NORMAL_BARRIER_RAD
+        )
+        elevation[invalid_crop] = invalid_level
+        candidate = watershed(elevation, markers=markers, mask=crop_parent)
         child_ids, child_sizes = np.unique(
-            candidate[parent_mask], return_counts=True
+            candidate[crop_parent], return_counts=True
         )
         nonzero = child_ids > 0
         child_ids = child_ids[nonzero]
@@ -333,7 +369,33 @@ def refine_auto_regions(
             reject_small_child += 1
             continue
 
-        score = _split_score(normals, valid, parent_mask, candidate, edge_fields)
+        crop_normals = normals[crop]
+        normal_gain = _normal_gain(
+            crop_normals, crop_valid, crop_parent, candidate
+        )
+        if normal_gain < split_score_thresh:
+            scores.append(normal_gain)
+            reject_low_score += 1
+            continue
+
+        if split_aux_confirmation and edge_fields is None:
+            crop_rgb = None if rgb_image is None else np.asarray(rgb_image)[crop]
+            edge_fields = _edge_fields(
+                point_map[crop], crop_rgb, atom_labels[crop], atom_scales
+            )
+        elif split_aux_confirmation:
+            crop_rgb = None if rgb_image is None else np.asarray(rgb_image)[crop]
+            edge_fields = _edge_fields(
+                point_map[crop], crop_rgb, atom_labels[crop], atom_scales
+            )
+        score = _split_score(
+            crop_normals,
+            crop_valid,
+            crop_parent,
+            candidate,
+            edge_fields,
+            normal_gain=normal_gain,
+        )
         scores.append(score)
         if score < split_score_thresh:
             reject_low_score += 1
@@ -346,9 +408,10 @@ def refine_auto_regions(
             key=lambda item: (-item[1], item[0]),
         )
         keep_child = ordered_children[0][0]
-        result[parent_mask & (candidate == keep_child)] = parent_id
+        result_crop = result[crop]
+        result_crop[crop_parent & (candidate == keep_child)] = parent_id
         for child_id, _ in ordered_children[1:]:
-            result[parent_mask & (candidate == child_id)] = next_label
+            result_crop[crop_parent & (candidate == child_id)] = next_label
             next_label += 1
             added_regions += 1
 
@@ -366,4 +429,4 @@ def refine_auto_regions(
         split_runtime_ms=runtime_ms,
         split_aux_confirmation=bool(split_aux_confirmation),
     )
-    return _compact_labels(result), diagnostics
+    return result, diagnostics
