@@ -13,6 +13,15 @@ class AtomMergeResult:
     atom_scales: np.ndarray
 
 
+@dataclass(frozen=True)
+class LayerAtomicSegmentationStages:
+    initial_labels: np.ndarray
+    merged_labels: np.ndarray
+    refined_labels: np.ndarray
+    atom_scales: np.ndarray
+    split_diagnostics: SplitDiagnostics | None = None
+
+
 def _compact_labels(labels):
     labels = np.asarray(labels)
     _, inverse = np.unique(labels, return_inverse=True)
@@ -180,6 +189,75 @@ def _select_rgb_frame(rgb_images, batch_idx, height, width):
     return np.clip(rgb.astype(np.float32, copy=False), 0.0, 1.0)
 
 
+def segment_point_map_layer_atomic_stages(
+    point_map,
+    depth_merge_thresh,
+    split=False,
+    rgb_images=None,
+    normal_method="cross",
+    split_score_thresh=0.10,
+    split_aux_confirmation=True,
+    conf_map=None,
+    top_conf_percentile=None,
+    seg_scale=300,
+    seg_sigma=1.1,
+    seg_min_size=500,
+    batch_idx=None,
+) -> LayerAtomicSegmentationStages:
+    point_map = np.asarray(point_map)
+    if point_map.ndim != 3 or point_map.shape[-1] != 3:
+        raise ValueError("point_map must have shape (H, W, 3)")
+
+    depth_map = point_map[..., -1]
+    initial_labels, coarse_labels, _ = segment_depth_felzenszwalb_rag_stages(
+        depth_map,
+        depth_merge_thresh,
+        conf_map,
+        top_conf_percentile,
+        seg_scale,
+        seg_sigma,
+        seg_min_size,
+        batch_idx,
+    )
+    merged = _merge_layer_atoms_with_metadata(
+        point_map,
+        initial_labels,
+        coarse_labels,
+        depth_merge_thresh,
+    )
+    if not split:
+        return LayerAtomicSegmentationStages(
+            initial_labels=np.asarray(initial_labels, dtype=np.intp),
+            merged_labels=merged.labels,
+            refined_labels=merged.labels,
+            atom_scales=merged.atom_scales,
+        )
+    rgb_image = _select_rgb_frame(
+        rgb_images,
+        batch_idx,
+        point_map.shape[0],
+        point_map.shape[1],
+    )
+    refined, diagnostics = refine_auto_regions(
+        point_map,
+        rgb_image,
+        merged.labels,
+        merged.atom_labels,
+        merged.atom_scales,
+        seg_min_size=seg_min_size,
+        normal_method=normal_method,
+        split_score_thresh=split_score_thresh,
+        split_aux_confirmation=split_aux_confirmation,
+    )
+    return LayerAtomicSegmentationStages(
+        initial_labels=np.asarray(initial_labels, dtype=np.intp),
+        merged_labels=merged.labels,
+        refined_labels=refined,
+        atom_scales=merged.atom_scales,
+        split_diagnostics=diagnostics,
+    )
+
+
 def segment_point_map_layer_atomic(
     point_map,
     depth_merge_thresh,
@@ -194,9 +272,8 @@ def segment_point_map_layer_atomic(
     if point_map.ndim != 3 or point_map.shape[-1] != 3:
         raise ValueError("point_map must have shape (H, W, 3)")
 
-    depth_map = point_map[..., -1]
     initial_labels, coarse_labels, _ = segment_depth_felzenszwalb_rag_stages(
-        depth_map,
+        point_map[..., -1],
         depth_merge_thresh,
         conf_map,
         top_conf_percentile,
@@ -227,42 +304,18 @@ def segment_point_map_layer_atomic_split(
     seg_min_size=500,
     batch_idx=None,
 ) -> np.ndarray:
-    point_map = np.asarray(point_map)
-    if point_map.ndim != 3 or point_map.shape[-1] != 3:
-        raise ValueError("point_map must have shape (H, W, 3)")
-
-    depth_map = point_map[..., -1]
-    initial_labels, coarse_labels, _ = segment_depth_felzenszwalb_rag_stages(
-        depth_map,
-        depth_merge_thresh,
-        conf_map,
-        top_conf_percentile,
-        seg_scale,
-        seg_sigma,
-        seg_min_size,
-        batch_idx,
-    )
-    merged = _merge_layer_atoms_with_metadata(
+    return segment_point_map_layer_atomic_stages(
         point_map,
-        initial_labels,
-        coarse_labels,
         depth_merge_thresh,
-    )
-    rgb_image = _select_rgb_frame(
-        rgb_images,
-        batch_idx,
-        point_map.shape[0],
-        point_map.shape[1],
-    )
-    refined, _ = refine_auto_regions(
-        point_map,
-        rgb_image,
-        merged.labels,
-        merged.atom_labels,
-        merged.atom_scales,
-        seg_min_size=seg_min_size,
+        split=True,
+        rgb_images=rgb_images,
         normal_method=normal_method,
         split_score_thresh=split_score_thresh,
         split_aux_confirmation=split_aux_confirmation,
-    )
-    return refined
+        conf_map=conf_map,
+        top_conf_percentile=top_conf_percentile,
+        seg_scale=seg_scale,
+        seg_sigma=seg_sigma,
+        seg_min_size=seg_min_size,
+        batch_idx=batch_idx,
+    ).refined_labels

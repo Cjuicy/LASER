@@ -1,6 +1,6 @@
 # Unified HART-AP Anchor Propagation Implementation Plan
 
-**Goal:** 在 `codex/auto-post-merge-split` 上一次性实现 HART-AP 旁路，使 `depth / geometry / layer_atomic / layer_atomic_split` 四种分割均可选择 `none / legacy_iou / hart`，完成本地回归、普通与 LC 引擎接入、验证文档、最终提交并推送到 `origin/codex/auto-post-merge-split`。
+**Goal:** 从 `codex/auto-post-merge-split` 的设计提交创建独立分支，一次性实现 HART-AP 旁路，使 `depth / geometry / layer_atomic / layer_atomic_split` 四种分割均可选择 `none / legacy_iou / hart`，完成本地回归、普通与 LC 引擎接入、验证文档、最终提交并推送到 `origin/codex/unified-hart-anchor-propagation`。
 
 **Architecture:** 保留 `utils/depth.py` 与 `utils/lsa.py` 的 legacy 图和 IoU 加权传播不变；新增 `inference_engine/anchor_propagation/`，把四种分割适配为严格嵌套的 Anchor Cell–Leaf–Parent 层次，以稀疏 label-pair 对应构建 Leaf/Anchor TrackSegments，只在双侧高置信核心中运行现有 IRLS，再用中位数和 complete-link 对数尺度共识生成一通道局部 mask。HART 路径逻辑分离 Base/Refined 状态；普通引擎立即输出 refined points，LC 引擎保存纯局部残差 mask 并在优化后的全局 Sim(3) 下应用一次。
 
@@ -14,8 +14,8 @@
 
 ## 固定基线与不可变约束
 
-- 工作分支：`codex/auto-post-merge-split`。
-- 基线提交：`c4c2820c649fd612be433c0b58912cee011ddac4`。
+- 工作分支：`codex/unified-hart-anchor-propagation`。
+- 基线提交：`c1fc82200e2e6dcbe4a7ae8ad36c76cb3a7e929e`（设计提交；其代码基线继承自 `c4c2820c649fd612be433c0b58912cee011ddac4`）。
 - 开始时测试基线：`python -m pytest -q` -> `103 passed`。
 - 不修改四种分割的算法、默认参数和旧 ndarray 公共输出。
 - 不修改 legacy `Vertex.cache={'iou': [], 'scale': []}`、IoU 加权公式、逐层遍历顺序或 `scale_mask` 语义。
@@ -560,10 +560,14 @@ git add \
   tests/test_hart_anchors.py \
   tests/test_hart_consensus.py \
   tests/test_hart_propagator.py \
+  tests/test_hart_smoke_script.py \
   tests/test_hart_streaming_integration.py \
   tests/test_segmentation_engine_modes.py \
   tests/test_demo.py tests/test_demo_lc.py \
-  docs/hart-anchor-propagation-cloud-validation.md
+  README.md \
+  docs/hart-anchor-propagation-cloud-validation.md \
+  docs/superpowers/specs/2026-07-20-unified-hart-anchor-propagation-design.md \
+  docs/superpowers/plans/2026-07-20-unified-hart-anchor-propagation.md
 git commit -m "feat: add unified HART anchor propagation"
 ```
 
@@ -571,13 +575,13 @@ git commit -m "feat: add unified HART anchor propagation"
 
 ```bash
 git status --short --branch
-git push origin codex/auto-post-merge-split
+git push origin codex/unified-hart-anchor-propagation
 ```
 
 - [ ] 用远端引用核对推送成功：
 
 ```bash
-git ls-remote --heads origin codex/auto-post-merge-split
+git ls-remote --heads origin codex/unified-hart-anchor-propagation
 git rev-parse HEAD
 ```
 

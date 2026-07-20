@@ -35,6 +35,9 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             geometry_seg_profile: str = "baseline_params",
             split_score_thresh: float = 0.10,
             split_aux_confirmation: bool = True,
+            anchor_propagation: str | None = None,
+            anchor_min_pixels: int = 64,
+            scale_consistency_thresh: float = 0.05,
     ):
         super().__init__(
             delegate=delegate.to(inference_device),
@@ -51,6 +54,9 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             geometry_seg_profile=geometry_seg_profile,
             split_score_thresh=split_score_thresh,
             split_aux_confirmation=split_aux_confirmation,
+            anchor_propagation=anchor_propagation,
+            anchor_min_pixels=anchor_min_pixels,
+            scale_consistency_thresh=scale_consistency_thresh,
         )
 
     def _registration_worker(self):
@@ -101,7 +107,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                 # working_window['local_points'] = s_d * working_window.pop('local_points')
                 # working_window['camera_poses'] = apply_sim3_to_pose(working_window.pop('camera_poses'), s_d, R, t)
 
-                if self.depth_refine:
+                if self.anchor_propagation == "legacy_iou":
                     tgt_pcd = working_window['local_points'].cpu().numpy()
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
@@ -115,6 +121,29 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                         tgt_sp_graph,
                         self.overlap
                     )
+                elif self.anchor_propagation == "hart":
+                    cumulative_sim3 = accumulate_sim3(
+                        self.registration_state.cumulative_sim3,
+                        working_window['sim3'],
+                    )
+                    base_points = cumulative_sim3[0] * working_window['local_points']
+                    base_poses = apply_sim3_to_pose(
+                        working_window['camera_poses'], *cumulative_sim3
+                    )
+                    result = self._run_hart_propagation(
+                        base_points,
+                        base_poses,
+                        working_window['conf'],
+                        working_window.get('images'),
+                        cumulative_sim3=cumulative_sim3,
+                    )
+                    working_window['local_scale_mask'] = torch.from_numpy(
+                        result.local_scale_mask
+                    ).to(
+                        device=working_window['local_points'].device,
+                        dtype=working_window['local_points'].dtype,
+                    )
+                    working_window['hart_diagnostics'] = result.diagnostics
             else:
                 _, intrinsic_ = estimate_pseudo_depth_and_intrinsics(working_window['local_points'])
                 ref_intrinsic = intrinsic_[0]
@@ -128,12 +157,28 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     torch.zeros(3, device=self.process_device)
                 )
 
-                if self.depth_refine:
+                if self.anchor_propagation == "legacy_iou":
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
                         working_window.get('images'),
                     )
+                elif self.anchor_propagation == "hart":
+                    cumulative_sim3 = working_window['sim3']
+                    result = self._run_hart_propagation(
+                        working_window['local_points'],
+                        working_window['camera_poses'],
+                        working_window['conf'],
+                        working_window.get('images'),
+                        cumulative_sim3=cumulative_sim3,
+                    )
+                    working_window['local_scale_mask'] = torch.from_numpy(
+                        result.local_scale_mask
+                    ).to(
+                        device=working_window['local_points'].device,
+                        dtype=working_window['local_points'].dtype,
+                    )
+                    working_window['hart_diagnostics'] = result.diagnostics
 
             self._update_cache(working_window, tgt_sp_graph)
             self._save_cache()
@@ -154,7 +199,13 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             # apply local to world transformation
             cache_sim3 = cache['sim3']
             s_d, R, t = accumulate_sim3(ref_sim3, cache_sim3)
-            if 'scale_mask' in cache.keys():
+            if 'local_scale_mask' in cache.keys():
+                cache['local_points'] = (
+                    s_d
+                    * cache.pop('local_scale_mask')
+                    * cache.pop('local_points')
+                )
+            elif 'scale_mask' in cache.keys():
                 cache['local_points'] = ref_sim3[0] * cache.pop('scale_mask') * cache.pop('local_points')
             else:
                 cache['local_points'] = s_d * cache.pop('local_points')

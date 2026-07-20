@@ -93,6 +93,10 @@ def get_args_parser():
     parser.add_argument('--split_score_thresh', default=0.10, type=float)
     parser.add_argument('--split_aux_confirmation', default=True,
                         action=argparse.BooleanOptionalAction)
+    parser.add_argument('--anchor_propagation', default=None,
+                        choices=('none', 'legacy_iou', 'hart'))
+    parser.add_argument('--anchor_min_pixels', default=64, type=int)
+    parser.add_argument('--scale_consistency_thresh', default=0.05, type=float)
     return parser
 
 
@@ -214,7 +218,10 @@ if __name__ == '__main__':
                                normal_method=args.normal_method,
                                geometry_seg_profile=args.geometry_seg_profile,
                                split_score_thresh=args.split_score_thresh,
-                               split_aux_confirmation=args.split_aux_confirmation))
+                               split_aux_confirmation=args.split_aux_confirmation,
+                               anchor_propagation=args.anchor_propagation,
+                               anchor_min_pixels=args.anchor_min_pixels,
+                               scale_consistency_thresh=args.scale_consistency_thresh))
     elif model_variant == 'streaming_pi3_lc':
         pi3_main(args, partial(StreamingWindowEngineLC, dtype=dtype, inference_device=device, window_size=75, overlap=30,
                                top_conf_percentile=0.3,
@@ -223,6 +230,9 @@ if __name__ == '__main__':
                                normal_method=args.normal_method,
                                geometry_seg_profile=args.geometry_seg_profile,
                                split_score_thresh=args.split_score_thresh,
-                               split_aux_confirmation=args.split_aux_confirmation))
+                               split_aux_confirmation=args.split_aux_confirmation,
+                               anchor_propagation=args.anchor_propagation,
+                               anchor_min_pixels=args.anchor_min_pixels,
+                               scale_consistency_thresh=args.scale_consistency_thresh))
     else:
         raise NotImplementedError

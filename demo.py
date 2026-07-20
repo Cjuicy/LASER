@@ -59,6 +59,13 @@ def get_args_parser():
     parser.add_argument('--window_size', default=10, type=int, help='sliding window size')          # 滑动窗口参数
     parser.add_argument('--overlap', default=5, type=int, help='sliding window overlap size')
     parser.add_argument('--depth_refine', action='store_true', help='enable depth refine')          # 深度优化开关
+    parser.add_argument('--anchor_propagation', default=None,
+                        choices=('none', 'legacy_iou', 'hart'),
+                        help='anchor propagation strategy; omitted preserves --depth_refine behavior')
+    parser.add_argument('--anchor_min_pixels', default=64, type=int,
+                        help='minimum mutual high-confidence pixels for a HART anchor')
+    parser.add_argument('--scale_consistency_thresh', default=0.05, type=float,
+                        help='complete-link log-scale consistency threshold for HART')
     parser.add_argument('--segment_mode', default='depth',
                         choices=('depth', 'geometry', 'layer_atomic', 'layer_atomic_split'),
                         help='segmentation method used by depth refinement')
@@ -130,6 +137,9 @@ def load_model(args):
         geometry_seg_profile=args.geometry_seg_profile,
         split_score_thresh=args.split_score_thresh,
         split_aux_confirmation=args.split_aux_confirmation,
+        anchor_propagation=args.anchor_propagation,
+        anchor_min_pixels=args.anchor_min_pixels,
+        scale_consistency_thresh=args.scale_consistency_thresh,
     )
 
 # 执行滑动窗口推理

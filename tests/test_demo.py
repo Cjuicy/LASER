@@ -53,6 +53,17 @@ def test_segmentation_options_default_to_depth_baseline():
     assert args.geometry_seg_profile == "baseline_params"
     assert args.split_score_thresh == 0.10
     assert args.split_aux_confirmation is True
+    assert args.anchor_propagation is None
+    assert args.anchor_min_pixels == 64
+    assert args.scale_consistency_thresh == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("mode", ["none", "legacy_iou", "hart"])
+def test_parser_accepts_anchor_propagation_modes(mode):
+    args = demo.get_args_parser().parse_args([
+        "--anchor_propagation", mode,
+    ])
+    assert args.anchor_propagation == mode
 
 
 @pytest.mark.parametrize(
@@ -84,6 +95,12 @@ def test_parser_accepts_split_threshold_and_auxiliary_ablation():
         "--split_score_thresh",
         "0.17",
         "--no-split_aux_confirmation",
+        "--anchor_propagation",
+        "hart",
+        "--anchor_min_pixels",
+        "32",
+        "--scale_consistency_thresh",
+        "0.08",
     ])
 
     assert args.split_score_thresh == pytest.approx(0.17)
@@ -125,6 +142,12 @@ def test_load_model_forwards_segmentation_options(tmp_path, monkeypatch):
         "--split_score_thresh",
         "0.17",
         "--no-split_aux_confirmation",
+        "--anchor_propagation",
+        "hart",
+        "--anchor_min_pixels",
+        "32",
+        "--scale_consistency_thresh",
+        "0.08",
     ])
     captured = {}
 
@@ -149,6 +172,9 @@ def test_load_model_forwards_segmentation_options(tmp_path, monkeypatch):
     assert captured["geometry_seg_profile"] == "legacy"
     assert captured["split_score_thresh"] == pytest.approx(0.17)
     assert captured["split_aux_confirmation"] is False
+    assert captured["anchor_propagation"] == "hart"
+    assert captured["anchor_min_pixels"] == 32
+    assert captured["scale_consistency_thresh"] == pytest.approx(0.08)
 
 
 def test_natural_sort_key_orders_embedded_numbers_numerically():

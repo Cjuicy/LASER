@@ -89,7 +89,7 @@ The results will be saved in the `viser_results/SEQ_NAME`directory for future vi
 
 ### Unified segmentation methods
 
-The same streaming pipeline can select one of three validated segmentation methods:
+The same streaming pipeline can select one of four validated segmentation methods:
 
 ```bash
 python demo.py \
@@ -104,7 +104,8 @@ python demo.py \
     --segment_mode depth
 ```
 
-Set `--segment_mode` to `depth`, `geometry`, or `layer_atomic`. Geometry defaults to
+Set `--segment_mode` to `depth`, `geometry`, `layer_atomic`, or
+`layer_atomic_split`. Geometry defaults to
 `--normal_method cross --geometry_seg_profile baseline_params`. The formal comparison
 profile aligns all three methods to Felzenszwalb `scale=300`, `sigma=1.1`, and
 `min_size=500`; the historical geometry settings are available only with
@@ -112,7 +113,30 @@ profile aligns all three methods to Felzenszwalb `scale=300`, `sigma=1.1`, and
 
 See [docs/unified-segmentation-cloud-validation.md](docs/unified-segmentation-cloud-validation.md)
 for branch checkout, CPU smoke tests, full regression tests, and matched cloud commands
-for all three modes.
+for all four modes.
+
+### HART anchor propagation
+
+The four segmentation modes can share the hierarchy-aware HART sidecar without changing
+the legacy IoU path:
+
+```bash
+python demo.py \
+    --model_ckpt weights/model.safetensors \
+    --data_path DATA_PATH \
+    --cache_path ./cache/hart \
+    --output_path ./viser_results/hart \
+    --window_size 30 \
+    --overlap 10 \
+    --segment_mode layer_atomic_split \
+    --anchor_propagation hart
+```
+
+Use `--anchor_propagation none`, `legacy_iou`, or `hart`. Omitting it preserves the
+original `--depth_refine` behavior. See
+[docs/hart-anchor-propagation-cloud-validation.md](docs/hart-anchor-propagation-cloud-validation.md)
+for the four-mode CPU smoke test, full validation, ordinary inference, and loop-closure
+commands.
 
 ### Loop-closure inference
 Loop-closure requires additional dependencies for package `faiss` can be installed through:

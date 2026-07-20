@@ -2,7 +2,9 @@
 
 - 日期：2026-07-20
 - 代码基线：`codex/auto-post-merge-split@c4c2820c649fd612be433c0b58912cee011ddac4`
-- 目标分支：`codex/auto-post-merge-split`
+- 实现分支：`codex/unified-hart-anchor-propagation`（从包含本设计的
+  `codex/auto-post-merge-split@c1fc82200e2e6dcbe4a7ae8ad36c76cb3a7e929e`
+  创建）
 - 设计范围：锚点产生、区域/轨迹尺度共识、窗口内传播、重叠窗口传播、普通与回环引擎状态隔离
 - 最终方法名：`HART-AP`（High-confidence Anchor–Region–Track Anchor Propagation，高置信锚点—区域—轨迹传播）
 

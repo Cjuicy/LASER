@@ -5,6 +5,7 @@ import torch
 from inference_engine import streaming_window_engine as swe_module
 from inference_engine.streaming_window_engine import StreamingWindowEngine
 from inference_engine.streaming_window_engine_lc import StreamingWindowEngineLC
+from inference_engine.anchor_propagation import resolve_anchor_propagation
 
 
 def _engine(tmp_path, **kwargs):
@@ -27,6 +28,19 @@ def test_engine_defaults_to_depth_and_aligned_geometry_configuration(tmp_path):
     assert engine.geometry_seg_profile == "baseline_params"
     assert engine.split_score_thresh == 0.10
     assert engine.split_aux_confirmation is True
+    assert engine.anchor_propagation == "none"
+
+
+def test_legacy_depth_refine_flag_resolves_to_legacy_iou():
+    assert resolve_anchor_propagation(False) == "none"
+    assert resolve_anchor_propagation(True) == "legacy_iou"
+    assert resolve_anchor_propagation(False, "hart") == "hart"
+    assert resolve_anchor_propagation(True, "none") == "none"
+
+
+def test_unknown_anchor_propagation_fails_fast(tmp_path):
+    with pytest.raises(ValueError, match="anchor_propagation"):
+        _engine(tmp_path, anchor_propagation="unknown")
 
 
 @pytest.mark.parametrize(
@@ -42,6 +56,30 @@ def test_engine_accepts_all_explicit_modes_when_refinement_is_enabled(tmp_path, 
 def test_non_depth_mode_requires_depth_refinement(tmp_path, mode):
     with pytest.raises(ValueError, match="depth_refine"):
         _engine(tmp_path / mode, segment_mode=mode, depth_refine=False)
+
+
+@pytest.mark.parametrize(
+    "mode", ["depth", "geometry", "layer_atomic", "layer_atomic_split"]
+)
+def test_explicit_hart_is_available_for_every_segmentation_mode(tmp_path, mode):
+    engine = _engine(
+        tmp_path / mode,
+        segment_mode=mode,
+        depth_refine=False,
+        anchor_propagation="hart",
+    )
+    assert engine.anchor_propagation == "hart"
+
+
+@pytest.mark.parametrize("mode", ["geometry", "layer_atomic", "layer_atomic_split"])
+def test_explicit_none_allows_non_depth_global_only_ablation(tmp_path, mode):
+    engine = _engine(
+        tmp_path / mode,
+        segment_mode=mode,
+        depth_refine=False,
+        anchor_propagation="none",
+    )
+    assert engine.anchor_propagation == "none"
 
 
 def test_engine_rejects_unknown_mode(tmp_path):

@@ -60,6 +60,12 @@ from .utils.lsa import (
     SEGMENT_MODES,
     get_felzenszwalb_params,
 )
+from .anchor_propagation import (
+    HartAnchorPropagator,
+    RegistrationState,
+    build_segmentation_window,
+    resolve_anchor_propagation,
+)
 
 # 线程停止标志
 STOP_SIGNAL = object()
@@ -84,12 +90,22 @@ class StreamingWindowEngine(VanillaEngine):
             geometry_seg_profile: str = "baseline_params",
             split_score_thresh: float = 0.10,
             split_aux_confirmation: bool = True,
+            anchor_propagation: str | None = None,
+            anchor_min_pixels: int = 64,
+            scale_consistency_thresh: float = 0.05,
     ):
+        resolved_anchor_propagation = resolve_anchor_propagation(
+            depth_refine, anchor_propagation
+        )
         if segment_mode not in SEGMENT_MODES:
             raise ValueError(
                 f"Unknown segment_mode: {segment_mode!r}; expected one of {SEGMENT_MODES}."
             )
-        if segment_mode != "depth" and not depth_refine:
+        if (
+            segment_mode != "depth"
+            and not depth_refine
+            and anchor_propagation is None
+        ):
             raise ValueError(
                 f"segment_mode={segment_mode!r} requires depth_refine=True."
             )
@@ -125,11 +141,25 @@ class StreamingWindowEngine(VanillaEngine):
         self.dtype = dtype
         # 5️⃣ 深度细化
         self.depth_refine = depth_refine
+        self._anchor_propagation_explicit = anchor_propagation is not None
+        self.anchor_propagation = resolved_anchor_propagation
         self.segment_mode = segment_mode
         self.normal_method = normal_method
         self.geometry_seg_profile = geometry_seg_profile
         self.split_score_thresh = float(split_score_thresh)
         self.split_aux_confirmation = bool(split_aux_confirmation)
+        self.anchor_min_pixels = int(anchor_min_pixels)
+        self.scale_consistency_thresh = float(scale_consistency_thresh)
+        self.hart_propagator = (
+            HartAnchorPropagator(
+                corr_iou_thresh=0.3,
+                anchor_min_pixels=self.anchor_min_pixels,
+                scale_consistency_thresh=self.scale_consistency_thresh,
+                confidence_quantile=self.top_conf_percentile,
+            )
+            if self.anchor_propagation == "hart"
+            else None
+        )
         self.felzenszwalb_params = get_felzenszwalb_params(
             segment_mode,
             geometry_seg_profile,
@@ -148,6 +178,7 @@ class StreamingWindowEngine(VanillaEngine):
         print(
             "[segmentation] "
             f"{segmentation_details}, "
+            f"anchor_propagation={self.anchor_propagation}, "
             f"scale={self.felzenszwalb_params['seg_scale']}, "
             f"sigma={self.felzenszwalb_params['seg_sigma']}, "
             f"min_size={self.felzenszwalb_params['seg_min_size']}"
@@ -165,6 +196,8 @@ class StreamingWindowEngine(VanillaEngine):
         # 8️⃣ 相邻窗口状态
         self.prev_window_cache = None
         self.anchor_sp_graph = None
+        self.registration_state = None
+        self.anchor_propagation_state = None
 
         # 9️⃣ 线程对象和运行状态
         self._inference_thread = None
@@ -189,6 +222,8 @@ class StreamingWindowEngine(VanillaEngine):
         if self.running:
             raise RuntimeError('Cannot change depth refinement mode while running')
         self.depth_refine = flag
+        if not self._anchor_propagation_explicit:
+            self.anchor_propagation = resolve_anchor_propagation(flag)
 
     def _build_segment_graph(self, local_points, conf, images=None):
         return make_sp_graph(
@@ -202,6 +237,44 @@ class StreamingWindowEngine(VanillaEngine):
             split_score_thresh=self.split_score_thresh,
             split_aux_confirmation=self.split_aux_confirmation,
         )
+
+    def _build_hart_segments(self, base_points, conf, images=None):
+        return build_segmentation_window(
+            base_points.cpu().numpy(),
+            conf_map=conf.cpu().numpy(),
+            top_conf_percentile=self.top_conf_percentile,
+            segment_mode=self.segment_mode,
+            normal_method=self.normal_method,
+            geometry_seg_profile=self.geometry_seg_profile,
+            rgb_images=None if images is None else images.cpu().numpy(),
+            split_score_thresh=self.split_score_thresh,
+            split_aux_confirmation=self.split_aux_confirmation,
+        )
+
+    def _run_hart_propagation(
+        self,
+        base_points,
+        base_poses,
+        confidence,
+        images=None,
+        cumulative_sim3=None,
+    ):
+        segments = self._build_hart_segments(base_points, confidence, images)
+        result = self.hart_propagator.refine(
+            previous_registration_state=self.registration_state,
+            previous_anchor_state=self.anchor_propagation_state,
+            current_base_points=base_points,
+            current_confidence=confidence,
+            current_segments=segments,
+            overlap=self.overlap,
+        )
+        self.registration_state = RegistrationState(
+            base_points_tail=base_points[-self.overlap:].detach().clone(),
+            base_poses_tail=base_poses[-self.overlap:].detach().clone(),
+            cumulative_sim3=cumulative_sim3,
+        )
+        self.anchor_propagation_state = result.next_state
+        return result
 
     # 把当前已经完成配准的窗口写入磁盘
     def _save_cache(self):
@@ -222,6 +295,8 @@ class StreamingWindowEngine(VanillaEngine):
 
         self.prev_window_cache = None
         self.anchor_sp_graph = None
+        self.registration_state = None
+        self.anchor_propagation_state = None
 
         self._inference_thread = None
         self._registration_thread = None
@@ -299,14 +374,19 @@ class StreamingWindowEngine(VanillaEngine):
 
                 # 3️⃣ 取相邻窗口的重叠点云
                 # metric depth align
-                prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]
+                if self.anchor_propagation == "hart":
+                    prev_local_points = self.registration_state.base_points_tail
+                    prev_camera_poses = self.registration_state.base_poses_tail
+                else:
+                    prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]
+                    prev_camera_poses = self.prev_window_cache['camera_poses'][-self.overlap:]
                 cur_local_points = working_window['local_points'][:self.overlap]
 
                 # 4️⃣ 求相似变换
                 s_d, R, t = register_adjacent_windows(
                     prev_local_points,
                     cur_local_points,
-                    self.prev_window_cache['camera_poses'][-self.overlap:],
+                    prev_camera_poses,
                     working_window['camera_poses'][:self.overlap],
                     conf_mask
                 )
@@ -317,7 +397,7 @@ class StreamingWindowEngine(VanillaEngine):
                 working_window['camera_poses'] = apply_sim3_to_pose(working_window.pop('camera_poses'), s_d, R, t)
 
                 # 7️⃣ 可选深度细化
-                if self.depth_refine:
+                if self.anchor_propagation == "legacy_iou":
                     tgt_pcd = working_window['local_points'].cpu().numpy()
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
@@ -331,6 +411,19 @@ class StreamingWindowEngine(VanillaEngine):
                         tgt_sp_graph,
                         self.overlap
                     )
+                elif self.anchor_propagation == "hart":
+                    base_points = working_window['local_points']
+                    result = self._run_hart_propagation(
+                        base_points,
+                        working_window['camera_poses'],
+                        working_window['conf'],
+                        working_window.get('images'),
+                    )
+                    local_scale = torch.from_numpy(
+                        result.local_scale_mask
+                    ).to(device=base_points.device, dtype=base_points.dtype)
+                    working_window['local_points'] = base_points * local_scale
+                    working_window['hart_diagnostics'] = result.diagnostics
             # ⚠️ 首窗口处理
             else:
                 # 1️⃣ 估计参考内参
@@ -343,12 +436,25 @@ class StreamingWindowEngine(VanillaEngine):
                 )
 
                 # 3️⃣ 创建首窗口分割图
-                if self.depth_refine:
+                if self.anchor_propagation == "legacy_iou":
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
                         working_window.get('images'),
                     )
+                elif self.anchor_propagation == "hart":
+                    base_points = working_window['local_points']
+                    result = self._run_hart_propagation(
+                        base_points,
+                        working_window['camera_poses'],
+                        working_window['conf'],
+                        working_window.get('images'),
+                    )
+                    local_scale = torch.from_numpy(
+                        result.local_scale_mask
+                    ).to(device=base_points.device, dtype=base_points.dtype)
+                    working_window['local_points'] = base_points * local_scale
+                    working_window['hart_diagnostics'] = result.diagnostics
 
             # ⚠️ 更新并保存窗口
             self._update_cache(working_window, tgt_sp_graph)
