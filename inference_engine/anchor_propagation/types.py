@@ -90,7 +90,14 @@ class TrackWindow:
 class RegistrationState:
     base_points_tail: torch.Tensor
     base_poses_tail: torch.Tensor
+    propagated_points_tail: torch.Tensor | None = None
     cumulative_sim3: tuple[Any, Any, Any] | None = None
+
+    @property
+    def points_for_registration(self):
+        if self.propagated_points_tail is None:
+            return self.base_points_tail
+        return self.propagated_points_tail
 
 
 @dataclass(frozen=True)

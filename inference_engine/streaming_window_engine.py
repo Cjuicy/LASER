@@ -258,6 +258,7 @@ class StreamingWindowEngine(VanillaEngine):
         confidence,
         images=None,
         cumulative_sim3=None,
+        registration_base_points=None,
     ):
         segments = self._build_hart_segments(base_points, confidence, images)
         result = self.hart_propagator.refine(
@@ -268,9 +269,19 @@ class StreamingWindowEngine(VanillaEngine):
             current_segments=segments,
             overlap=self.overlap,
         )
+        local_scale = torch.from_numpy(result.local_scale_mask).to(
+            device=base_points.device,
+            dtype=base_points.dtype,
+        )
+        if registration_base_points is None:
+            registration_base_points = base_points
+        propagated_points = registration_base_points * local_scale
         self.registration_state = RegistrationState(
             base_points_tail=base_points[-self.overlap:].detach().clone(),
             base_poses_tail=base_poses[-self.overlap:].detach().clone(),
+            propagated_points_tail=(
+                propagated_points[-self.overlap:].detach().clone()
+            ),
             cumulative_sim3=cumulative_sim3,
         )
         self.anchor_propagation_state = result.next_state
@@ -375,7 +386,9 @@ class StreamingWindowEngine(VanillaEngine):
                 # 3️⃣ 取相邻窗口的重叠点云
                 # metric depth align
                 if self.anchor_propagation == "hart":
-                    prev_local_points = self.registration_state.base_points_tail
+                    prev_local_points = (
+                        self.registration_state.points_for_registration
+                    )
                     prev_camera_poses = self.registration_state.base_poses_tail
                 else:
                     prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]

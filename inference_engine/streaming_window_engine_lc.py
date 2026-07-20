@@ -92,7 +92,12 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                 conf_mask = (self.prev_window_cache['conf'][-self.overlap:] >= prev_conf_thresh) & tgt_mask
 
                 # metric depth align
-                prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]
+                if self.anchor_propagation == "hart":
+                    prev_local_points = (
+                        self.registration_state.points_for_registration
+                    )
+                else:
+                    prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]
                 cur_local_points = working_window['local_points'][:self.overlap]
 
                 s_d, R, t = register_adjacent_windows(
@@ -136,6 +141,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                         working_window['conf'],
                         working_window.get('images'),
                         cumulative_sim3=cumulative_sim3,
+                        registration_base_points=working_window['local_points'],
                     )
                     working_window['local_scale_mask'] = torch.from_numpy(
                         result.local_scale_mask
@@ -171,6 +177,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                         working_window['conf'],
                         working_window.get('images'),
                         cumulative_sim3=cumulative_sim3,
+                        registration_base_points=working_window['local_points'],
                     )
                     working_window['local_scale_mask'] = torch.from_numpy(
                         result.local_scale_mask

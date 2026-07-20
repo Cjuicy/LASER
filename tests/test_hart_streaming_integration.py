@@ -6,7 +6,11 @@ import torch
 
 from inference_engine import streaming_window_engine as swe_module
 from inference_engine import streaming_window_engine_lc as swe_lc_module
-from inference_engine.anchor_propagation.types import PropagationResult
+from inference_engine.anchor_propagation.segmentation import _frame_from_layers
+from inference_engine.anchor_propagation.types import (
+    PropagationResult,
+    SegmentationWindow,
+)
 from inference_engine.streaming_window_engine import StreamingWindowEngine, STOP_SIGNAL
 from inference_engine.streaming_window_engine_lc import StreamingWindowEngineLC
 
@@ -94,9 +98,7 @@ def test_legacy_route_keeps_graph_and_refine_contract(monkeypatch, tmp_path):
     assert calls == ["graph", "graph", "refine"]
 
 
-def test_hart_registration_reads_base_points_not_refined_output(
-    monkeypatch, tmp_path
-):
+def test_hart_registration_consumes_previous_refined_points(monkeypatch, tmp_path):
     captured_sources = []
     _patch_registration_primitives(monkeypatch, captured_sources)
     engine = _engine(
@@ -112,7 +114,7 @@ def test_hart_registration_reads_base_points_not_refined_output(
     class FakePropagator:
         def refine(self, **kwargs):
             calls.append(kwargs)
-            scale = 2.0 if len(calls) == 1 else 1.0
+            scale = 2.0 if len(calls) == 2 else 1.0
             shape = (*kwargs["current_base_points"].shape[:3], 1)
             return PropagationResult(
                 local_scale_mask=np.full(shape, scale, dtype=np.float32),
@@ -122,13 +124,99 @@ def test_hart_registration_reads_base_points_not_refined_output(
 
     engine.hart_propagator = FakePropagator()
 
-    _run_worker(engine, [_window(3.0), _window(3.0)])
+    _run_worker(engine, [_window(3.0), _window(3.0), _window(3.0)])
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     np.testing.assert_array_equal(captured_sources[0][..., -1], 3.0)
+    np.testing.assert_array_equal(captured_sources[1][..., -1], 6.0)
     np.testing.assert_array_equal(
-        calls[1]["previous_registration_state"].base_points_tail[..., -1],
+        calls[2]["previous_registration_state"].base_points_tail[..., -1],
         3.0,
+    )
+    np.testing.assert_array_equal(
+        calls[2][
+            "previous_registration_state"
+        ].points_for_registration[..., -1],
+        6.0,
+    )
+
+
+def test_hart_feedback_changes_the_next_window_camera_scale(monkeypatch, tmp_path):
+    _patch_registration_primitives(monkeypatch)
+
+    def register(src_points, tgt_points, src_poses, tgt_poses, mask):
+        scale = src_points[..., -1].mean() / tgt_points[..., -1].mean()
+        return float(scale), torch.eye(3), torch.zeros(3)
+
+    monkeypatch.setattr(swe_module, "register_adjacent_windows", register)
+    engine = _engine(
+        tmp_path,
+        depth_refine=False,
+        anchor_propagation="hart",
+        anchor_min_pixels=1,
+    )
+    engine._build_hart_segments = lambda *args: SimpleNamespace()
+    calls = []
+
+    class FakePropagator:
+        def refine(self, **kwargs):
+            calls.append(kwargs)
+            scale = 2.0 if len(calls) == 2 else 1.0
+            shape = (*kwargs["current_base_points"].shape[:3], 1)
+            return PropagationResult(
+                local_scale_mask=np.full(shape, scale, dtype=np.float32),
+                next_state=object(),
+                diagnostics={},
+            )
+
+    engine.hart_propagator = FakePropagator()
+    third = _window(3.0)
+    third["camera_poses"][:, 0, 3] = torch.tensor([1.0, 2.0])
+
+    _run_worker(engine, [_window(3.0), _window(3.0), third])
+
+    np.testing.assert_array_equal(
+        engine.prev_window_cache["camera_poses"][:, 0, 3],
+        [2.0, 4.0],
+    )
+
+
+def test_real_hart_regional_scale_is_propagated_to_the_next_window(
+    monkeypatch, tmp_path
+):
+    captured_sources = []
+    _patch_registration_primitives(monkeypatch, captured_sources)
+    engine = _engine(
+        tmp_path,
+        depth_refine=False,
+        anchor_propagation="hart",
+        anchor_min_pixels=1,
+    )
+    labels = np.asarray([[0, 1, 1], [0, 1, 1]], dtype=np.intp)
+    frame = _frame_from_layers(labels, labels)
+
+    def segments(base_points, *args):
+        return SegmentationWindow(
+            frames=tuple(frame for _ in range(base_points.shape[0])),
+            segment_mode="depth",
+        )
+
+    engine._build_hart_segments = segments
+    first = _window(3.0)
+    first["local_points"][..., 0, -1] = 6.0
+    second = _window(3.0)
+    third = _window(3.0)
+
+    _run_worker(engine, [first, second, third])
+
+    assert len(captured_sources) == 2
+    np.testing.assert_array_equal(captured_sources[1][..., 0, -1], 6.0)
+    np.testing.assert_array_equal(captured_sources[1][..., 1:, -1], 3.0)
+    np.testing.assert_array_equal(
+        engine.registration_state.base_points_tail[..., 0, -1], 3.0
+    )
+    np.testing.assert_array_equal(
+        engine.registration_state.points_for_registration[..., 0, -1], 6.0
     )
 
 
@@ -175,11 +263,13 @@ def test_lc_worker_keeps_raw_points_and_tracks_cumulative_base_scale(
     monkeypatch.setattr(
         swe_lc_module, "unproject_depth_to_local_points", unproject
     )
-    monkeypatch.setattr(
-        swe_lc_module,
-        "register_adjacent_windows",
-        lambda *args: (2.0, torch.eye(3), torch.zeros(3)),
-    )
+    captured_sources = []
+
+    def register(src_points, *args):
+        captured_sources.append(src_points.detach().clone())
+        return 2.0, torch.eye(3), torch.zeros(3)
+
+    monkeypatch.setattr(swe_lc_module, "register_adjacent_windows", register)
     engine = StreamingWindowEngineLC(
         torch.nn.Identity(),
         inference_device="cpu",
@@ -199,19 +289,23 @@ def test_lc_worker_keeps_raw_points_and_tracks_cumulative_base_scale(
     class FakePropagator:
         def refine(self, **kwargs):
             calls.append(kwargs)
+            scale = 2.0 if len(calls) == 2 else 1.0
             shape = (*kwargs["current_base_points"].shape[:3], 1)
             return PropagationResult(
-                local_scale_mask=np.ones(shape, dtype=np.float32),
+                local_scale_mask=np.full(shape, scale, dtype=np.float32),
                 next_state=object(),
                 diagnostics={},
             )
 
     engine.hart_propagator = FakePropagator()
-    _run_worker(engine, [_window(3.0), _window(3.0)])
+    _run_worker(engine, [_window(3.0), _window(3.0), _window(3.0)])
 
     np.testing.assert_array_equal(engine.prev_window_cache["local_points"][..., -1], 3.0)
     np.testing.assert_array_equal(calls[1]["current_base_points"][..., -1], 6.0)
-    assert engine.registration_state.cumulative_sim3[0] == 2.0
+    np.testing.assert_array_equal(calls[2]["current_base_points"][..., -1], 12.0)
+    np.testing.assert_array_equal(captured_sources[0][..., -1], 3.0)
+    np.testing.assert_array_equal(captured_sources[1][..., -1], 6.0)
+    assert engine.registration_state.cumulative_sim3[0] == 4.0
     assert "local_scale_mask" in engine.prev_window_cache
 
 

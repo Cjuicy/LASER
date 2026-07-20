@@ -79,6 +79,10 @@ python demo_lc.py --config_path configs/loop_config.yaml ...
 HART 仅新增纯局部 `local_scale_mask`；回环优化后按“优化后的全局尺度 × 局部
 mask × 原始点云”应用一次。
 
+在线传播不是只改当前输出：普通引擎把 `Base × local mask` 的尾部点云送入下一
+窗口 Sim(3)；LC 在内存中把 `raw × local mask` 送入下一 pairwise Sim(3)。因此
+HART 会逐窗口改变后续相机位姿并进入 ATE 计算链，同时磁盘 raw cache 仍不被覆盖。
+
 ## 4. 对照实验路由
 
 - `--anchor_propagation none`：只做全局窗口配准，不运行分割或局部传播；

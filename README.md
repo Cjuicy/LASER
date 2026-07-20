@@ -133,7 +133,9 @@ python demo.py \
 ```
 
 Use `--anchor_propagation none`, `legacy_iou`, or `hart`. Omitting it preserves the
-original `--depth_refine` behavior. See
+original `--depth_refine` behavior. HART feeds each refined overlap tail into the next
+window registration, so its point-cloud correction propagates through subsequent Sim(3)
+and camera poses instead of affecting only the current output. See
 [docs/hart-anchor-propagation-cloud-validation.md](docs/hart-anchor-propagation-cloud-validation.md)
 for the four-mode CPU smoke test, full validation, ordinary inference, and loop-closure
 commands.
