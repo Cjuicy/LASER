@@ -422,60 +422,105 @@ class StreamingWindowEngine(VanillaEngine):
                                                   self.top_conf_percentile, interpolation='nearest')
                 conf_mask = (self.prev_window_cache['conf'][-self.overlap:] >= prev_conf_thresh) & tgt_mask
 
-                # 3️⃣ 取相邻窗口的重叠点云
-                # metric depth align
                 if self.anchor_propagation == "hart":
-                    prev_local_points = (
-                        self.registration_state.points_for_registration
+                    raw_points = working_window['local_points']
+                    raw_poses = working_window['camera_poses']
+                    registration_points, registration_mask, registration_diag = (
+                        self._select_hart_registration_input(
+                            self.registration_state.final_base_points_tail,
+                            conf_mask,
+                        )
                     )
-                    prev_camera_poses = self.registration_state.base_poses_tail
-                else:
-                    prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]
-                    prev_camera_poses = self.prev_window_cache['camera_poses'][-self.overlap:]
-                cur_local_points = working_window['local_points'][:self.overlap]
-
-                # 4️⃣ 求相似变换
-                s_d, R, t = register_adjacent_windows(
-                    prev_local_points,
-                    cur_local_points,
-                    prev_camera_poses,
-                    working_window['camera_poses'][:self.overlap],
-                    conf_mask
-                )
-
-                # 5️⃣ 统一当前窗口的深度尺度
-                working_window['local_points'] = s_d * working_window.pop('local_points')
-                # 6️⃣ 更新相机位姿
-                working_window['camera_poses'] = apply_sim3_to_pose(working_window.pop('camera_poses'), s_d, R, t)
-
-                # 7️⃣ 可选深度细化
-                if self.anchor_propagation == "legacy_iou":
-                    tgt_pcd = working_window['local_points'].cpu().numpy()
-                    tgt_sp_graph = self._build_segment_graph(
-                        working_window['local_points'],
-                        working_window['conf'],
-                        working_window.get('images'),
+                    coarse_scale, _, _ = register_adjacent_windows(
+                        registration_points,
+                        raw_points[:self.overlap],
+                        self.registration_state.final_base_poses_tail,
+                        raw_poses[:self.overlap],
+                        registration_mask,
                     )
-                    working_window['local_points'] = working_window['local_points'] * refine_depth_segments(
-                        self.prev_window_cache['local_points'].cpu().numpy(),
-                        tgt_pcd,
-                        self.anchor_sp_graph,
-                        tgt_sp_graph,
-                        self.overlap
-                    )
-                elif self.anchor_propagation == "hart":
-                    base_points = working_window['local_points']
+                    coarse_base_points = coarse_scale * raw_points
                     result = self._run_hart_propagation(
-                        base_points,
-                        working_window['camera_poses'],
+                        coarse_base_points,
                         working_window['conf'],
                         working_window.get('images'),
                     )
-                    local_scale = torch.from_numpy(
-                        result.local_scale_mask
-                    ).to(device=base_points.device, dtype=base_points.dtype)
-                    working_window['local_points'] = base_points * local_scale
-                    working_window['hart_diagnostics'] = result.diagnostics
+                    final_scale = coarse_scale * result.window_scale
+                    final_rotation, final_translation = (
+                        register_adjacent_window_pose(
+                            self.registration_state.final_base_poses_tail,
+                            raw_poses[:self.overlap],
+                            final_scale,
+                        )
+                    )
+                    final_base_points = final_scale * raw_points
+                    final_base_poses = apply_sim3_to_pose(
+                        raw_poses,
+                        final_scale,
+                        final_rotation,
+                        final_translation,
+                    )
+                    local_residual = torch.from_numpy(
+                        result.local_residual_mask
+                    ).to(
+                        device=final_base_points.device,
+                        dtype=final_base_points.dtype,
+                    )
+                    working_window['local_points'] = (
+                        final_base_points * local_residual
+                    )
+                    working_window['camera_poses'] = final_base_poses
+                    diagnostics = dict(result.diagnostics)
+                    diagnostics.update(registration_diag)
+                    diagnostics.update(
+                        coarse_registration_scale=float(
+                            torch.as_tensor(coarse_scale).detach().cpu()
+                        ),
+                        final_registration_scale=float(
+                            torch.as_tensor(final_scale).detach().cpu()
+                        ),
+                    )
+                    working_window['hart_diagnostics'] = diagnostics
+                    self._commit_hart_state(
+                        result,
+                        final_base_points,
+                        final_base_poses,
+                    )
+                else:
+                    # Legacy and disabled routes keep their original registration
+                    # contract and operate on the public cached geometry.
+                    s_d, R, t = register_adjacent_windows(
+                        self.prev_window_cache['local_points'][-self.overlap:],
+                        working_window['local_points'][:self.overlap],
+                        self.prev_window_cache['camera_poses'][-self.overlap:],
+                        working_window['camera_poses'][:self.overlap],
+                        conf_mask,
+                    )
+                    working_window['local_points'] = (
+                        s_d * working_window.pop('local_points')
+                    )
+                    working_window['camera_poses'] = apply_sim3_to_pose(
+                        working_window.pop('camera_poses'), s_d, R, t
+                    )
+
+                    if self.anchor_propagation == "legacy_iou":
+                        tgt_pcd = working_window['local_points'].cpu().numpy()
+                        tgt_sp_graph = self._build_segment_graph(
+                            working_window['local_points'],
+                            working_window['conf'],
+                            working_window.get('images'),
+                        )
+                        working_window['local_points'] = (
+                            working_window['local_points']
+                            * refine_depth_segments(
+                                self.prev_window_cache[
+                                    'local_points'
+                                ].cpu().numpy(),
+                                tgt_pcd,
+                                self.anchor_sp_graph,
+                                tgt_sp_graph,
+                                self.overlap,
+                            )
+                        )
             # ⚠️ 首窗口处理
             else:
                 # 1️⃣ 估计参考内参
@@ -495,18 +540,36 @@ class StreamingWindowEngine(VanillaEngine):
                         working_window.get('images'),
                     )
                 elif self.anchor_propagation == "hart":
-                    base_points = working_window['local_points']
+                    final_base_points = working_window['local_points']
+                    final_base_poses = working_window['camera_poses']
                     result = self._run_hart_propagation(
-                        base_points,
-                        working_window['camera_poses'],
+                        final_base_points,
                         working_window['conf'],
                         working_window.get('images'),
                     )
-                    local_scale = torch.from_numpy(
-                        result.local_scale_mask
-                    ).to(device=base_points.device, dtype=base_points.dtype)
-                    working_window['local_points'] = base_points * local_scale
-                    working_window['hart_diagnostics'] = result.diagnostics
+                    local_residual = torch.from_numpy(
+                        result.local_residual_mask
+                    ).to(
+                        device=final_base_points.device,
+                        dtype=final_base_points.dtype,
+                    )
+                    working_window['local_points'] = (
+                        final_base_points * local_residual
+                    )
+                    diagnostics = dict(result.diagnostics)
+                    diagnostics.update(
+                        coarse_registration_scale=1.0,
+                        final_registration_scale=1.0,
+                        registration_pose_support_pixels=0,
+                        registration_pose_support_used=False,
+                        registration_pose_support_fallback_count=0,
+                    )
+                    working_window['hart_diagnostics'] = diagnostics
+                    self._commit_hart_state(
+                        result,
+                        final_base_points,
+                        final_base_poses,
+                    )
 
             # ⚠️ 更新并保存窗口
             self._update_cache(working_window, tgt_sp_graph)

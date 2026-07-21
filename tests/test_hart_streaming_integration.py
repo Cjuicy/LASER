@@ -62,6 +62,11 @@ def _patch_registration_primitives(monkeypatch, captured_sources=None):
         return 1.0, torch.eye(3), torch.zeros(3)
 
     monkeypatch.setattr(swe_module, "register_adjacent_windows", register)
+    monkeypatch.setattr(
+        swe_module,
+        "register_adjacent_window_pose",
+        lambda *args: (torch.eye(3), torch.zeros(3)),
+    )
 
 
 def _run_worker(engine, windows):
@@ -70,6 +75,26 @@ def _run_worker(engine, windows):
         engine.registration_queue.put((window, 0.0))
     engine.registration_queue.put(STOP_SIGNAL)
     engine._registration_worker()
+
+
+def _fake_result(kwargs, *, window_scale=1.0, residual=1.0, support=False):
+    shape = kwargs["current_base_points"].shape[:3]
+    residual_map = np.broadcast_to(
+        np.asarray(residual, dtype=np.float32), shape
+    ).copy()
+    support_map = np.broadcast_to(np.asarray(support, dtype=bool), shape).copy()
+    next_state = AnchorPropagationState(
+        local_residual_tail=residual_map[-1:].copy(),
+        confidence_tail=np.ones(shape[-3:], dtype=np.float32)[-1:].copy(),
+        segments_tail=(),
+    )
+    return PropagationResult(
+        window_scale=float(window_scale),
+        local_residual_mask=residual_map[..., None],
+        pose_support_mask=support_map,
+        next_state=next_state,
+        diagnostics={"window_scale": float(window_scale)},
+    )
 
 
 def test_fixed_scale_pose_solver_preserves_registration_direction():
@@ -243,9 +268,17 @@ def test_legacy_route_keeps_graph_and_refine_contract(monkeypatch, tmp_path):
     assert calls == ["graph", "graph", "refine"]
 
 
-def test_hart_registration_consumes_previous_refined_points(monkeypatch, tmp_path):
-    captured_sources = []
-    _patch_registration_primitives(monkeypatch, captured_sources)
+def test_ordinary_hart_registration_uses_only_pose_support_residual(
+    monkeypatch, tmp_path
+):
+    _patch_registration_primitives(monkeypatch)
+    captured = []
+
+    def register(src_points, tgt_points, src_poses, tgt_poses, mask):
+        captured.append((src_points.detach().clone(), mask.detach().clone()))
+        return 1.0, torch.eye(3), torch.zeros(3)
+
+    monkeypatch.setattr(swe_module, "register_adjacent_windows", register)
     engine = _engine(
         tmp_path,
         depth_refine=False,
@@ -255,45 +288,52 @@ def test_hart_registration_consumes_previous_refined_points(monkeypatch, tmp_pat
     engine._build_segment_graph = lambda *args: pytest.fail("legacy graph called")
     engine._build_hart_segments = lambda *args: SimpleNamespace()
     calls = []
+    residual = np.asarray(
+        [[[2.0, 4.0, 4.0], [2.0, 4.0, 4.0]]], dtype=np.float32
+    )
+    support = np.asarray(
+        [[[True, False, False], [True, False, False]]], dtype=bool
+    )
 
     class FakePropagator:
         def refine(self, **kwargs):
             calls.append(kwargs)
-            scale = 2.0 if len(calls) == 2 else 1.0
-            shape = (*kwargs["current_base_points"].shape[:3], 1)
-            return PropagationResult(
-                local_scale_mask=np.full(shape, scale, dtype=np.float32),
-                next_state=object(),
-                diagnostics={"fake": len(calls)},
-            )
+            if len(calls) == 1:
+                return _fake_result(
+                    kwargs, residual=residual, support=support
+                )
+            return _fake_result(kwargs)
 
     engine.hart_propagator = FakePropagator()
 
-    _run_worker(engine, [_window(3.0), _window(3.0), _window(3.0)])
+    _run_worker(engine, [_window(3.0), _window(3.0)])
 
-    assert len(calls) == 3
-    np.testing.assert_array_equal(captured_sources[0][..., -1], 3.0)
-    np.testing.assert_array_equal(captured_sources[1][..., -1], 6.0)
+    assert len(calls) == 2
     np.testing.assert_array_equal(
-        calls[2]["previous_registration_state"].base_points_tail[..., -1],
+        captured[0][0][..., -1],
+        [[[6.0, 12.0, 12.0], [6.0, 12.0, 12.0]]],
+    )
+    np.testing.assert_array_equal(
+        captured[0][1],
+        [[[True, False, False], [True, False, False]]],
+    )
+    np.testing.assert_array_equal(
+        calls[1][
+            "previous_registration_state"
+        ].final_base_points_tail[..., -1],
         3.0,
     )
-    np.testing.assert_array_equal(
-        calls[2][
-            "previous_registration_state"
-        ].points_for_registration[..., -1],
-        6.0,
-    )
 
 
-def test_hart_feedback_changes_the_next_window_camera_scale(monkeypatch, tmp_path):
+def test_ordinary_hart_changes_current_window_camera_scale(monkeypatch, tmp_path):
     _patch_registration_primitives(monkeypatch)
+    final_scales = []
 
-    def register(src_points, tgt_points, src_poses, tgt_poses, mask):
-        scale = src_points[..., -1].mean() / tgt_points[..., -1].mean()
-        return float(scale), torch.eye(3), torch.zeros(3)
+    def solve(previous_poses, current_poses, scale):
+        final_scales.append(float(scale))
+        return torch.eye(3), torch.zeros(3)
 
-    monkeypatch.setattr(swe_module, "register_adjacent_windows", register)
+    monkeypatch.setattr(swe_module, "register_adjacent_window_pose", solve)
     engine = _engine(
         tmp_path,
         depth_refine=False,
@@ -306,38 +346,79 @@ def test_hart_feedback_changes_the_next_window_camera_scale(monkeypatch, tmp_pat
     class FakePropagator:
         def refine(self, **kwargs):
             calls.append(kwargs)
-            scale = 2.0 if len(calls) == 2 else 1.0
-            shape = (*kwargs["current_base_points"].shape[:3], 1)
-            return PropagationResult(
-                local_scale_mask=np.full(shape, scale, dtype=np.float32),
-                next_state=object(),
-                diagnostics={},
+            return _fake_result(
+                kwargs,
+                window_scale=2.0 if len(calls) == 2 else 1.0,
             )
 
     engine.hart_propagator = FakePropagator()
-    third = _window(3.0)
-    third["camera_poses"][:, 0, 3] = torch.tensor([1.0, 2.0])
+    second = _window(3.0)
+    second["camera_poses"][:, 0, 3] = torch.tensor([1.0, 2.0])
 
-    _run_worker(engine, [_window(3.0), _window(3.0), third])
+    _run_worker(engine, [_window(3.0), second])
 
+    assert final_scales == [2.0]
     np.testing.assert_array_equal(
         engine.prev_window_cache["camera_poses"][:, 0, 3],
         [2.0, 4.0],
     )
+    assert (
+        engine.prev_window_cache["hart_diagnostics"][
+            "final_registration_scale"
+        ]
+        == 2.0
+    )
 
 
-def test_real_hart_regional_scale_is_propagated_to_the_next_window(
+def test_ordinary_hart_applies_public_scale_and_local_residual_once(
     monkeypatch, tmp_path
 ):
-    captured_sources = []
-    _patch_registration_primitives(monkeypatch, captured_sources)
+    _patch_registration_primitives(monkeypatch)
     engine = _engine(
         tmp_path,
         depth_refine=False,
         anchor_propagation="hart",
         anchor_min_pixels=1,
     )
-    labels = np.asarray([[0, 1, 1], [0, 1, 1]], dtype=np.intp)
+    engine._build_hart_segments = lambda *args: SimpleNamespace()
+    calls = []
+    residual = np.asarray(
+        [[[0.5, 1.0, 1.0], [0.5, 1.0, 1.0]]], dtype=np.float32
+    )
+
+    class FakePropagator:
+        def refine(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 2:
+                return _fake_result(
+                    kwargs, window_scale=2.0, residual=residual
+                )
+            return _fake_result(kwargs)
+
+    engine.hart_propagator = FakePropagator()
+
+    _run_worker(engine, [_window(3.0), _window(3.0)])
+
+    np.testing.assert_array_equal(
+        engine.prev_window_cache["local_points"][..., 0, -1], 3.0
+    )
+    np.testing.assert_array_equal(
+        engine.prev_window_cache["local_points"][..., 1:, -1], 6.0
+    )
+    np.testing.assert_array_equal(
+        engine.registration_state.final_base_points_tail[..., -1], 6.0
+    )
+
+
+def test_real_hart_uniform_scale_changes_current_window(monkeypatch, tmp_path):
+    _patch_registration_primitives(monkeypatch)
+    engine = _engine(
+        tmp_path,
+        depth_refine=False,
+        anchor_propagation="hart",
+        anchor_min_pixels=1,
+    )
+    labels = np.zeros((2, 3), dtype=np.intp)
     frame = _frame_from_layers(labels, labels)
 
     def segments(base_points, *args):
@@ -347,21 +428,17 @@ def test_real_hart_regional_scale_is_propagated_to_the_next_window(
         )
 
     engine._build_hart_segments = segments
-    first = _window(3.0)
-    first["local_points"][..., 0, -1] = 6.0
     second = _window(3.0)
-    third = _window(3.0)
+    second["camera_poses"][:, 0, 3] = torch.tensor([1.0, 2.0])
 
-    _run_worker(engine, [first, second, third])
+    _run_worker(engine, [_window(6.0), second])
 
-    assert len(captured_sources) == 2
-    np.testing.assert_array_equal(captured_sources[1][..., 0, -1], 6.0)
-    np.testing.assert_array_equal(captured_sources[1][..., 1:, -1], 3.0)
+    assert engine.prev_window_cache["hart_diagnostics"]["window_scale"] == 2.0
     np.testing.assert_array_equal(
-        engine.registration_state.base_points_tail[..., 0, -1], 3.0
+        engine.prev_window_cache["camera_poses"][:, 0, 3], [2.0, 4.0]
     )
     np.testing.assert_array_equal(
-        engine.registration_state.points_for_registration[..., 0, -1], 6.0
+        engine.prev_window_cache["local_points"][..., -1], 6.0
     )
 
 
