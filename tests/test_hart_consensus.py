@@ -47,13 +47,17 @@ def test_leaf_consensus_fills_missing_anchor_cell_but_conflict_stays_one():
     frame = _frame_from_layers(initial, leaf)
     tracks = build_track_window((frame.anchor_labels,), threshold=0.3)
 
-    mask, statuses, _ = build_scale_mask(
+    mask, statuses, diagnostics = build_scale_mask(
         (frame,), tracks, {0: 2.0}, set(), threshold=0.05
     )
 
     np.testing.assert_array_equal(mask, [[[2.0, 2.0, 2.0, 2.0]]])
     assert np.all(statuses[0, :, :2] == STATUS_DIRECT)
     assert np.all(statuses[0, :, 2:] == STATUS_LEAF_FILL)
+    assert diagnostics["regional_scale_min"] == 2.0
+    assert diagnostics["regional_scale_median"] == 2.0
+    assert diagnostics["regional_scale_max"] == 2.0
+    assert "scale_mask_min" not in diagnostics
 
     conflict_mask, conflict_status, _ = build_scale_mask(
         (frame,), tracks, {}, {0}, threshold=0.05

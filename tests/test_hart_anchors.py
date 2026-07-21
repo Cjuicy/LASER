@@ -48,6 +48,7 @@ def test_direct_anchor_uses_intersection_core_and_existing_irls_direction():
     assert anchors[0].scale == 2.0
     assert anchors[0].pixel_count == 6
     assert diagnostics["direct_anchor_count"] == 1
+    assert diagnostics["pose_consensus_valid_pixels"] == 6
     np.testing.assert_array_equal(calls[0][0], current_depth[0])
     np.testing.assert_array_equal(calls[0][1], previous_depth[0])
 
@@ -74,3 +75,4 @@ def test_direct_anchor_rejects_small_high_confidence_core():
 
     assert anchors == ()
     assert diagnostics["rejected_small_core_count"] == 1
+    assert diagnostics["pose_consensus_valid_pixels"] == 2

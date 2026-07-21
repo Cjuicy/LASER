@@ -62,6 +62,9 @@ def estimate_direct_anchors(
             & (previous_depth[frame_index] > 0)
             & (current_depth[frame_index] > 0)
         )
+        diagnostics["pose_consensus_valid_pixels"] += int(
+            np.count_nonzero(prev_high & cur_high & valid_depth)
+        )
         for relation in relations:
             diagnostics["direct_anchor_candidate_count"] += 1
             core = (

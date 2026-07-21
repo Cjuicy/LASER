@@ -157,8 +157,8 @@ def build_scale_mask(
         no_anchor_pixel_ratio=float(
             np.count_nonzero(status_maps == STATUS_NO_ANCHOR) / total
         ),
-        scale_mask_min=float(mask.min()),
-        scale_mask_median=float(np.median(mask)),
-        scale_mask_max=float(mask.max()),
+        regional_scale_min=float(mask.min()),
+        regional_scale_median=float(np.median(mask)),
+        regional_scale_max=float(mask.max()),
     )
     return mask, status_maps, dict(diagnostics)

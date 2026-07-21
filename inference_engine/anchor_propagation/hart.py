@@ -6,8 +6,16 @@ import time
 import numpy as np
 
 from .anchors import estimate_direct_anchors
-from .consensus import aggregate_segment_scales, build_scale_mask
+from .consensus import (
+    STATUS_NO_ANCHOR,
+    aggregate_segment_scales,
+    build_scale_mask,
+)
 from .correspondence import build_hierarchical_tracks
+from .pose_consensus import (
+    decompose_regional_scales,
+    select_pose_consensus,
+)
 from .types import AnchorPropagationState, PropagationResult
 
 
@@ -81,7 +89,12 @@ class HartAnchorPropagator:
         )
 
         if previous_registration_state is None or previous_anchor_state is None:
-            mask = np.ones(points.shape[:3], dtype=np.float32)
+            regional_scale = np.ones(points.shape[:3], dtype=np.float32)
+            status_maps = np.full(
+                points.shape[:3], STATUS_NO_ANCHOR, dtype=np.uint8
+            )
+            direct_anchors = ()
+            segment_scales = {}
             anchor_ms = 0.0
             consensus_ms = 0.0
             consensus_diagnostics = {
@@ -89,27 +102,36 @@ class HartAnchorPropagator:
                 "filled_pixel_ratio": 0.0,
                 "conflict_pixel_ratio": 0.0,
                 "no_anchor_pixel_ratio": 1.0,
-                "scale_mask_min": 1.0,
-                "scale_mask_median": 1.0,
-                "scale_mask_max": 1.0,
+                "regional_scale_min": 1.0,
+                "regional_scale_median": 1.0,
+                "regional_scale_max": 1.0,
             }
+            anchor_diagnostics = {"pose_consensus_valid_pixels": 0}
         else:
             previous_frames = previous_anchor_state.segments_tail
             if len(previous_frames) != overlap:
                 raise ValueError("previous anchor state must contain exactly overlap frames")
-            previous_base = _numpy(previous_registration_state.base_points_tail)
+            previous_base = _numpy(
+                previous_registration_state.final_base_points_tail
+            )
             if previous_base.shape != (overlap, *points.shape[1:]):
                 raise ValueError(
                     "previous base points must contain aligned overlap frames"
                 )
-            previous_scale = np.asarray(previous_anchor_state.local_scale_tail)
-            if previous_scale.shape != (overlap, *points.shape[1:3]):
+            previous_residual = np.asarray(
+                previous_anchor_state.local_residual_tail
+            )
+            if previous_residual.shape != (overlap, *points.shape[1:3]):
                 raise ValueError(
-                    "previous local scale must contain aligned overlap frames"
+                    "previous local residual must contain aligned overlap frames"
                 )
-            if np.any(~np.isfinite(previous_scale)) or np.any(previous_scale <= 0):
-                raise ValueError("previous local scale must be finite and positive")
-            previous_depth = previous_base[..., -1] * previous_scale
+            if np.any(~np.isfinite(previous_residual)) or np.any(
+                previous_residual <= 0
+            ):
+                raise ValueError(
+                    "previous local residual must be finite and positive"
+                )
+            previous_depth = previous_base[..., -1] * previous_residual
             current_depth = points[:overlap, ..., -1]
             previous_confidence = np.asarray(previous_anchor_state.confidence_tail)
             if previous_confidence.shape != (overlap, *points.shape[1:3]):
@@ -142,7 +164,7 @@ class HartAnchorPropagator:
             segment_scales, conflict_segments = aggregate_segment_scales(
                 direct_anchors, self.scale_consistency_thresh
             )
-            mask, _, consensus_diagnostics = build_scale_mask(
+            regional_scale, status_maps, consensus_diagnostics = build_scale_mask(
                 current_segments.frames,
                 anchor_tracks,
                 segment_scales,
@@ -151,20 +173,63 @@ class HartAnchorPropagator:
             )
             consensus_ms = (time.perf_counter() - consensus_start) * 1000.0
 
+        pose_consensus = select_pose_consensus(
+            direct_anchors,
+            segment_scales,
+            valid_pixel_count=int(
+                anchor_diagnostics.get("pose_consensus_valid_pixels", 0)
+            ),
+            threshold=self.scale_consistency_thresh,
+        )
+        segment_maps = np.stack(
+            [
+                segment_ids[frame.anchor_labels]
+                for frame, segment_ids in zip(
+                    current_segments.frames,
+                    anchor_tracks.segment_ids,
+                    strict=True,
+                )
+            ]
+        )
+        local_residual, pose_support = decompose_regional_scales(
+            regional_scale,
+            status_maps,
+            segment_maps,
+            window_scale=pose_consensus.window_scale,
+            pose_segment_ids=pose_consensus.segment_ids,
+        )
+
         diagnostics.update(consensus_diagnostics)
         diagnostics.update(
+            window_scale=pose_consensus.window_scale,
+            pose_consensus_group_count=pose_consensus.group_count,
+            pose_consensus_selected_segment_count=len(
+                pose_consensus.segment_ids
+            ),
+            pose_consensus_support_pixels=pose_consensus.support_pixels,
+            pose_consensus_valid_pixels=pose_consensus.valid_pixels,
+            pose_consensus_support_ratio=pose_consensus.support_ratio,
+            pose_consensus_accepted=pose_consensus.accepted,
+            pose_support_pixel_ratio=float(
+                np.count_nonzero(pose_support) / max(pose_support.size, 1)
+            ),
+            local_residual_min=float(local_residual.min()),
+            local_residual_median=float(np.median(local_residual)),
+            local_residual_max=float(local_residual.max()),
             correspondence_runtime_ms=correspondence_ms,
             anchor_runtime_ms=anchor_ms,
             consensus_runtime_ms=consensus_ms,
             propagation_runtime_ms=(time.perf_counter() - start) * 1000.0,
         )
         next_state = AnchorPropagationState(
-            local_scale_tail=mask[-overlap:].copy(),
+            local_residual_tail=local_residual[-overlap:].copy(),
             confidence_tail=confidence[-overlap:].copy(),
             segments_tail=tuple(current_segments.frames[-overlap:]),
         )
         return PropagationResult(
-            local_scale_mask=mask[..., None],
+            window_scale=pose_consensus.window_scale,
+            local_residual_mask=local_residual[..., None],
+            pose_support_mask=pose_support,
             next_state=next_state,
             diagnostics=dict(diagnostics),
         )
