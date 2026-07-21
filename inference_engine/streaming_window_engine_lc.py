@@ -7,6 +7,7 @@ import time
 from .streaming_window_engine import StreamingWindowEngine, STOP_SIGNAL
 from .inference_utils import (
     register_adjacent_windows,
+    register_adjacent_window_pose,
     estimate_pseudo_depth_and_intrinsics,
     unproject_depth_to_local_points,
     refine_depth_segments
@@ -91,65 +92,122 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                                                   self.top_conf_percentile, interpolation='nearest')
                 conf_mask = (self.prev_window_cache['conf'][-self.overlap:] >= prev_conf_thresh) & tgt_mask
 
-                # metric depth align
                 if self.anchor_propagation == "hart":
-                    prev_local_points = (
-                        self.registration_state.points_for_registration
+                    raw_points = working_window['local_points']
+                    raw_poses = working_window['camera_poses']
+                    registration_points, registration_mask, registration_diag = (
+                        self._select_hart_registration_input(
+                            self.prev_window_cache['local_points'][
+                                -self.overlap:
+                            ],
+                            conf_mask,
+                        )
+                    )
+                    coarse_scale, coarse_rotation, coarse_translation = (
+                        register_adjacent_windows(
+                            registration_points,
+                            raw_points[:self.overlap],
+                            self.prev_window_cache['camera_poses'][
+                                -self.overlap:
+                            ],
+                            raw_poses[:self.overlap],
+                            registration_mask,
+                        )
+                    )
+                    coarse_pairwise = (
+                        coarse_scale,
+                        coarse_rotation,
+                        coarse_translation,
+                    )
+                    coarse_cumulative = accumulate_sim3(
+                        self.registration_state.cumulative_sim3,
+                        coarse_pairwise,
+                    )
+                    coarse_base_points = coarse_cumulative[0] * raw_points
+                    result = self._run_hart_propagation(
+                        coarse_base_points,
+                        working_window['conf'],
+                        working_window.get('images'),
+                    )
+                    final_pair_scale = coarse_scale * result.window_scale
+                    final_rotation, final_translation = (
+                        register_adjacent_window_pose(
+                            self.prev_window_cache['camera_poses'][
+                                -self.overlap:
+                            ],
+                            raw_poses[:self.overlap],
+                            final_pair_scale,
+                        )
+                    )
+                    final_pairwise = (
+                        final_pair_scale,
+                        final_rotation,
+                        final_translation,
+                    )
+                    final_cumulative = accumulate_sim3(
+                        self.registration_state.cumulative_sim3,
+                        final_pairwise,
+                    )
+                    final_base_points = final_cumulative[0] * raw_points
+                    final_base_poses = apply_sim3_to_pose(
+                        raw_poses,
+                        *final_cumulative,
+                    )
+                    working_window['sim3'] = final_pairwise
+                    working_window['local_residual_mask'] = torch.from_numpy(
+                        result.local_residual_mask
+                    ).to(
+                        device=raw_points.device,
+                        dtype=raw_points.dtype,
+                    )
+                    diagnostics = dict(result.diagnostics)
+                    diagnostics.update(registration_diag)
+                    diagnostics.update(
+                        coarse_registration_scale=float(
+                            torch.as_tensor(coarse_scale).detach().cpu()
+                        ),
+                        final_registration_scale=float(
+                            torch.as_tensor(final_pair_scale).detach().cpu()
+                        ),
+                        final_cumulative_scale=float(
+                            torch.as_tensor(
+                                final_cumulative[0]
+                            ).detach().cpu()
+                        ),
+                    )
+                    working_window['hart_diagnostics'] = diagnostics
+                    self._commit_hart_state(
+                        result,
+                        final_base_points,
+                        final_base_poses,
+                        cumulative_sim3=final_cumulative,
                     )
                 else:
-                    prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]
-                cur_local_points = working_window['local_points'][:self.overlap]
+                    s_d, R, t = register_adjacent_windows(
+                        self.prev_window_cache['local_points'][-self.overlap:],
+                        working_window['local_points'][:self.overlap],
+                        self.prev_window_cache['camera_poses'][-self.overlap:],
+                        working_window['camera_poses'][:self.overlap],
+                        conf_mask,
+                    )
+                    working_window['sim3'] = s_d, R, t
 
-                s_d, R, t = register_adjacent_windows(
-                    prev_local_points,
-                    cur_local_points,
-                    self.prev_window_cache['camera_poses'][-self.overlap:],
-                    working_window['camera_poses'][:self.overlap],
-                    conf_mask
-                )
-
-                working_window['sim3'] = s_d, R, t
-                # working_window['local_points'] = s_d * working_window.pop('local_points')
-                # working_window['camera_poses'] = apply_sim3_to_pose(working_window.pop('camera_poses'), s_d, R, t)
-
-                if self.anchor_propagation == "legacy_iou":
-                    tgt_pcd = working_window['local_points'].cpu().numpy()
-                    tgt_sp_graph = self._build_segment_graph(
-                        working_window['local_points'],
-                        working_window['conf'],
-                        working_window.get('images'),
-                    )
-                    working_window['scale_mask'] = refine_depth_segments(
-                        self.prev_window_cache['local_points'].cpu().numpy(),
-                        tgt_pcd,
-                        self.anchor_sp_graph,
-                        tgt_sp_graph,
-                        self.overlap
-                    )
-                elif self.anchor_propagation == "hart":
-                    cumulative_sim3 = accumulate_sim3(
-                        self.registration_state.cumulative_sim3,
-                        working_window['sim3'],
-                    )
-                    base_points = cumulative_sim3[0] * working_window['local_points']
-                    base_poses = apply_sim3_to_pose(
-                        working_window['camera_poses'], *cumulative_sim3
-                    )
-                    result = self._run_hart_propagation(
-                        base_points,
-                        base_poses,
-                        working_window['conf'],
-                        working_window.get('images'),
-                        cumulative_sim3=cumulative_sim3,
-                        registration_base_points=working_window['local_points'],
-                    )
-                    working_window['local_scale_mask'] = torch.from_numpy(
-                        result.local_scale_mask
-                    ).to(
-                        device=working_window['local_points'].device,
-                        dtype=working_window['local_points'].dtype,
-                    )
-                    working_window['hart_diagnostics'] = result.diagnostics
+                    if self.anchor_propagation == "legacy_iou":
+                        tgt_pcd = working_window['local_points'].cpu().numpy()
+                        tgt_sp_graph = self._build_segment_graph(
+                            working_window['local_points'],
+                            working_window['conf'],
+                            working_window.get('images'),
+                        )
+                        working_window['scale_mask'] = refine_depth_segments(
+                            self.prev_window_cache[
+                                'local_points'
+                            ].cpu().numpy(),
+                            tgt_pcd,
+                            self.anchor_sp_graph,
+                            tgt_sp_graph,
+                            self.overlap,
+                        )
             else:
                 _, intrinsic_ = estimate_pseudo_depth_and_intrinsics(working_window['local_points'])
                 ref_intrinsic = intrinsic_[0]
@@ -173,19 +231,31 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     cumulative_sim3 = working_window['sim3']
                     result = self._run_hart_propagation(
                         working_window['local_points'],
-                        working_window['camera_poses'],
                         working_window['conf'],
                         working_window.get('images'),
-                        cumulative_sim3=cumulative_sim3,
-                        registration_base_points=working_window['local_points'],
                     )
-                    working_window['local_scale_mask'] = torch.from_numpy(
-                        result.local_scale_mask
+                    working_window['local_residual_mask'] = torch.from_numpy(
+                        result.local_residual_mask
                     ).to(
                         device=working_window['local_points'].device,
                         dtype=working_window['local_points'].dtype,
                     )
-                    working_window['hart_diagnostics'] = result.diagnostics
+                    diagnostics = dict(result.diagnostics)
+                    diagnostics.update(
+                        coarse_registration_scale=1.0,
+                        final_registration_scale=1.0,
+                        final_cumulative_scale=1.0,
+                        registration_pose_support_pixels=0,
+                        registration_pose_support_used=False,
+                        registration_pose_support_fallback_count=0,
+                    )
+                    working_window['hart_diagnostics'] = diagnostics
+                    self._commit_hart_state(
+                        result,
+                        working_window['local_points'],
+                        working_window['camera_poses'],
+                        cumulative_sim3=cumulative_sim3,
+                    )
 
             self._update_cache(working_window, tgt_sp_graph)
             self._save_cache()
@@ -206,10 +276,10 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             # apply local to world transformation
             cache_sim3 = cache['sim3']
             s_d, R, t = accumulate_sim3(ref_sim3, cache_sim3)
-            if 'local_scale_mask' in cache.keys():
+            if 'local_residual_mask' in cache.keys():
                 cache['local_points'] = (
                     s_d
-                    * cache.pop('local_scale_mask')
+                    * cache.pop('local_residual_mask')
                     * cache.pop('local_points')
                 )
             elif 'scale_mask' in cache.keys():

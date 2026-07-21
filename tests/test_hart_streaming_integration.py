@@ -442,14 +442,16 @@ def test_real_hart_uniform_scale_changes_current_window(monkeypatch, tmp_path):
     )
 
 
-def _cache(depth, sim3_scale, *, local_mask=None, legacy_mask=None):
+def _cache(depth, sim3_scale, *, local_residual=None, legacy_mask=None):
     cache = {
         "local_points": torch.full((1, 1, 1, 3), depth),
         "camera_poses": torch.eye(4)[None],
         "sim3": (sim3_scale, torch.eye(3), torch.zeros(3)),
     }
-    if local_mask is not None:
-        cache["local_scale_mask"] = torch.full((1, 1, 1, 1), local_mask)
+    if local_residual is not None:
+        cache["local_residual_mask"] = torch.full(
+            (1, 1, 1, 1), local_residual
+        )
     if legacy_mask is not None:
         cache["scale_mask"] = torch.full((1, 1, 1, 1), legacy_mask)
     return cache
@@ -458,8 +460,8 @@ def _cache(depth, sim3_scale, *, local_mask=None, legacy_mask=None):
 def test_lc_hart_applies_optimized_global_scale_and_local_residual_once():
     aggregated = StreamingWindowEngineLC.aggregate_caches(
         [
-            _cache(3.0, 1.0, local_mask=2.0),
-            _cache(3.0, 2.0, local_mask=4.0),
+            _cache(3.0, 1.0, local_residual=2.0),
+            _cache(3.0, 2.0, local_residual=4.0),
         ]
     )
 
@@ -468,9 +470,7 @@ def test_lc_hart_applies_optimized_global_scale_and_local_residual_once():
     np.testing.assert_array_equal(points[1], 24.0)
 
 
-def test_lc_worker_keeps_raw_points_and_tracks_cumulative_base_scale(
-    monkeypatch, tmp_path
-):
+def _patch_lc_registration_primitives(monkeypatch, captured_sources=None):
     monkeypatch.setattr(
         swe_lc_module,
         "estimate_pseudo_depth_and_intrinsics",
@@ -485,13 +485,24 @@ def test_lc_worker_keeps_raw_points_and_tracks_cumulative_base_scale(
     monkeypatch.setattr(
         swe_lc_module, "unproject_depth_to_local_points", unproject
     )
-    captured_sources = []
 
     def register(src_points, *args):
-        captured_sources.append(src_points.detach().clone())
+        if captured_sources is not None:
+            captured_sources.append(src_points.detach().clone())
         return 2.0, torch.eye(3), torch.zeros(3)
 
     monkeypatch.setattr(swe_lc_module, "register_adjacent_windows", register)
+    monkeypatch.setattr(
+        swe_lc_module,
+        "register_adjacent_window_pose",
+        lambda *args: (torch.eye(3), torch.zeros(3)),
+    )
+
+
+def test_lc_worker_couples_window_scale_into_current_pairwise_sim3(
+    monkeypatch, tmp_path
+):
+    _patch_lc_registration_primitives(monkeypatch)
     engine = StreamingWindowEngineLC(
         torch.nn.Identity(),
         inference_device="cpu",
@@ -511,24 +522,75 @@ def test_lc_worker_keeps_raw_points_and_tracks_cumulative_base_scale(
     class FakePropagator:
         def refine(self, **kwargs):
             calls.append(kwargs)
-            scale = 2.0 if len(calls) == 2 else 1.0
-            shape = (*kwargs["current_base_points"].shape[:3], 1)
-            return PropagationResult(
-                local_scale_mask=np.full(shape, scale, dtype=np.float32),
-                next_state=object(),
-                diagnostics={},
+            return _fake_result(
+                kwargs,
+                window_scale=1.5 if len(calls) == 2 else 1.0,
+                residual=2.0 if len(calls) == 2 else 1.0,
+                support=len(calls) == 2,
             )
+
+    engine.hart_propagator = FakePropagator()
+    _run_worker(engine, [_window(3.0), _window(3.0)])
+
+    np.testing.assert_array_equal(
+        engine.prev_window_cache["local_points"][..., -1], 3.0
+    )
+    np.testing.assert_array_equal(calls[1]["current_base_points"][..., -1], 6.0)
+    assert engine.prev_window_cache["sim3"][0] == pytest.approx(3.0)
+    assert engine.registration_state.cumulative_sim3[0] == pytest.approx(3.0)
+    np.testing.assert_array_equal(
+        engine.registration_state.final_base_points_tail[..., -1], 9.0
+    )
+    np.testing.assert_array_equal(
+        engine.prev_window_cache["local_residual_mask"], 2.0
+    )
+    assert (
+        engine.prev_window_cache["hart_diagnostics"][
+            "final_registration_scale"
+        ]
+        == pytest.approx(3.0)
+    )
+
+
+def test_lc_registration_uses_previous_raw_residual_on_support(
+    monkeypatch, tmp_path
+):
+    captured_sources = []
+    _patch_lc_registration_primitives(monkeypatch, captured_sources)
+    engine = StreamingWindowEngineLC(
+        torch.nn.Identity(),
+        inference_device="cpu",
+        dtype=torch.float32,
+        process_device="cpu",
+        cache_root=str(tmp_path),
+        window_size=2,
+        overlap=1,
+        depth_refine=False,
+        anchor_propagation="hart",
+        anchor_min_pixels=1,
+    )
+    engine._save_cache = lambda: None
+    engine._build_hart_segments = lambda *args: SimpleNamespace()
+    calls = []
+
+    class FakePropagator:
+        def refine(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 2:
+                return _fake_result(
+                    kwargs,
+                    window_scale=1.5,
+                    residual=2.0,
+                    support=True,
+                )
+            return _fake_result(kwargs)
 
     engine.hart_propagator = FakePropagator()
     _run_worker(engine, [_window(3.0), _window(3.0), _window(3.0)])
 
-    np.testing.assert_array_equal(engine.prev_window_cache["local_points"][..., -1], 3.0)
-    np.testing.assert_array_equal(calls[1]["current_base_points"][..., -1], 6.0)
-    np.testing.assert_array_equal(calls[2]["current_base_points"][..., -1], 12.0)
     np.testing.assert_array_equal(captured_sources[0][..., -1], 3.0)
     np.testing.assert_array_equal(captured_sources[1][..., -1], 6.0)
-    assert engine.registration_state.cumulative_sim3[0] == 4.0
-    assert "local_scale_mask" in engine.prev_window_cache
+    assert not torch.any(captured_sources[1][..., -1] == 9.0)
 
 
 def test_lc_legacy_scale_mask_semantics_are_unchanged():
