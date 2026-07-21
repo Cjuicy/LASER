@@ -115,7 +115,7 @@ See [docs/unified-segmentation-cloud-validation.md](docs/unified-segmentation-cl
 for branch checkout, CPU smoke tests, full regression tests, and matched cloud commands
 for all four modes.
 
-### HART anchor propagation
+### HART v2 pose-consensus coupling
 
 The four segmentation modes can share the hierarchy-aware HART sidecar without changing
 the legacy IoU path:
@@ -133,12 +133,14 @@ python demo.py \
 ```
 
 Use `--anchor_propagation none`, `legacy_iou`, or `hart`. Omitting it preserves the
-original `--depth_refine` behavior. HART feeds each refined overlap tail into the next
-window registration, so its point-cloud correction propagates through subsequent Sim(3)
-and camera poses instead of affecting only the current output. See
+original `--depth_refine` behavior. HART v2 separates each reliable regional scale into
+a window-wide pose-consensus scale and a local residual. The consensus scale immediately
+updates the current-window Sim(3) and camera poses; only direct pixels in the accepted
+consensus group support the next registration, while the residual refines output geometry.
+See
 [docs/hart-anchor-propagation-cloud-validation.md](docs/hart-anchor-propagation-cloud-validation.md)
-for the four-mode CPU smoke test, full validation, ordinary inference, and loop-closure
-commands.
+for the four-mode CPU smoke test, exact cloud setup, matched `none`/`hart` runs,
+diagnostics, ATE interpretation, and loop-closure commands.
 
 ### Loop-closure inference
 Loop-closure requires additional dependencies for package `faiss` can be installed through:

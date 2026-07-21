@@ -72,8 +72,9 @@ def verify_mode(mode, point_maps, confidence, rgb):
         n_jobs=1,
     )
     registration_state = RegistrationState(
-        base_points_tail=torch.from_numpy(point_maps[-overlap:]),
-        base_poses_tail=torch.eye(4).repeat(overlap, 1, 1),
+        final_base_points_tail=torch.from_numpy(point_maps[-overlap:]),
+        final_base_poses_tail=torch.eye(4).repeat(overlap, 1, 1),
+        pose_support_mask_tail=first.pose_support_mask[-overlap:].copy(),
     )
     second = propagator.refine(
         previous_registration_state=registration_state,
@@ -83,18 +84,35 @@ def verify_mode(mode, point_maps, confidence, rgb):
         current_segments=current_segments,
         overlap=overlap,
     )
-    mask = second.local_scale_mask
-    if mask.shape != (*current_points.shape[:3], 1):
-        raise AssertionError(f"unexpected HART mask shape: {mask.shape}")
-    if np.any(~np.isfinite(mask)) or np.any(mask <= 0):
-        raise AssertionError("HART mask contains invalid scale values")
+    residual = second.local_residual_mask
+    if residual.shape != (*current_points.shape[:3], 1):
+        raise AssertionError(
+            f"unexpected HART residual shape: {residual.shape}"
+        )
+    if np.any(~np.isfinite(residual)) or np.any(residual <= 0):
+        raise AssertionError("HART residual contains invalid scale values")
     direct_count = int(second.diagnostics.get("direct_anchor_count", 0))
     if direct_count < 1:
         raise AssertionError(f"mode={mode} produced no direct anchor")
+    if not np.isclose(second.window_scale, 1.25, rtol=1e-4):
+        raise AssertionError(
+            f"mode={mode} expected g=1.25, got {second.window_scale:.6f}"
+        )
+    if not np.allclose(residual, 1.0, rtol=1e-4):
+        raise AssertionError(
+            f"mode={mode} did not isolate uniform scale into g"
+        )
+    support_pixels = int(np.count_nonzero(second.pose_support_mask))
+    if support_pixels < 1:
+        raise AssertionError(f"mode={mode} produced no pose support")
+    support_ratio = support_pixels / second.pose_support_mask.size
     print(
         f"[PASS] mode={mode} direct_anchors={direct_count} "
-        f"scale_min={mask.min():.4f} scale_median={np.median(mask):.4f} "
-        f"scale_max={mask.max():.4f}"
+        f"g={second.window_scale:.4f} "
+        f"residual_min={residual.min():.4f} "
+        f"residual_median={np.median(residual):.4f} "
+        f"residual_max={residual.max():.4f} "
+        f"pose_support_ratio={support_ratio:.4f}"
     )
 
 

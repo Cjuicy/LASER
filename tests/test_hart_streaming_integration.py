@@ -410,6 +410,38 @@ def test_ordinary_hart_applies_public_scale_and_local_residual_once(
     )
 
 
+def test_hart_cache_save_reports_pose_coupling_diagnostics(capsys, tmp_path):
+    engine = _engine(
+        tmp_path,
+        depth_refine=False,
+        anchor_propagation="hart",
+    )
+    engine.temp_cache_dir = tmp_path
+    engine.prev_window_cache = {
+        "hart_diagnostics": {
+            "coarse_registration_scale": 2.0,
+            "window_scale": 1.5,
+            "final_registration_scale": 3.0,
+            "pose_consensus_accepted": True,
+            "pose_consensus_support_ratio": 0.75,
+            "registration_pose_support_used": False,
+            "registration_pose_support_fallback_count": 1,
+            "local_residual_min": 0.8,
+            "local_residual_median": 1.0,
+            "local_residual_max": 1.2,
+        }
+    }
+
+    engine._save_cache()
+
+    line = capsys.readouterr().out.splitlines()[-1]
+    assert line.startswith("[HART v2] window=0 ")
+    assert "coarse=2.000000 g=1.500000 final=3.000000" in line
+    assert "consensus=True support_ratio=0.750000" in line
+    assert "registration_support=False fallbacks=1" in line
+    assert "residual=[0.800000,1.000000,1.200000]" in line
+
+
 def test_real_hart_uniform_scale_changes_current_window(monkeypatch, tmp_path):
     _patch_registration_primitives(monkeypatch)
     engine = _engine(

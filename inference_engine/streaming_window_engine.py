@@ -328,6 +328,24 @@ class StreamingWindowEngine(VanillaEngine):
 
     # 把当前已经完成配准的窗口写入磁盘
     def _save_cache(self):
+        diagnostics = self.prev_window_cache.get('hart_diagnostics')
+        if isinstance(diagnostics, dict):
+            print(
+                f"[HART v2] window={self.cache_id} "
+                f"coarse={float(diagnostics['coarse_registration_scale']):.6f} "
+                f"g={float(diagnostics['window_scale']):.6f} "
+                f"final={float(diagnostics['final_registration_scale']):.6f} "
+                f"consensus={bool(diagnostics['pose_consensus_accepted'])} "
+                f"support_ratio={float(diagnostics['pose_consensus_support_ratio']):.6f} "
+                "registration_support="
+                f"{bool(diagnostics['registration_pose_support_used'])} "
+                "fallbacks="
+                f"{int(diagnostics['registration_pose_support_fallback_count'])} "
+                "residual=["
+                f"{float(diagnostics['local_residual_min']):.6f},"
+                f"{float(diagnostics['local_residual_median']):.6f},"
+                f"{float(diagnostics['local_residual_max']):.6f}]"
+            )
         torch.save(self.prev_window_cache, self.temp_cache_dir / f'window_cache_{self.cache_id}.pt')
         self.cache_id += 1
 
