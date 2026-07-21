@@ -45,6 +45,7 @@ from . import VanillaEngine
 from .inference_utils import (
     dict_to_device,
     register_adjacent_windows,
+    register_adjacent_window_pose,
     estimate_pseudo_depth_and_intrinsics,
     unproject_depth_to_local_points,
     apply_sim3_to_pose,
@@ -254,14 +255,11 @@ class StreamingWindowEngine(VanillaEngine):
     def _run_hart_propagation(
         self,
         base_points,
-        base_poses,
         confidence,
         images=None,
-        cumulative_sim3=None,
-        registration_base_points=None,
     ):
         segments = self._build_hart_segments(base_points, confidence, images)
-        result = self.hart_propagator.refine(
+        return self.hart_propagator.refine(
             previous_registration_state=self.registration_state,
             previous_anchor_state=self.anchor_propagation_state,
             current_base_points=base_points,
@@ -269,23 +267,64 @@ class StreamingWindowEngine(VanillaEngine):
             current_segments=segments,
             overlap=self.overlap,
         )
-        local_scale = torch.from_numpy(result.local_scale_mask).to(
-            device=base_points.device,
-            dtype=base_points.dtype,
-        )
-        if registration_base_points is None:
-            registration_base_points = base_points
-        propagated_points = registration_base_points * local_scale
+
+    def _select_hart_registration_input(self, fallback_points, mutual_mask):
+        if self.registration_state is None or self.anchor_propagation_state is None:
+            raise RuntimeError("HART registration state is not initialized")
+        expected_shape = tuple(fallback_points.shape[:3])
+        if tuple(mutual_mask.shape) != expected_shape:
+            raise ValueError("mutual confidence mask must align with fallback points")
+
+        support = torch.from_numpy(
+            self.registration_state.pose_support_mask_tail
+        ).to(device=fallback_points.device, dtype=torch.bool)
+        residual = torch.from_numpy(
+            self.anchor_propagation_state.local_residual_tail
+        ).to(device=fallback_points.device, dtype=fallback_points.dtype)
+        if tuple(support.shape) != expected_shape:
+            raise ValueError("pose support tail must align with fallback points")
+        if tuple(residual.shape) != expected_shape:
+            raise ValueError("local residual tail must align with fallback points")
+
+        mutual = mutual_mask.to(device=fallback_points.device, dtype=torch.bool)
+        candidate = mutual & support
+        support_pixels = int(torch.count_nonzero(candidate).item())
+        use_support = support_pixels >= self.anchor_min_pixels
+        diagnostics = {
+            "registration_pose_support_pixels": support_pixels,
+            "registration_pose_support_used": use_support,
+            "registration_pose_support_fallback_count": int(not use_support),
+        }
+        if not use_support:
+            return fallback_points, mutual, diagnostics
+        return fallback_points * residual[..., None], candidate, diagnostics
+
+    def _commit_hart_state(
+        self,
+        result,
+        final_base_points,
+        final_base_poses,
+        cumulative_sim3=None,
+    ):
+        if final_base_points.ndim != 4 or final_base_points.shape[-1] != 3:
+            raise ValueError("final Base points must have shape (N,H,W,3)")
+        if final_base_poses.shape != (final_base_points.shape[0], 4, 4):
+            raise ValueError("final Base poses must align with final Base points")
+        if result.pose_support_mask.shape != tuple(final_base_points.shape[:3]):
+            raise ValueError("pose support mask must align with final Base points")
         self.registration_state = RegistrationState(
-            base_points_tail=base_points[-self.overlap:].detach().clone(),
-            base_poses_tail=base_poses[-self.overlap:].detach().clone(),
-            propagated_points_tail=(
-                propagated_points[-self.overlap:].detach().clone()
+            final_base_points_tail=(
+                final_base_points[-self.overlap:].detach().clone()
+            ),
+            final_base_poses_tail=(
+                final_base_poses[-self.overlap:].detach().clone()
+            ),
+            pose_support_mask_tail=(
+                result.pose_support_mask[-self.overlap:].copy()
             ),
             cumulative_sim3=cumulative_sim3,
         )
         self.anchor_propagation_state = result.next_state
-        return result
 
     # 把当前已经完成配准的窗口写入磁盘
     def _save_cache(self):

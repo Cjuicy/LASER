@@ -207,8 +207,28 @@ def register_adjacent_windows(
         mask
     )
 
-    R, t = register_func(tgt_cam_overlap, src_cam_overlap, scale=s_d)
+    R, t = register_adjacent_window_pose(
+        src_cam_overlap,
+        tgt_cam_overlap,
+        s_d,
+        register_func=register_func,
+    )
     return s_d, R, t
+
+
+def register_adjacent_window_pose(
+    src_cam_overlap,
+    tgt_cam_overlap,
+    scale,
+    register_func=register_camera_poses_kabsch_pytorch,
+):
+    """Solve the target-to-source pose transform at a prescribed scale."""
+    scale_tensor = torch.as_tensor(scale)
+    if scale_tensor.numel() != 1 or not bool(torch.isfinite(scale_tensor)):
+        raise ValueError("registration scale must be finite")
+    if float(scale_tensor) <= 0:
+        raise ValueError("registration scale must be positive")
+    return register_func(tgt_cam_overlap, src_cam_overlap, scale=scale)
 
 
 def align_cam_pts_irls(

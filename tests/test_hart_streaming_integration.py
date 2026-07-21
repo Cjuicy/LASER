@@ -6,9 +6,12 @@ import torch
 
 from inference_engine import streaming_window_engine as swe_module
 from inference_engine import streaming_window_engine_lc as swe_lc_module
+from inference_engine.inference_utils import register_adjacent_window_pose
 from inference_engine.anchor_propagation.segmentation import _frame_from_layers
 from inference_engine.anchor_propagation.types import (
+    AnchorPropagationState,
     PropagationResult,
+    RegistrationState,
     SegmentationWindow,
 )
 from inference_engine.streaming_window_engine import StreamingWindowEngine, STOP_SIGNAL
@@ -67,6 +70,148 @@ def _run_worker(engine, windows):
         engine.registration_queue.put((window, 0.0))
     engine.registration_queue.put(STOP_SIGNAL)
     engine._registration_worker()
+
+
+def test_fixed_scale_pose_solver_preserves_registration_direction():
+    previous_poses = torch.eye(4).repeat(2, 1, 1)
+    current_poses = torch.eye(4).repeat(2, 1, 1)
+    calls = []
+
+    def solve(src_poses, tgt_poses, *, scale):
+        calls.append((src_poses, tgt_poses, scale))
+        return torch.eye(3), torch.ones(3)
+
+    rotation, translation = register_adjacent_window_pose(
+        previous_poses,
+        current_poses,
+        2.0,
+        register_func=solve,
+    )
+
+    assert calls == [(current_poses, previous_poses, 2.0)]
+    np.testing.assert_array_equal(rotation, torch.eye(3))
+    np.testing.assert_array_equal(translation, torch.ones(3))
+
+
+def _set_hart_tail_state(engine, *, residual, support):
+    points = torch.zeros((1, 2, 3, 3), dtype=torch.float32)
+    points[..., -1] = 3.0
+    engine.registration_state = RegistrationState(
+        final_base_points_tail=points,
+        final_base_poses_tail=torch.eye(4)[None],
+        pose_support_mask_tail=np.asarray(support, dtype=bool).reshape(1, 2, 3),
+    )
+    engine.anchor_propagation_state = AnchorPropagationState(
+        local_residual_tail=np.asarray(residual, dtype=np.float32).reshape(1, 2, 3),
+        confidence_tail=np.ones((1, 2, 3), dtype=np.float32),
+        segments_tail=(),
+    )
+    return points
+
+
+def test_registration_support_uses_base_times_residual(tmp_path):
+    engine = _engine(
+        tmp_path,
+        depth_refine=False,
+        anchor_propagation="hart",
+        anchor_min_pixels=2,
+    )
+    fallback = _set_hart_tail_state(
+        engine,
+        residual=[2.0, 1.0, 1.0, 2.0, 1.0, 1.0],
+        support=[True, False, False, True, False, False],
+    )
+
+    points, mask, diagnostics = engine._select_hart_registration_input(
+        fallback,
+        torch.ones((1, 2, 3), dtype=torch.bool),
+    )
+
+    np.testing.assert_array_equal(
+        points[..., -1],
+        [[[6.0, 3.0, 3.0], [6.0, 3.0, 3.0]]],
+    )
+    np.testing.assert_array_equal(
+        mask,
+        [[[True, False, False], [True, False, False]]],
+    )
+    assert diagnostics == {
+        "registration_pose_support_pixels": 2,
+        "registration_pose_support_used": True,
+        "registration_pose_support_fallback_count": 0,
+    }
+
+
+def test_registration_support_falls_back_to_unmodified_base(tmp_path):
+    engine = _engine(
+        tmp_path,
+        depth_refine=False,
+        anchor_propagation="hart",
+        anchor_min_pixels=3,
+    )
+    fallback = _set_hart_tail_state(
+        engine,
+        residual=[2.0, 1.0, 1.0, 2.0, 1.0, 1.0],
+        support=[True, False, False, True, False, False],
+    )
+    mutual = torch.ones((1, 2, 3), dtype=torch.bool)
+
+    points, mask, diagnostics = engine._select_hart_registration_input(
+        fallback,
+        mutual,
+    )
+
+    np.testing.assert_array_equal(points[..., -1], 3.0)
+    np.testing.assert_array_equal(mask, mutual)
+    assert diagnostics == {
+        "registration_pose_support_pixels": 2,
+        "registration_pose_support_used": False,
+        "registration_pose_support_fallback_count": 1,
+    }
+
+
+def test_commit_hart_state_waits_for_final_base_and_pose(tmp_path):
+    engine = _engine(
+        tmp_path,
+        depth_refine=False,
+        anchor_propagation="hart",
+        anchor_min_pixels=1,
+    )
+    final_base = torch.zeros((2, 2, 3, 3), dtype=torch.float32)
+    final_base[..., -1] = 7.0
+    final_poses = torch.eye(4).repeat(2, 1, 1)
+    final_poses[:, 0, 3] = torch.tensor([4.0, 5.0])
+    next_state = AnchorPropagationState(
+        local_residual_tail=np.ones((1, 2, 3), dtype=np.float32),
+        confidence_tail=np.ones((1, 2, 3), dtype=np.float32),
+        segments_tail=(),
+    )
+    result = PropagationResult(
+        window_scale=1.0,
+        local_residual_mask=np.ones((2, 2, 3, 1), dtype=np.float32),
+        pose_support_mask=np.asarray(
+            [
+                [[False, False, False], [False, False, False]],
+                [[True, False, False], [True, False, False]],
+            ]
+        ),
+        next_state=next_state,
+        diagnostics={},
+    )
+
+    engine._commit_hart_state(result, final_base, final_poses)
+
+    np.testing.assert_array_equal(
+        engine.registration_state.final_base_points_tail[..., -1], 7.0
+    )
+    np.testing.assert_array_equal(
+        engine.registration_state.final_base_poses_tail[:, 0, 3], [5.0]
+    )
+    np.testing.assert_array_equal(
+        engine.registration_state.pose_support_mask_tail,
+        [[[True, False, False], [True, False, False]]],
+    )
+    assert engine.anchor_propagation_state is next_state
 
 
 def test_none_route_runs_no_segmentation_or_local_refinement(monkeypatch, tmp_path):
