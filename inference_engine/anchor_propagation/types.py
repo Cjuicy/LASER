@@ -88,30 +88,37 @@ class TrackWindow:
 
 @dataclass(frozen=True)
 class RegistrationState:
-    base_points_tail: torch.Tensor
-    base_poses_tail: torch.Tensor
-    propagated_points_tail: torch.Tensor | None = None
+    final_base_points_tail: torch.Tensor
+    final_base_poses_tail: torch.Tensor
+    pose_support_mask_tail: np.ndarray
     cumulative_sim3: tuple[Any, Any, Any] | None = None
-
-    @property
-    def points_for_registration(self):
-        if self.propagated_points_tail is None:
-            return self.base_points_tail
-        return self.propagated_points_tail
 
 
 @dataclass(frozen=True)
 class AnchorPropagationState:
-    local_scale_tail: np.ndarray
+    local_residual_tail: np.ndarray
     confidence_tail: np.ndarray
     segments_tail: tuple[SegmentationFrame, ...]
 
 
 @dataclass(frozen=True)
 class PropagationResult:
-    local_scale_mask: np.ndarray
+    window_scale: float
+    local_residual_mask: np.ndarray
+    pose_support_mask: np.ndarray
     next_state: AnchorPropagationState
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PoseConsensus:
+    window_scale: float
+    segment_ids: frozenset[int]
+    group_count: int
+    support_pixels: int
+    valid_pixels: int
+    support_ratio: float
+    accepted: bool
 
 
 @dataclass(frozen=True)
