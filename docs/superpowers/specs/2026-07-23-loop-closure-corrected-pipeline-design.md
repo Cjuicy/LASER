@@ -296,10 +296,21 @@ SALAD 只在所有第一阶段窗口缓存完成后运行。
 4. 使用统一的 `0.3` 比例构建 A、B 两侧双侧 mask；
 5. 将联合 A 侧预测配准到矫正缓存 A，得到 `L_A`；
 6. 将联合 B 侧预测配准到矫正缓存 B，得到 `L_B`；
-7. 按现有优化器所需方向构建回环测量：
+7. 计算两个全局对齐结果之间的修正：
 
 ```text
-C_AB = L_B compose inverse(L_A)
+C_global = L_B compose inverse(L_A)
+```
+
+`L_A` 和 `L_B` 的目标缓存已经处于第一阶段全局坐标系，因此
+`C_global` 不能直接作为优化器的窗口局部相对测量。使用对应缓存的第一阶段
+绝对变换 `G_A` 和 `G_B` 转换坐标：
+
+```text
+C_AB =
+    inverse(G_B)
+    compose C_global
+    compose G_A
 ```
 
 回环约束保存为：
@@ -310,6 +321,12 @@ C_AB = L_B compose inverse(L_A)
 
 现有 `Sim3LoopOptimizer` 接收所有 `sim3_edge` 和所有有效回环约束。优化器的
 残差、求解器、阻尼和收敛逻辑保持不变。
+
+当节点绝对变换与回环测量一致时，必须满足现有优化器的零残差不变量：
+
+```text
+C_AB compose inverse(G_A) compose G_B == identity
+```
 
 ## 11. 优化输出与最终聚合
 
@@ -445,7 +462,10 @@ D_i = G_hat_i compose inverse(G_i)
 ### 15.4 回环约束
 
 - A、B 两侧配准收到的是矫正缓存点云；
-- `C_AB` 使用已经确认的组合方向；
+- `C_global` 不能直接作为窗口局部回环测量；
+- `C_AB` 使用 `inverse(G_B) compose C_global compose G_A` 转换坐标；
+- 使用非单位尺度、非零旋转和非零位移验证局部回环测量；
+- 节点与测量一致时，现有优化器的初始回环残差为单位变换；
 - 优化器收到且只收到 `N - 1` 条顺序边；
 - 所有有效回环约束进入同一次优化器调用；
 - 所有回环范围无效时退化到无回环路径。
