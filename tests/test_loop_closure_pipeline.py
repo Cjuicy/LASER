@@ -446,6 +446,52 @@ def test_build_local_loop_constraint_recovers_joint_local_measurement(
     assert_sim3_close(actual, expected)
 
 
+def test_local_loop_constraint_satisfies_optimizer_zero_residual(
+    monkeypatch,
+    tmp_path,
+):
+    module, _, _, _ = make_engine(monkeypatch, tmp_path)
+    sim3_abs_a = (
+        1.3,
+        rotation_z(28.0),
+        torch.tensor([2.0, -1.0, 0.5]),
+    )
+    sim3_abs_b = (
+        0.75,
+        rotation_z(-22.0),
+        torch.tensor([-3.0, 2.0, -0.4]),
+    )
+    local_alignment_a = make_sim3(1.0)
+    local_alignment_b = compose_sim3(
+        inverse_sim3(sim3_abs_b),
+        sim3_abs_a,
+    )
+    global_alignment_a = compose_sim3(
+        sim3_abs_a,
+        local_alignment_a,
+    )
+    global_alignment_b = compose_sim3(
+        sim3_abs_b,
+        local_alignment_b,
+    )
+
+    constraint = module.build_local_loop_constraint(
+        sim3_abs_a,
+        sim3_abs_b,
+        global_alignment_a,
+        global_alignment_b,
+    )
+    residual = compose_sim3(
+        constraint,
+        compose_sim3(
+            inverse_sim3(sim3_abs_a),
+            sim3_abs_b,
+        ),
+    )
+
+    assert_sim3_close(residual, make_sim3(1.0))
+
+
 def test_loop_candidate_with_disjoint_confidence_is_skipped(
     monkeypatch,
     tmp_path,
