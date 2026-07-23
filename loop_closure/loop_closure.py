@@ -10,6 +10,10 @@ from utils.load_fn import load_and_preprocess_images
 from pi3.models.pi3 import Pi3
 from inference_engine import StreamingWindowEngine
 from inference_engine.inference_utils import register_adjacent_windows
+from inference_engine.utils.registration_confidence import (
+    select_top_confidence_mask,
+    validate_confidence_keep_ratio,
+)
 from utils.image_paths import discover_images
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -56,7 +60,7 @@ class LoopClosureEngine:
             window_size,
             overlap,
             sample_interval=1,
-            top_conf_percentile=0.5,
+            registration_top_confidence_ratio=0.3,
             image_paths=None,
     ):
         self.config = config
@@ -64,7 +68,11 @@ class LoopClosureEngine:
         self.pi3_model = pi3_model
         self.window_size = window_size
         self.overlap = overlap
-        self.top_conf_percentile = top_conf_percentile
+        self.registration_top_confidence_ratio = (
+            validate_confidence_keep_ratio(
+                registration_top_confidence_ratio
+            )
+        )
 
         self.img_dir = image_dir
         self.img_list = image_paths
@@ -149,8 +157,10 @@ class LoopClosureEngine:
             cam_pose_loop = item[1]['camera_poses'][:chunk_a_range[1] - chunk_a_range[0]]
             # conf_mask_loop = item[1]['mask'][:chunk_a_range[1] - chunk_a_range[0]]
             conf_map_loop = item[1]['conf'][:chunk_a_range[1] - chunk_a_range[0]]
-            conf_loop_thresh = torch.quantile(conf_map_loop, self.top_conf_percentile, interpolation='nearest')
-            conf_mask_loop = conf_map_loop >= conf_loop_thresh
+            conf_mask_loop = select_top_confidence_mask(
+                conf_map_loop,
+                self.registration_top_confidence_ratio,
+            )
 
             chunk_a_rela_begin = chunk_a_range[0] - self.chunk_indices[chunk_idx_a][0]
             chunk_a_rela_end = chunk_a_rela_begin + chunk_a_range[1] - chunk_a_range[0]
@@ -159,8 +169,10 @@ class LoopClosureEngine:
             cam_pose_a = chunk_data_a['camera_poses'][chunk_a_rela_begin:chunk_a_rela_end]
             # conf_mask_a = chunk_data_a['mask'][chunk_a_rela_begin:chunk_a_rela_end]
             conf_map_a = chunk_data_a['conf'][chunk_a_rela_begin:chunk_a_rela_end]
-            conf_a_thresh = torch.quantile(conf_map_a, self.top_conf_percentile, interpolation='nearest')
-            conf_mask_a = conf_map_a >= conf_a_thresh
+            conf_mask_a = select_top_confidence_mask(
+                conf_map_a,
+                self.registration_top_confidence_ratio,
+            )
 
             s_a, R_a, t_a = register_adjacent_windows(
                 point_map_a,
@@ -174,8 +186,10 @@ class LoopClosureEngine:
             cam_pose_loop = item[1]['camera_poses'][-chunk_b_range[1] + chunk_b_range[0]:]
             # conf_mask_loop = item[1]['mask'][-chunk_b_range[1] + chunk_b_range[0]:]
             conf_map_loop = item[1]['conf'][-chunk_b_range[1] + chunk_b_range[0]:]
-            conf_loop_thresh = torch.quantile(conf_map_loop, self.top_conf_percentile, interpolation='nearest')
-            conf_mask_loop = conf_map_loop >= conf_loop_thresh
+            conf_mask_loop = select_top_confidence_mask(
+                conf_map_loop,
+                self.registration_top_confidence_ratio,
+            )
 
             chunk_b_rela_begin = chunk_b_range[0] - self.chunk_indices[chunk_idx_b][0]
             chunk_b_rela_end = chunk_b_rela_begin + chunk_b_range[1] - chunk_b_range[0]
@@ -184,8 +198,10 @@ class LoopClosureEngine:
             cam_pose_b = chunk_data_b['camera_poses'][chunk_b_rela_begin:chunk_b_rela_end]
             # conf_mask_b = chunk_data_b['mask'][chunk_b_rela_begin:chunk_b_rela_end]
             conf_map_b = chunk_data_b['conf'][chunk_b_rela_begin:chunk_b_rela_end]
-            conf_b_thresh = torch.quantile(conf_map_b, self.top_conf_percentile, interpolation='nearest')
-            conf_mask_b = conf_map_b >= conf_b_thresh
+            conf_mask_b = select_top_confidence_mask(
+                conf_map_b,
+                self.registration_top_confidence_ratio,
+            )
 
             s_b, R_b, t_b = register_adjacent_windows(
                 point_map_b,

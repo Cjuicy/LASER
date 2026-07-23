@@ -16,6 +16,7 @@ from .utils.geometry import (
     apply_sim3_to_pose,
     accumulate_sim3
 )
+from .utils.registration_confidence import select_top_confidence_mask
 
 
 class StreamingWindowEngineLC(StreamingWindowEngine):
@@ -26,6 +27,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             dtype: torch.dtype,
             process_device: str = 'cpu',
             top_conf_percentile: float = 0.5,
+            registration_top_confidence_ratio: float = 0.3,
             window_size: int = 20,
             overlap: int = 5,
             depth_refine=False,
@@ -40,6 +42,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             dtype=dtype,
             process_device=process_device,
             top_conf_percentile=top_conf_percentile,
+            registration_top_confidence_ratio=registration_top_confidence_ratio,
             window_size=window_size,
             overlap=overlap,
             depth_refine=depth_refine,
@@ -66,9 +69,10 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     working_window[key] = working_window[key].squeeze(0)
 
             # camera pose registration
-            conf_thresh = torch.quantile(working_window['conf'][:self.overlap], self.top_conf_percentile,
-                                         interpolation='nearest')
-            tgt_mask = working_window['conf'][:self.overlap] >= conf_thresh
+            tgt_mask = select_top_confidence_mask(
+                working_window['conf'][:self.overlap],
+                self.registration_top_confidence_ratio,
+            )
 
             if self.prev_window_cache is not None:
                 # fixed intrinsic enforce
@@ -77,9 +81,11 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     ref_intrinsic
                 )
                 # mutual conf mask
-                prev_conf_thresh = torch.quantile(self.prev_window_cache['conf'][-self.overlap:],
-                                                  self.top_conf_percentile, interpolation='nearest')
-                conf_mask = (self.prev_window_cache['conf'][-self.overlap:] >= prev_conf_thresh) & tgt_mask
+                prev_mask = select_top_confidence_mask(
+                    self.prev_window_cache['conf'][-self.overlap:],
+                    self.registration_top_confidence_ratio,
+                )
+                conf_mask = prev_mask & tgt_mask
 
                 # metric depth align
                 prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]

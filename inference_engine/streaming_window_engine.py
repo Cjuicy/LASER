@@ -54,6 +54,10 @@ from .inference_utils import (
     sliding_window_l
 )
 from .utils.geometry import homogenize_points
+from .utils.registration_confidence import (
+    select_top_confidence_mask,
+    validate_confidence_keep_ratio,
+)
 from .utils.lsa import (
     GEOMETRY_SEGMENTATION_PROFILES,
     NORMAL_METHODS,
@@ -74,6 +78,7 @@ class StreamingWindowEngine(VanillaEngine):
             intermediate_device: str = 'cuda',
             process_device: str = 'cpu',
             top_conf_percentile: float = 0.5,
+            registration_top_confidence_ratio: float = None,
             window_size: int = 20,
             overlap: int = 5,
             depth_refine=True,
@@ -112,6 +117,18 @@ class StreamingWindowEngine(VanillaEngine):
         self.overlap = overlap
         self.intermediate_device = intermediate_device
         # 3️⃣ 置信度阈值参数
+        legacy_registration_ratio = (
+            top_conf_percentile
+            if top_conf_percentile is not None
+            else 1.0
+        )
+        self.registration_top_confidence_ratio = (
+            validate_confidence_keep_ratio(
+                legacy_registration_ratio
+                if registration_top_confidence_ratio is None
+                else registration_top_confidence_ratio
+            )
+        )
         self.top_conf_percentile = 1 - top_conf_percentile if top_conf_percentile is not None else 0.0
 
         # 4️⃣ 设备和数据类型
@@ -264,9 +281,10 @@ class StreamingWindowEngine(VanillaEngine):
 
             # 3️⃣ 当前窗口重叠区域的置信度筛选
             # camera pose registration
-            conf_thresh = torch.quantile(working_window['conf'][:self.overlap], self.top_conf_percentile,
-                                         interpolation='nearest')
-            tgt_mask = working_window['conf'][:self.overlap] >= conf_thresh
+            tgt_mask = select_top_confidence_mask(
+                working_window['conf'][:self.overlap],
+                self.registration_top_confidence_ratio,
+            )
 
             # ⚠️ 非首窗口处理
             if self.prev_window_cache is not None:
@@ -278,9 +296,11 @@ class StreamingWindowEngine(VanillaEngine):
                 )
                 # 2️⃣ 构造双向高置信度掩码
                 # mutual conf mask
-                prev_conf_thresh = torch.quantile(self.prev_window_cache['conf'][-self.overlap:],
-                                                  self.top_conf_percentile, interpolation='nearest')
-                conf_mask = (self.prev_window_cache['conf'][-self.overlap:] >= prev_conf_thresh) & tgt_mask
+                prev_mask = select_top_confidence_mask(
+                    self.prev_window_cache['conf'][-self.overlap:],
+                    self.registration_top_confidence_ratio,
+                )
+                conf_mask = prev_mask & tgt_mask
 
                 # 3️⃣ 取相邻窗口的重叠点云
                 # metric depth align

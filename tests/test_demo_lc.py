@@ -64,6 +64,12 @@ def test_segmentation_options_default_to_depth_baseline():
     assert args.geometry_seg_profile == "baseline_params"
 
 
+def test_loop_registration_confidence_defaults_to_top_thirty_percent():
+    args = demo_lc.get_args_parser().parse_args([])
+
+    assert args.registration_top_confidence_ratio == 0.3
+
+
 @pytest.mark.parametrize("segment_mode", ["depth", "geometry", "layer_atomic"])
 def test_parser_accepts_all_segmentation_modes(segment_mode):
     args = demo_lc.get_args_parser().parse_args([
@@ -143,6 +149,7 @@ def test_load_model_forwards_segmentation_options(tmp_path, monkeypatch):
     assert captured["segment_mode"] == "geometry"
     assert captured["normal_method"] == "sobel"
     assert captured["geometry_seg_profile"] == "legacy"
+    assert captured["registration_top_confidence_ratio"] == 0.3
 
 
 def test_natural_sort_key_orders_embedded_numbers_numerically():
@@ -199,3 +206,4 @@ def test_build_loop_closure_engine_passes_canonical_manifest(
     )
 
     assert calls[0][1]["image_paths"] is image_paths
+    assert calls[0][1]["registration_top_confidence_ratio"] == 0.3

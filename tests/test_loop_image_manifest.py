@@ -219,3 +219,26 @@ def test_loop_engine_passes_explicit_manifest_to_detector(
 
     assert engine.img_list is image_paths
     assert detector_calls[0]["image_paths"] is image_paths
+
+
+def test_loop_engine_defaults_registration_to_top_thirty_percent(
+    monkeypatch,
+    tmp_path,
+):
+    detector_calls = []
+    module = load_loop_engine_module(monkeypatch, detector_calls)
+
+    engine = module.LoopClosureEngine(
+        engine_config(),
+        tmp_path,
+        tmp_path / "output",
+        object(),
+        10,
+        5,
+        image_paths=[str(tmp_path / "frame1.png")],
+    )
+
+    assert engine.registration_top_confidence_ratio == 0.3
+    assert detector_calls[0]["image_paths"] == [
+        str(tmp_path / "frame1.png"),
+    ]

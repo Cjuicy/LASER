@@ -54,6 +54,12 @@ def get_args_parser():
     parser.add_argument('--geometry_seg_profile', default='baseline_params',
                         choices=('baseline_params', 'legacy'),
                         help='Felzenszwalb profile for geometry segmentation')
+    parser.add_argument(
+        '--registration_top_confidence_ratio',
+        default=0.3,
+        type=float,
+        help='fraction of highest-confidence pixels kept for registration',
+    )
 
     return parser
 
@@ -85,6 +91,9 @@ def load_model(args):
         segment_mode=args.segment_mode,
         normal_method=args.normal_method,
         geometry_seg_profile=args.geometry_seg_profile,
+        registration_top_confidence_ratio=(
+            args.registration_top_confidence_ratio
+        ),
     )
 
 
@@ -103,6 +112,9 @@ def build_loop_closure_engine(
         args.window_size,
         args.overlap,
         args.sample_interval,
+        registration_top_confidence_ratio=(
+            args.registration_top_confidence_ratio
+        ),
         image_paths=image_paths,
     )
 
