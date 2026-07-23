@@ -470,6 +470,63 @@ def test_loop_candidate_with_disjoint_confidence_is_skipped(
     assert optimizer.calls == []
 
 
+@pytest.mark.parametrize(
+    "invalid_alignment",
+    [
+        (
+            float("nan"),
+            torch.eye(3),
+            torch.zeros(3),
+        ),
+        (
+            0.0,
+            torch.eye(3),
+            torch.zeros(3),
+        ),
+        (
+            -1.0,
+            torch.eye(3),
+            torch.zeros(3),
+        ),
+        (
+            1.0,
+            torch.full((3, 3), float("inf")),
+            torch.zeros(3),
+        ),
+    ],
+)
+def test_process_loops_skips_mathematically_invalid_sim3(
+    monkeypatch,
+    tmp_path,
+    invalid_alignment,
+):
+    module, engine, _, _ = make_engine(monkeypatch, tmp_path)
+    caches = make_two_caches()
+    engine.loop_list = [(0, 2)]
+    monkeypatch.setattr(
+        module,
+        "process_loop_list",
+        lambda *args, **kwargs: [
+            (0, (0, 1), 1, (1, 2)),
+        ],
+    )
+    engine.process_single_chunk = lambda *args, **kwargs: {
+        "local_points": torch.ones((2, 1, 1, 3)),
+        "camera_poses": torch.eye(4).repeat(2, 1, 1),
+        "conf": torch.ones((2, 1, 1)),
+    }
+    alignments = iter((invalid_alignment, make_sim3(1.0)))
+    monkeypatch.setattr(
+        module,
+        "register_adjacent_windows",
+        lambda *args: next(alignments),
+    )
+
+    constraints = engine.process_loops(caches)
+
+    assert constraints == []
+
+
 def test_cache_count_must_match_canonical_manifest(
     monkeypatch,
     tmp_path,

@@ -89,17 +89,58 @@ def build_local_loop_constraint(
         global_alignment_a,
         global_alignment_b,
 ):
+    for context, transform in (
+            ("sim3_abs_a", sim3_abs_a),
+            ("sim3_abs_b", sim3_abs_b),
+            ("global_alignment_a", global_alignment_a),
+            ("global_alignment_b", global_alignment_b),
+    ):
+        validate_sim3(transform, context)
+
     global_correction = accumulate_sim3(
         global_alignment_b,
         closed_form_inverse_sim3(*global_alignment_a),
     )
-    return accumulate_sim3(
+    constraint = accumulate_sim3(
         closed_form_inverse_sim3(*sim3_abs_b),
         accumulate_sim3(
             global_correction,
             sim3_abs_a,
         ),
     )
+    validate_sim3(constraint, "loop_constraint_ab")
+    return constraint
+
+
+def validate_sim3(transform, context):
+    if not isinstance(transform, (tuple, list)) or len(transform) != 3:
+        raise ValueError(
+            f"{context} must contain scale, rotation, translation"
+        )
+
+    scale, rotation, translation = transform
+    scale_tensor = torch.as_tensor(scale)
+    rotation_tensor = torch.as_tensor(rotation)
+    translation_tensor = torch.as_tensor(translation)
+
+    if scale_tensor.numel() != 1:
+        raise ValueError(f"{context} scale must be scalar")
+    if tuple(rotation_tensor.shape) != (3, 3):
+        raise ValueError(
+            f"{context} rotation must have shape (3, 3)"
+        )
+    if translation_tensor.numel() != 3:
+        raise ValueError(
+            f"{context} translation must contain 3 values"
+        )
+    if not torch.isfinite(scale_tensor).all():
+        raise ValueError(f"{context} scale is not finite")
+    if not torch.isfinite(rotation_tensor).all():
+        raise ValueError(f"{context} rotation is not finite")
+    if not torch.isfinite(translation_tensor).all():
+        raise ValueError(f"{context} translation is not finite")
+    if float(scale_tensor.detach().cpu().item()) <= 0.0:
+        raise ValueError(f"{context} scale must be positive")
 
 
 class LoopClosureEngine:
@@ -340,12 +381,19 @@ class LoopClosureEngine:
                 mutual_mask_b,
             )
 
-            s_ab, R_ab, t_ab = build_local_loop_constraint(
-                raw_predictions[chunk_idx_a]["sim3_abs"],
-                raw_predictions[chunk_idx_b]["sim3_abs"],
-                (s_a, R_a, t_a),
-                (s_b, R_b, t_b),
-            )
+            try:
+                s_ab, R_ab, t_ab = build_local_loop_constraint(
+                    raw_predictions[chunk_idx_a]["sim3_abs"],
+                    raw_predictions[chunk_idx_b]["sim3_abs"],
+                    (s_a, R_a, t_a),
+                    (s_b, R_b, t_b),
+                )
+            except ValueError as error:
+                print(
+                    "Skipping loop candidate "
+                    f"{chunk_idx_a}->{chunk_idx_b}: {error}"
+                )
+                continue
             self.loop_constraints.append(
                 (
                     chunk_idx_a,
