@@ -14,6 +14,7 @@ from inference_engine.utils.registration_confidence import (
     select_top_confidence_mask,
     validate_confidence_keep_ratio,
 )
+from inference_engine.utils.geometry import accumulate_sim3
 from utils.image_paths import discover_images
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -48,6 +49,31 @@ def remove_duplicates(data_list):
             seen[key] = True
             result.append(item)
     return result
+
+
+def identity_sim3_like(reference_sim3):
+    _, rotation, translation = reference_sim3
+    return (
+        1.0,
+        torch.eye(
+            rotation.shape[-1],
+            dtype=rotation.dtype,
+            device=rotation.device,
+        ),
+        torch.zeros_like(translation),
+    )
+
+
+def accumulate_edges_from_identity(
+        sequential_edges,
+        reference_sim3,
+):
+    absolute_transforms = [identity_sim3_like(reference_sim3)]
+    for edge in sequential_edges:
+        absolute_transforms.append(
+            accumulate_sim3(absolute_transforms[-1], edge)
+        )
+    return absolute_transforms
 
 
 class LoopClosureEngine:
@@ -92,9 +118,57 @@ class LoopClosureEngine:
 
         self.loop_list = []  # e.g. [(1584, 139), ...]
         self.loop_optimizer = Sim3LoopOptimizer(config)
-        self.sim3_list = []  # [(s [1,], R [3,3], T [3,]), ...]
-        self.loop_sim3_list = []  # [(chunk_idx_a, chunk_idx_b, s [1,], R [3,3], T [3,]), ...]
+        self.loop_results = []
+        self.loop_constraints = []
         self.loop_predict_list = []
+
+    def _ensure_image_manifest(self):
+        if self.img_list is None:
+            self.img_list = discover_images(
+                self.img_dir,
+                sample_interval=self.sample_interval,
+            )
+            self.loop_detector.image_paths = self.img_list
+
+        if len(self.img_list) == 0:
+            raise ValueError(
+                f"[DIR EMPTY] No images found in {self.img_dir}!"
+            )
+
+    def _build_chunk_indices(self):
+        step = self.window_size - self.overlap
+        if step <= 0:
+            raise ValueError("window_size must be greater than overlap")
+
+        chunk_indices = []
+        for start_idx in range(0, len(self.img_list), step):
+            end_idx = min(
+                start_idx + self.window_size,
+                len(self.img_list),
+            )
+            if end_idx - start_idx <= self.overlap:
+                break
+            chunk_indices.append((start_idx, end_idx))
+        return chunk_indices
+
+    def _validate_cache_count(self, raw_predictions):
+        self.chunk_indices = self._build_chunk_indices()
+        if len(raw_predictions) != len(self.chunk_indices):
+            raise ValueError(
+                "cache count does not match image manifest: "
+                f"expected {len(self.chunk_indices)}, "
+                f"got {len(raw_predictions)}"
+            )
+
+        for index, prediction in enumerate(raw_predictions):
+            if "sim3_abs" not in prediction:
+                raise ValueError(
+                    f"cache {index} is missing sim3_abs"
+                )
+            if index > 0 and "sim3_edge" not in prediction:
+                raise ValueError(
+                    f"cache {index} is missing sim3_edge"
+                )
 
     def get_loop_pairs(self):
         self.loop_detector.run()
@@ -130,20 +204,22 @@ class LoopClosureEngine:
         return predictions
 
     def process_loops(self, raw_predictions):
-        step = self.window_size - self.overlap
-        num_chunks = (len(self.img_list) - self.overlap + step - 1) // step
-        self.chunk_indices = []
-        for i in range(num_chunks):
-            start_idx = i * step
-            end_idx = min(start_idx + self.window_size, len(self.img_list))
-            self.chunk_indices.append((start_idx, end_idx))
+        if self.chunk_indices is None:
+            self.chunk_indices = self._build_chunk_indices()
 
         print('Loop SIM(3) estimating...')
-        loop_results = process_loop_list(self.chunk_indices,
-                                         self.loop_list,
-                                         half_window=self.config['Model']['loop_chunk_size'] // 2)
-        loop_results = remove_duplicates(loop_results)
-        for item in loop_results:
+        self.loop_results = process_loop_list(
+            self.chunk_indices,
+            self.loop_list,
+            half_window=(
+                self.config['Model']['loop_chunk_size'] // 2
+            ),
+        )
+        self.loop_results = remove_duplicates(self.loop_results)
+        self.loop_predict_list = []
+        self.loop_constraints = []
+
+        for item in self.loop_results:
             single_chunk_predictions = self.process_single_chunk(item[1], range_2=item[3])
             self.loop_predict_list.append((item, single_chunk_predictions))
 
@@ -212,30 +288,52 @@ class LoopClosureEngine:
             )
 
             s_ab, R_ab, t_ab = compute_sim3_ab((s_a, R_a, t_a), (s_b, R_b, t_b))
-            # not inverse
-            self.loop_sim3_list.append((chunk_idx_a, chunk_idx_b, (s_ab, R_ab, t_ab)))
+            self.loop_constraints.append(
+                (
+                    chunk_idx_a,
+                    chunk_idx_b,
+                    (s_ab, R_ab, t_ab),
+                )
+            )
 
-        # not inverse
-        self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
+        return self.loop_constraints
 
     def run(self, raw_predictions):
         print(f"Loading images from {self.img_dir}...")
-        if self.img_list is None:
-            self.img_list = discover_images(
-                self.img_dir,
-                sample_interval=self.sample_interval,
-            )
-
-        if len(self.img_list) == 0:
-            raise ValueError(f"[DIR EMPTY] No images found in {self.img_dir}!")
+        self._ensure_image_manifest()
         print(f"Found {len(self.img_list)} images")
+        self._validate_cache_count(raw_predictions)
+
+        initial_absolute = [
+            prediction["sim3_abs"]
+            for prediction in raw_predictions
+        ]
 
         self.get_loop_pairs()
-        for pred in raw_predictions[1:]:
-            self.sim3_list.append(pred['sim3'])
+        if not self.loop_list:
+            return initial_absolute
 
-        self.process_loops(raw_predictions)
-        return self.sim3_list
+        loop_constraints = self.process_loops(raw_predictions)
+        if not loop_constraints:
+            return initial_absolute
+
+        sequential_edges = [
+            prediction["sim3_edge"]
+            for prediction in raw_predictions[1:]
+        ]
+        optimized_edges = self.loop_optimizer.optimize(
+            sequential_edges,
+            loop_constraints,
+        )
+        if len(optimized_edges) != len(sequential_edges):
+            raise ValueError(
+                "optimized edge count does not match sequential edge count"
+            )
+
+        return accumulate_edges_from_identity(
+            optimized_edges,
+            initial_absolute[0],
+        )
 
 
 if __name__ == '__main__':

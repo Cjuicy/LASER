@@ -158,6 +158,7 @@ def load_loop_engine_module(monkeypatch, detector_calls):
     monkeypatch.setitem(sys.modules, "pi3.models.pi3", fake_pi3)
 
     fake_engine = types.ModuleType("inference_engine")
+    fake_engine.__path__ = []
     fake_engine.StreamingWindowEngine = object
     monkeypatch.setitem(sys.modules, "inference_engine", fake_engine)
 
@@ -167,6 +168,38 @@ def load_loop_engine_module(monkeypatch, detector_calls):
         sys.modules,
         "inference_engine.inference_utils",
         fake_inference,
+    )
+
+    fake_engine_utils = types.ModuleType("inference_engine.utils")
+    fake_engine_utils.__path__ = []
+    monkeypatch.setitem(
+        sys.modules,
+        "inference_engine.utils",
+        fake_engine_utils,
+    )
+
+    fake_confidence = types.ModuleType(
+        "inference_engine.utils.registration_confidence"
+    )
+    fake_confidence.select_top_confidence_mask = (
+        lambda confidence, keep_ratio: torch.ones_like(
+            confidence,
+            dtype=torch.bool,
+        )
+    )
+    fake_confidence.validate_confidence_keep_ratio = float
+    monkeypatch.setitem(
+        sys.modules,
+        "inference_engine.utils.registration_confidence",
+        fake_confidence,
+    )
+
+    fake_geometry = types.ModuleType("inference_engine.utils.geometry")
+    fake_geometry.accumulate_sim3 = lambda first, second: second
+    monkeypatch.setitem(
+        sys.modules,
+        "inference_engine.utils.geometry",
+        fake_geometry,
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
 
