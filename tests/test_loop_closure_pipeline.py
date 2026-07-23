@@ -92,15 +92,24 @@ def load_loop_engine_module(monkeypatch):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.loop_list = []
+            self.loop_closures = []
             self.run_calls = 0
+            self.save_calls = 0
             self.image_paths = kwargs.get("image_paths")
             detector_instances.append(self)
 
         def run(self):
             self.run_calls += 1
+            self.loop_closures = [
+                (frame_a, frame_b, 0.9)
+                for frame_a, frame_b in self.loop_list
+            ]
 
         def get_loop_list(self):
             return self.loop_list
+
+        def save_results(self):
+            self.save_calls += 1
 
     fake_loop_model.LoopDetector = RecordingDetector
     monkeypatch.setitem(sys.modules, "loop_closure.loop_model", fake_loop_model)
@@ -277,6 +286,18 @@ def test_no_loop_returns_original_absolute_transforms(
     for actual, cache in zip(optimized_absolute, caches):
         assert_sim3_close(actual, cache["sim3_abs"])
     assert optimizer.calls == []
+
+
+def test_get_loop_pairs_persists_scored_candidates(
+    monkeypatch,
+    tmp_path,
+):
+    _, engine, detector, _ = make_engine(monkeypatch, tmp_path)
+    detector.loop_list = [(2, 0)]
+
+    engine.get_loop_pairs()
+
+    assert detector.save_calls == 1
 
 
 def test_invalid_loop_candidates_do_not_invoke_optimizer(
@@ -525,6 +546,71 @@ def test_process_loops_skips_mathematically_invalid_sim3(
     constraints = engine.process_loops(caches)
 
     assert constraints == []
+
+
+def test_process_loops_prints_constraint_diagnostics(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    module, engine, _, _ = make_engine(monkeypatch, tmp_path)
+    caches = make_two_caches()
+    engine.loop_list = [(2, 0)]
+    engine.loop_candidates = [(2, 0, 0.91)]
+    monkeypatch.setattr(
+        module,
+        "process_loop_list",
+        lambda *args, **kwargs: [
+            (1, (1, 2), 0, (0, 1)),
+        ],
+    )
+    engine.process_single_chunk = lambda *args, **kwargs: {
+        "local_points": torch.ones((2, 1, 1, 3)),
+        "camera_poses": torch.eye(4).repeat(2, 1, 1),
+        "conf": torch.ones((2, 1, 1)),
+    }
+    alignments = iter((make_sim3(1.0), make_sim3(1.0)))
+    monkeypatch.setattr(
+        module,
+        "register_adjacent_windows",
+        lambda *args: next(alignments),
+    )
+
+    engine.process_loops(caches)
+    output = capsys.readouterr().out
+
+    assert "frames=2->0" in output
+    assert "windows=1->0" in output
+    assert "similarity=0.910000" in output
+    assert "measurement_scale=" in output
+    assert "measurement_rotation_deg=" in output
+    assert "measurement_translation_norm=" in output
+    assert "initial_residual_scale_log_abs=" in output
+    assert "initial_residual_rotation_deg=" in output
+    assert "initial_residual_translation_norm=" in output
+
+
+def test_run_prints_graph_constraint_counts(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    _, engine, _, _ = make_engine(monkeypatch, tmp_path)
+    caches = make_two_caches()
+
+    def set_loop_pairs():
+        engine.loop_list = [(2, 0)]
+
+    engine.get_loop_pairs = set_loop_pairs
+    engine.process_loops = lambda predictions: [
+        (1, 0, make_sim3(2.0)),
+    ]
+
+    engine.run(caches)
+    output = capsys.readouterr().out
+
+    assert "sequential_constraints=1" in output
+    assert "loop_constraints=1" in output
 
 
 def test_cache_count_must_match_canonical_manifest(

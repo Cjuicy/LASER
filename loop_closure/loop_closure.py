@@ -1,4 +1,5 @@
 import argparse
+import math
 import torch
 from pathlib import Path
 
@@ -143,6 +144,39 @@ def validate_sim3(transform, context):
         raise ValueError(f"{context} scale must be positive")
 
 
+def sim3_metrics(transform):
+    scale, rotation, translation = transform
+    scale_value = float(
+        torch.as_tensor(scale).detach().cpu().item()
+    )
+    rotation_tensor = torch.as_tensor(
+        rotation,
+        dtype=torch.float64,
+    )
+    cosine = torch.clamp(
+        (torch.trace(rotation_tensor) - 1.0) / 2.0,
+        -1.0,
+        1.0,
+    )
+    rotation_degrees = float(
+        torch.rad2deg(torch.acos(cosine)).item()
+    )
+    translation_norm = float(
+        torch.linalg.vector_norm(
+            torch.as_tensor(
+                translation,
+                dtype=torch.float64,
+            ).reshape(-1)
+        ).item()
+    )
+    return {
+        "scale": scale_value,
+        "scale_log_abs": abs(math.log(scale_value)),
+        "rotation_deg": rotation_degrees,
+        "translation_norm": translation_norm,
+    }
+
+
 class LoopClosureEngine:
     def __init__(
             self,
@@ -184,6 +218,7 @@ class LoopClosureEngine:
         self.all_camera_intrinsics = []
 
         self.loop_list = []  # e.g. [(1584, 139), ...]
+        self.loop_candidates = []
         self.loop_optimizer = Sim3LoopOptimizer(config)
         self.loop_results = []
         self.loop_constraints = []
@@ -242,6 +277,10 @@ class LoopClosureEngine:
 
     def get_loop_pairs(self):
         self.loop_detector.run()
+        self.loop_detector.save_results()
+        self.loop_candidates = list(
+            self.loop_detector.loop_closures or []
+        )
         self.loop_list = self.loop_detector.get_loop_list()
         del self.loop_detector
         torch.cuda.empty_cache()
@@ -278,13 +317,33 @@ class LoopClosureEngine:
             self.chunk_indices = self._build_chunk_indices()
 
         print('Loop SIM(3) estimating...')
-        self.loop_results = process_loop_list(
-            self.chunk_indices,
-            self.loop_list,
-            half_window=(
-                self.config['Model']['loop_chunk_size'] // 2
-            ),
+        candidates = (
+            self.loop_candidates
+            if self.loop_candidates
+            else [
+                (frame_a, frame_b, float("nan"))
+                for frame_a, frame_b in self.loop_list
+            ]
         )
+        self.loop_results = []
+        for frame_a, frame_b, similarity in candidates:
+            mapped = process_loop_list(
+                self.chunk_indices,
+                [(frame_a, frame_b)],
+                half_window=(
+                    self.config['Model']['loop_chunk_size'] // 2
+                ),
+            )
+            if not mapped:
+                continue
+            self.loop_results.append(
+                (
+                    *mapped[0],
+                    frame_a,
+                    frame_b,
+                    float(similarity),
+                )
+            )
         self.loop_results = remove_duplicates(self.loop_results)
         self.loop_predict_list = []
         self.loop_constraints = []
@@ -298,6 +357,9 @@ class LoopClosureEngine:
             chunk_idx_b = item[0][2]
             chunk_a_range = item[0][1]
             chunk_b_range = item[0][3]
+            frame_a = item[0][4]
+            frame_b = item[0][5]
+            similarity = item[0][6]
 
             point_map_loop = item[1]['local_points'][:chunk_a_range[1] - chunk_a_range[0]]
             cam_pose_loop = item[1]['camera_poses'][:chunk_a_range[1] - chunk_a_range[0]]
@@ -381,12 +443,25 @@ class LoopClosureEngine:
                 mutual_mask_b,
             )
 
+            sim3_abs_a = raw_predictions[chunk_idx_a]["sim3_abs"]
+            sim3_abs_b = raw_predictions[chunk_idx_b]["sim3_abs"]
             try:
-                s_ab, R_ab, t_ab = build_local_loop_constraint(
-                    raw_predictions[chunk_idx_a]["sim3_abs"],
-                    raw_predictions[chunk_idx_b]["sim3_abs"],
+                loop_constraint = build_local_loop_constraint(
+                    sim3_abs_a,
+                    sim3_abs_b,
                     (s_a, R_a, t_a),
                     (s_b, R_b, t_b),
+                )
+                initial_residual = accumulate_sim3(
+                    loop_constraint,
+                    accumulate_sim3(
+                        closed_form_inverse_sim3(*sim3_abs_a),
+                        sim3_abs_b,
+                    ),
+                )
+                validate_sim3(
+                    initial_residual,
+                    "initial_loop_residual",
                 )
             except ValueError as error:
                 print(
@@ -394,6 +469,28 @@ class LoopClosureEngine:
                     f"{chunk_idx_a}->{chunk_idx_b}: {error}"
                 )
                 continue
+
+            measurement_metrics = sim3_metrics(loop_constraint)
+            residual_metrics = sim3_metrics(initial_residual)
+            print(
+                "Loop constraint: "
+                f"frames={frame_a}->{frame_b}, "
+                f"windows={chunk_idx_a}->{chunk_idx_b}, "
+                f"similarity={similarity:.6f}, "
+                "measurement_scale="
+                f"{measurement_metrics['scale']:.6f}, "
+                "measurement_rotation_deg="
+                f"{measurement_metrics['rotation_deg']:.6f}, "
+                "measurement_translation_norm="
+                f"{measurement_metrics['translation_norm']:.6f}, "
+                "initial_residual_scale_log_abs="
+                f"{residual_metrics['scale_log_abs']:.6f}, "
+                "initial_residual_rotation_deg="
+                f"{residual_metrics['rotation_deg']:.6f}, "
+                "initial_residual_translation_norm="
+                f"{residual_metrics['translation_norm']:.6f}"
+            )
+            s_ab, R_ab, t_ab = loop_constraint
             self.loop_constraints.append(
                 (
                     chunk_idx_a,
@@ -427,6 +524,11 @@ class LoopClosureEngine:
             prediction["sim3_edge"]
             for prediction in raw_predictions[1:]
         ]
+        print(
+            "Loop graph: "
+            f"sequential_constraints={len(sequential_edges)}, "
+            f"loop_constraints={len(loop_constraints)}"
+        )
         optimized_edges = self.loop_optimizer.optimize(
             sequential_edges,
             loop_constraints,
