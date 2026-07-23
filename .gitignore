@@ -153,3 +153,4 @@ results/
 *.egg-info
 
 .vscode/
+.worktrees/
