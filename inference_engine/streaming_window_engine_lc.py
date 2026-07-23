@@ -15,7 +15,10 @@ from .utils.geometry import (
     accumulate_sim3,
     closed_form_inverse_sim3,
 )
-from .utils.registration_confidence import select_top_confidence_mask
+from .utils.registration_confidence import (
+    intersect_confidence_masks,
+    select_top_confidence_mask,
+)
 
 
 class StreamingWindowEngineLC(StreamingWindowEngine):
@@ -26,7 +29,6 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             dtype: torch.dtype,
             process_device: str = 'cpu',
             top_conf_percentile: float = 0.5,
-            registration_top_confidence_ratio: float = 0.3,
             window_size: int = 20,
             overlap: int = 5,
             depth_refine=False,
@@ -34,6 +36,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             segment_mode: str = "depth",
             normal_method: str = "cross",
             geometry_seg_profile: str = "baseline_params",
+            registration_top_confidence_ratio: float = 0.3,
     ):
         super().__init__(
             delegate=delegate.to(inference_device),
@@ -84,7 +87,11 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     self.prev_window_cache['conf'][-self.overlap:],
                     self.registration_top_confidence_ratio,
                 )
-                conf_mask = prev_mask & tgt_mask
+                conf_mask = intersect_confidence_masks(
+                    prev_mask,
+                    tgt_mask,
+                    context="loop streaming registration",
+                )
 
                 # metric depth align
                 prev_local_points = self.prev_window_cache['local_points'][-self.overlap:]
@@ -159,7 +166,10 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             self.latencies.append(total_process_time)
 
     @staticmethod
-    def aggregate_caches(parsed_caches, optimized_abs=None):
+    def apply_optimization_deltas(
+            parsed_caches,
+            optimized_abs=None,
+    ):
         if optimized_abs is None:
             optimized_abs = [
                 cache['sim3_abs']
@@ -171,7 +181,8 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             )
 
         adjusted_caches = []
-        for cache, optimized in zip(parsed_caches, optimized_abs):
+        for index, (cache, optimized) in enumerate(
+                zip(parsed_caches, optimized_abs)):
             original_inverse = closed_form_inverse_sim3(
                 *cache['sim3_abs']
             )
@@ -189,6 +200,26 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                 delta_rotation,
                 delta_translation,
             )
+            adjusted['sim3_abs'] = optimized
+            if index == 0:
+                adjusted.pop('sim3_edge', None)
+            else:
+                adjusted['sim3_edge'] = accumulate_sim3(
+                    closed_form_inverse_sim3(
+                        *optimized_abs[index - 1]
+                    ),
+                    optimized,
+                )
             adjusted_caches.append(adjusted)
 
+        return adjusted_caches
+
+    @staticmethod
+    def aggregate_caches(parsed_caches, optimized_abs=None):
+        adjusted_caches = (
+            StreamingWindowEngineLC.apply_optimization_deltas(
+                parsed_caches,
+                optimized_abs,
+            )
+        )
         return StreamingWindowEngine.aggregate_caches(adjusted_caches)

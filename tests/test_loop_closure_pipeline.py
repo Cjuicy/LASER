@@ -138,6 +138,7 @@ def load_loop_engine_module(monkeypatch):
     fake_engine = types.ModuleType("inference_engine")
     fake_engine.__path__ = []
     fake_engine.StreamingWindowEngine = object
+    fake_engine.StreamingWindowEngineLC = object
     monkeypatch.setitem(sys.modules, "inference_engine", fake_engine)
 
     fake_inference = types.ModuleType("inference_engine.inference_utils")
@@ -165,6 +166,23 @@ def load_loop_engine_module(monkeypatch):
             confidence,
             dtype=torch.bool,
         )
+    )
+
+    def fake_intersect_confidence_masks(
+        source_mask,
+        target_mask,
+        *,
+        context="registration",
+    ):
+        mutual_mask = source_mask & target_mask
+        if not torch.any(mutual_mask):
+            raise ValueError(
+                f"{context} has no shared high-confidence pixels"
+            )
+        return mutual_mask
+
+    fake_confidence.intersect_confidence_masks = (
+        fake_intersect_confidence_masks
     )
     monkeypatch.setitem(
         sys.modules,
@@ -334,6 +352,51 @@ def test_loop_constraints_use_corrected_cache_points_and_ab_direction(
     assert optimizer.calls == []
 
 
+def test_loop_candidate_with_disjoint_confidence_is_skipped(
+    monkeypatch,
+    tmp_path,
+):
+    module, engine, _, optimizer = make_engine(monkeypatch, tmp_path)
+    caches = make_two_caches()
+    engine.loop_list = [(0, 2)]
+    monkeypatch.setattr(
+        module,
+        "process_loop_list",
+        lambda *args, **kwargs: [
+            (0, (0, 1), 1, (1, 2)),
+        ],
+    )
+    joint_prediction = {
+        "local_points": torch.ones((2, 1, 1, 3)),
+        "camera_poses": torch.eye(4).repeat(2, 1, 1),
+        "conf": torch.ones((2, 1, 1)),
+    }
+    engine.process_single_chunk = (
+        lambda first_range, range_2=None: joint_prediction
+    )
+    selections = iter((
+        torch.tensor([True, False]),
+        torch.tensor([False, True]),
+    ))
+    monkeypatch.setattr(
+        module,
+        "select_top_confidence_mask",
+        lambda *args: next(selections),
+    )
+    monkeypatch.setattr(
+        module,
+        "register_adjacent_windows",
+        lambda *args: pytest.fail(
+            "disjoint loop candidate must not be registered"
+        ),
+    )
+
+    constraints = engine.process_loops(caches)
+
+    assert constraints == []
+    assert optimizer.calls == []
+
+
 def test_cache_count_must_match_canonical_manifest(
     monkeypatch,
     tmp_path,
@@ -347,3 +410,20 @@ def test_cache_count_must_match_canonical_manifest(
         engine.run(make_two_caches()[:1])
 
     assert detector.run_calls == 0
+
+
+@pytest.mark.parametrize("image_count", [1, 2, 3])
+def test_chunk_indices_match_streaming_for_short_first_window(
+    monkeypatch,
+    tmp_path,
+    image_count,
+):
+    _, engine, _, _ = make_engine(monkeypatch, tmp_path)
+    engine.window_size = 4
+    engine.overlap = 2
+    engine.img_list = [
+        str(tmp_path / f"frame{index}.png")
+        for index in range(image_count)
+    ]
+
+    assert engine._build_chunk_indices() == [(0, image_count)]

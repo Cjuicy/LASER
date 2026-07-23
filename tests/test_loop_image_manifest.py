@@ -160,6 +160,7 @@ def load_loop_engine_module(monkeypatch, detector_calls):
     fake_engine = types.ModuleType("inference_engine")
     fake_engine.__path__ = []
     fake_engine.StreamingWindowEngine = object
+    fake_engine.StreamingWindowEngineLC = object
     monkeypatch.setitem(sys.modules, "inference_engine", fake_engine)
 
     fake_inference = types.ModuleType("inference_engine.inference_utils")
@@ -188,6 +189,23 @@ def load_loop_engine_module(monkeypatch, detector_calls):
         )
     )
     fake_confidence.validate_confidence_keep_ratio = float
+
+    def fake_intersect_confidence_masks(
+        source_mask,
+        target_mask,
+        *,
+        context="registration",
+    ):
+        mutual_mask = source_mask & target_mask
+        if not torch.any(mutual_mask):
+            raise ValueError(
+                f"{context} has no shared high-confidence pixels"
+            )
+        return mutual_mask
+
+    fake_confidence.intersect_confidence_masks = (
+        fake_intersect_confidence_masks
+    )
     monkeypatch.setitem(
         sys.modules,
         "inference_engine.utils.registration_confidence",

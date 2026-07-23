@@ -237,3 +237,48 @@ def test_aggregate_rejects_transform_count_mismatch():
         match="optimized transform count does not match cache count",
     ):
         StreamingWindowEngineLC.aggregate_caches([cache], [])
+
+
+def test_apply_optimization_deltas_updates_cache_transform_contract():
+    caches = [
+        {
+            "local_points": torch.ones((1, 1, 1, 3)),
+            "camera_poses": torch.eye(4)[None],
+            "conf": torch.ones((1, 1, 1)),
+            "sim3_abs": (1.0, torch.eye(3), torch.zeros(3)),
+        },
+        {
+            "local_points": torch.full((1, 1, 1, 3), 6.0),
+            "camera_poses": torch.eye(4)[None],
+            "conf": torch.ones((1, 1, 1)),
+            "sim3_abs": (2.0, torch.eye(3), torch.zeros(3)),
+            "sim3_edge": (2.0, torch.eye(3), torch.zeros(3)),
+        },
+    ]
+    optimized_absolute = [
+        (1.0, torch.eye(3), torch.zeros(3)),
+        (4.0, torch.eye(3), torch.zeros(3)),
+    ]
+
+    adjusted = StreamingWindowEngineLC.apply_optimization_deltas(
+        caches,
+        optimized_absolute,
+    )
+
+    torch.testing.assert_close(
+        adjusted[1]["local_points"],
+        torch.full_like(adjusted[1]["local_points"], 12.0),
+    )
+    assert_sim3_close(
+        adjusted[1]["sim3_abs"],
+        optimized_absolute[1],
+    )
+    recomposed = accumulate_sim3(
+        adjusted[0]["sim3_abs"],
+        adjusted[1]["sim3_edge"],
+    )
+    assert_sim3_close(recomposed, adjusted[1]["sim3_abs"])
+    torch.testing.assert_close(
+        caches[1]["local_points"],
+        torch.full_like(caches[1]["local_points"], 6.0),
+    )

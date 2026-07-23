@@ -4,6 +4,9 @@ from pi3.models.pi3 import Pi3
 from inference_engine import VanillaEngine, StreamingWindowEngine, StreamingWindowEngineLC
 from loop_closure.loop_closure import LoopClosureEngine
 from loop_closure.utils.config_utils import load_config
+from inference_engine.utils.cache_utils import (
+    prepare_caches_for_aggregation,
+)
 from functools import partial
 import eval.misc as misc  # noqa
 import torch
@@ -14,7 +17,6 @@ import argparse
 import json
 from pathlib import Path
 import glob
-import shutil
 
 
 def get_args_parser():
@@ -104,7 +106,25 @@ def inference_streaming_model(model, imgs, *args, **kwargs):
     return save_dict
 
 
-def inference_streaming_model_lc(model, imgs, img_dir, *args, **kwargs):
+def inference_streaming_model_lc(
+        model,
+        imgs,
+        img_dir,
+        image_paths=None,
+        *args,
+        **kwargs,
+):
+    if image_paths is None:
+        raise ValueError(
+            "streaming_pi3_lc evaluation requires the exact image_paths "
+            "used to build imgs"
+        )
+    if len(image_paths) != len(imgs):
+        raise ValueError(
+            "image manifest length does not match evaluation tensor: "
+            f"{len(image_paths)} != {len(imgs)}"
+        )
+
     image_windows = model.img_sliding_window(imgs)
 
     model.begin()
@@ -112,36 +132,34 @@ def inference_streaming_model_lc(model, imgs, img_dir, *args, **kwargs):
         model(sample)
     model.end()
 
-    cache_path = Path(model.cache_dir)
-    cache_path_lc = cache_path.parent / f'{cache_path.name}_lc'
+    loop_output_path = Path(model.cache_dir) / "loop_closures.txt"
     lc_engine = LoopClosureEngine(
         load_config('configs/loop_config.yaml'),
         img_dir,
-        cache_path_lc,
+        loop_output_path,
         model.delegate,
         model.window_size,
         model.overlap,
+        registration_top_confidence_ratio=(
+            model.registration_top_confidence_ratio
+        ),
+        image_paths=image_paths,
     )
 
     cache_files = sorted(glob.glob(str(model.temp_cache_dir / 'window_cache_*.pt')),
                          key=lambda p: int(p.split('_')[-1].split('.')[0]))
     raw_predictions = [StreamingWindowEngine.parse_cache_file(cache_fname) for cache_fname in cache_files]
-    sim3_list_lc = lc_engine.run(raw_predictions)
-    sim3_list_lc.insert(0, raw_predictions[0]['sim3'])
-
-    os.makedirs(str(cache_path_lc), exist_ok=True)
-    for idx, (pred, sim3_lc) in enumerate(zip(raw_predictions, sim3_list_lc)):
-        pred['sim3'] = sim3_lc
-        torch.save(pred, str(cache_path_lc / f'window_cache_{idx}.pt'))
-
-    cache_files_lc = sorted(glob.glob(str(cache_path_lc / 'window_cache_*.pt')),
-                            key=lambda p: int(p.split('_')[-1].split('.')[0]))
-    parsed_caches = [StreamingWindowEngine.parse_cache_file(cache_files_lc[0])]
-    for cache_fname in cache_files_lc[1:]:
-        parsed_caches.append(StreamingWindowEngine.parse_cache_file(cache_fname, overlap=model.overlap))
-
-    ret_dict = StreamingWindowEngineLC._post_process_pred(StreamingWindowEngineLC.aggregate_caches(parsed_caches))
-    shutil.rmtree(cache_path_lc)
+    optimized_absolute = lc_engine.run(raw_predictions)
+    parsed_caches = prepare_caches_for_aggregation(
+        raw_predictions,
+        model.overlap,
+    )
+    ret_dict = StreamingWindowEngineLC._post_process_pred(
+        StreamingWindowEngineLC.aggregate_caches(
+            parsed_caches,
+            optimized_absolute,
+        )
+    )
     for key in ret_dict.keys():
         if isinstance(ret_dict[key], torch.Tensor):
             ret_dict[key] = ret_dict[key].cpu()

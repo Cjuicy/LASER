@@ -22,6 +22,9 @@ from tqdm import tqdm
 import glob
 from pathlib import Path
 from utils.image_paths import discover_images, natural_sort_key
+from inference_engine.utils.cache_utils import (
+    prepare_caches_for_aggregation,
+)
 
 # 初始化与设备配置
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -101,12 +104,12 @@ def build_loop_closure_engine(
     args,
     pi3_model,
     image_paths,
-    cache_path_lc,
+    loop_output_path,
 ):
     return LoopClosureEngine(
         config,
         args.data_path,
-        cache_path_lc,
+        loop_output_path,
         pi3_model,
         args.window_size,
         args.overlap,
@@ -116,22 +119,6 @@ def build_loop_closure_engine(
         ),
         image_paths=image_paths,
     )
-
-
-def prepare_caches_for_aggregation(raw_predictions, overlap):
-    if overlap < 0:
-        raise ValueError("overlap must be non-negative")
-
-    parsed_caches = []
-    for index, prediction in enumerate(raw_predictions):
-        trim = overlap if index > 0 else 0
-        parsed_caches.append({
-            key: value[trim:]
-            if isinstance(value, torch.Tensor)
-            else value
-            for key, value in prediction.items()
-        })
-    return parsed_caches
 
 
 def run_loop_closure_pipeline(
@@ -229,13 +216,13 @@ if __name__ == "__main__":
     # 📒2️⃣ 创建回环检测引擎
     config = load_config(args.config_path)
     cache_path = Path(args.cache_path)
-    cache_path_lc = cache_path.parent / f'{cache_path.name}_lc'
+    loop_output_path = cache_path / "loop_closures.txt"
     lc_engine = build_loop_closure_engine(
         config,
         args,
         pi3_model,
         image_names,
-        cache_path_lc,
+        loop_output_path,
     )
 
     # 3️⃣ 读取原始窗口缓存

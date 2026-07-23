@@ -13,6 +13,22 @@ from tqdm import tqdm
 from eval.eval_metadata import dataset_metadata
 
 
+def run_model_inference(
+        args,
+        model,
+        images,
+        image_dir,
+        image_paths,
+):
+    if args.model == 'streaming_pi3_lc':
+        return model(
+            images,
+            image_dir,
+            image_paths=image_paths,
+        )
+    return model(images)
+
+
 def eval_pose_estimation(args, model, device, dtype, save_dir=None, inverse_extrinsic=True):
     metadata = dataset_metadata.get(args.eval_dataset, dataset_metadata['sintel'])
     img_path = metadata['img_path']
@@ -102,7 +118,13 @@ def eval_pose_estimation_dist(args, model, device, dtype, img_path, save_dir=Non
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=dtype):
                     # Predict attributes including cameras, depth maps, and point maps.
-                    predictions = model(imgs) if args.model == 'streaming_pi3' else model(imgs, dir_path)
+                    predictions = run_model_inference(
+                        args,
+                        model,
+                        imgs,
+                        dir_path,
+                        filelist,
+                    )
 
             if 'pose_enc' in predictions.keys():
                 print("Converting pose encoding to extrinsic and intrinsic matrices...")

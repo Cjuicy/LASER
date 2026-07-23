@@ -15,10 +15,6 @@ pi3_model_module = types.ModuleType("pi3.models.pi3")
 pi3_model_module.Pi3 = StubPi3
 sys.modules["pi3.models.pi3"] = pi3_model_module
 
-inference_engine_module = types.ModuleType("inference_engine")
-inference_engine_module.StreamingWindowEngine = object
-sys.modules["inference_engine"] = inference_engine_module
-
 load_fn_module = types.ModuleType("utils.load_fn")
 load_fn_module.load_and_preprocess_images = lambda paths: paths
 sys.modules["utils.load_fn"] = load_fn_module

@@ -55,6 +55,7 @@ from .inference_utils import (
 )
 from .utils.geometry import homogenize_points
 from .utils.registration_confidence import (
+    intersect_confidence_masks,
     select_top_confidence_mask,
     validate_confidence_keep_ratio,
 )
@@ -78,7 +79,6 @@ class StreamingWindowEngine(VanillaEngine):
             intermediate_device: str = 'cuda',
             process_device: str = 'cpu',
             top_conf_percentile: float = 0.5,
-            registration_top_confidence_ratio: float = None,
             window_size: int = 20,
             overlap: int = 5,
             depth_refine=True,
@@ -87,6 +87,7 @@ class StreamingWindowEngine(VanillaEngine):
             segment_mode: str = "depth",
             normal_method: str = "cross",
             geometry_seg_profile: str = "baseline_params",
+            registration_top_confidence_ratio: float = None,
     ):
         if segment_mode not in SEGMENT_MODES:
             raise ValueError(
@@ -300,7 +301,11 @@ class StreamingWindowEngine(VanillaEngine):
                     self.prev_window_cache['conf'][-self.overlap:],
                     self.registration_top_confidence_ratio,
                 )
-                conf_mask = prev_mask & tgt_mask
+                conf_mask = intersect_confidence_masks(
+                    prev_mask,
+                    tgt_mask,
+                    context="sequential registration",
+                )
 
                 # 3️⃣ 取相邻窗口的重叠点云
                 # metric depth align

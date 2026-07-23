@@ -8,9 +8,13 @@ from .utils.sim3utils import *
 
 from utils.load_fn import load_and_preprocess_images
 from pi3.models.pi3 import Pi3
-from inference_engine import StreamingWindowEngine
+from inference_engine import (
+    StreamingWindowEngine,
+    StreamingWindowEngineLC,
+)
 from inference_engine.inference_utils import register_adjacent_windows
 from inference_engine.utils.registration_confidence import (
+    intersect_confidence_masks,
     select_top_confidence_mask,
     validate_confidence_keep_ratio,
 )
@@ -146,7 +150,10 @@ class LoopClosureEngine:
                 start_idx + self.window_size,
                 len(self.img_list),
             )
-            if end_idx - start_idx <= self.overlap:
+            if (
+                    start_idx > 0
+                    and end_idx - start_idx <= self.overlap
+            ):
                 break
             chunk_indices.append((start_idx, end_idx))
         return chunk_indices
@@ -249,13 +256,25 @@ class LoopClosureEngine:
                 conf_map_a,
                 self.registration_top_confidence_ratio,
             )
+            try:
+                mutual_mask_a = intersect_confidence_masks(
+                    conf_mask_loop,
+                    conf_mask_a,
+                    context=(
+                        f"loop constraint {chunk_idx_a}->{chunk_idx_b} "
+                        "side A"
+                    ),
+                )
+            except ValueError as error:
+                print(f"Skipping loop candidate: {error}")
+                continue
 
             s_a, R_a, t_a = register_adjacent_windows(
                 point_map_a,
                 point_map_loop,
                 cam_pose_a,
                 cam_pose_loop,
-                conf_mask_loop & conf_mask_a
+                mutual_mask_a,
             )
 
             point_map_loop = item[1]['local_points'][-chunk_b_range[1] + chunk_b_range[0]:]
@@ -278,13 +297,25 @@ class LoopClosureEngine:
                 conf_map_b,
                 self.registration_top_confidence_ratio,
             )
+            try:
+                mutual_mask_b = intersect_confidence_masks(
+                    conf_mask_loop,
+                    conf_mask_b,
+                    context=(
+                        f"loop constraint {chunk_idx_a}->{chunk_idx_b} "
+                        "side B"
+                    ),
+                )
+            except ValueError as error:
+                print(f"Skipping loop candidate: {error}")
+                continue
 
             s_b, R_b, t_b = register_adjacent_windows(
                 point_map_b,
                 point_map_loop,
                 cam_pose_b,
                 cam_pose_loop,
-                conf_mask_loop & conf_mask_b
+                mutual_mask_b,
             )
 
             s_ab, R_ab, t_ab = compute_sim3_ab((s_a, R_a, t_a), (s_b, R_b, t_b))
@@ -359,11 +390,14 @@ if __name__ == '__main__':
                          key=lambda p: int(p.split('_')[-1].split('.')[0]))
     raw_predictions = [StreamingWindowEngine.parse_cache_file(cache_fname) for cache_fname in cache_files]
     optimized_absolute = loop_closure.run(raw_predictions)
+    adjusted_predictions = (
+        StreamingWindowEngineLC.apply_optimization_deltas(
+            raw_predictions,
+            optimized_absolute,
+        )
+    )
 
-    for idx, (prediction, optimized) in enumerate(
-            zip(raw_predictions, optimized_absolute)):
-        output_prediction = dict(prediction)
-        output_prediction['sim3_optimized_abs'] = optimized
+    for idx, output_prediction in enumerate(adjusted_predictions):
         torch.save(
             output_prediction,
             output_dir / f'window_cache_{idx}.pt',

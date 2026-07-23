@@ -20,9 +20,34 @@ def select_top_confidence_mask(
     if finite_values.numel() == 0:
         raise ValueError("confidence contains no finite values")
 
+    quantile_values = (
+        finite_values
+        if finite_values.dtype in (torch.float32, torch.float64)
+        else finite_values.float()
+    )
     threshold = torch.quantile(
-        finite_values,
+        quantile_values,
         1.0 - ratio,
         interpolation="nearest",
     )
     return finite & (confidence >= threshold)
+
+
+def intersect_confidence_masks(
+    source_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    *,
+    context: str = "registration",
+) -> torch.Tensor:
+    if source_mask.shape != target_mask.shape:
+        raise ValueError(
+            f"{context} confidence mask shapes do not match: "
+            f"{tuple(source_mask.shape)} != {tuple(target_mask.shape)}"
+        )
+
+    mutual_mask = source_mask & target_mask
+    if not torch.any(mutual_mask):
+        raise ValueError(
+            f"{context} has no shared high-confidence pixels"
+        )
+    return mutual_mask
