@@ -20,6 +20,17 @@ def compose_sim3(first, second):
     )
 
 
+def inverse_sim3(scale, rotation=None, translation=None):
+    if rotation is None and translation is None:
+        scale, rotation, translation = scale
+    inverse_scale = 1.0 / scale
+    inverse_rotation = rotation.T
+    inverse_translation = (
+        -inverse_scale * inverse_rotation @ translation
+    )
+    return inverse_scale, inverse_rotation, inverse_translation
+
+
 def compute_sim3_ab(sim3_a, sim3_b):
     scale_a, rotation_a, translation_a = sim3_a
     scale_b, rotation_b, translation_b = sim3_b
@@ -192,6 +203,7 @@ def load_loop_engine_module(monkeypatch):
 
     fake_geometry = types.ModuleType("inference_engine.utils.geometry")
     fake_geometry.accumulate_sim3 = compose_sim3
+    fake_geometry.closed_form_inverse_sim3 = inverse_sim3
     monkeypatch.setitem(
         sys.modules,
         "inference_engine.utils.geometry",
@@ -304,7 +316,7 @@ def test_optimizer_receives_edges_and_returns_reaccumulated_absolutes(
     assert_sim3_close(optimized_absolute[1], make_sim3(3.0))
 
 
-def test_loop_constraints_use_corrected_cache_points_and_ab_direction(
+def test_loop_constraints_convert_global_alignments_to_local_measurement(
     monkeypatch,
     tmp_path,
 ):
@@ -348,8 +360,69 @@ def test_loop_constraints_use_corrected_cache_points_and_ab_direction(
     assert len(constraints) == 1
     chunk_a, chunk_b, constraint_ab = constraints[0]
     assert (chunk_a, chunk_b) == (0, 1)
-    assert_sim3_close(constraint_ab, make_sim3(3.0))
+    assert_sim3_close(constraint_ab, make_sim3(1.5))
     assert optimizer.calls == []
+
+
+def rotation_z(degrees):
+    radians = torch.deg2rad(torch.tensor(float(degrees)))
+    cosine = torch.cos(radians)
+    sine = torch.sin(radians)
+    zero = torch.zeros_like(cosine)
+    one = torch.ones_like(cosine)
+    return torch.stack((
+        torch.stack((cosine, -sine, zero)),
+        torch.stack((sine, cosine, zero)),
+        torch.stack((zero, zero, one)),
+    ))
+
+
+def test_build_local_loop_constraint_recovers_joint_local_measurement(
+    monkeypatch,
+    tmp_path,
+):
+    module, _, _, _ = make_engine(monkeypatch, tmp_path)
+    sim3_abs_a = (
+        1.4,
+        rotation_z(25.0),
+        torch.tensor([3.0, -2.0, 1.0]),
+    )
+    sim3_abs_b = (
+        0.8,
+        rotation_z(-35.0),
+        torch.tensor([-4.0, 1.5, 0.5]),
+    )
+    local_alignment_a = (
+        1.1,
+        rotation_z(12.0),
+        torch.tensor([0.4, -0.2, 0.7]),
+    )
+    local_alignment_b = (
+        0.9,
+        rotation_z(-18.0),
+        torch.tensor([-0.3, 0.8, -0.1]),
+    )
+    global_alignment_a = compose_sim3(
+        sim3_abs_a,
+        local_alignment_a,
+    )
+    global_alignment_b = compose_sim3(
+        sim3_abs_b,
+        local_alignment_b,
+    )
+    expected = compose_sim3(
+        local_alignment_b,
+        inverse_sim3(local_alignment_a),
+    )
+
+    actual = module.build_local_loop_constraint(
+        sim3_abs_a,
+        sim3_abs_b,
+        global_alignment_a,
+        global_alignment_b,
+    )
+
+    assert_sim3_close(actual, expected)
 
 
 def test_loop_candidate_with_disjoint_confidence_is_skipped(

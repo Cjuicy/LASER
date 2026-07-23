@@ -18,7 +18,10 @@ from inference_engine.utils.registration_confidence import (
     select_top_confidence_mask,
     validate_confidence_keep_ratio,
 )
-from inference_engine.utils.geometry import accumulate_sim3
+from inference_engine.utils.geometry import (
+    accumulate_sim3,
+    closed_form_inverse_sim3,
+)
 from utils.image_paths import discover_images
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -78,6 +81,25 @@ def accumulate_edges_from_identity(
             accumulate_sim3(absolute_transforms[-1], edge)
         )
     return absolute_transforms
+
+
+def build_local_loop_constraint(
+        sim3_abs_a,
+        sim3_abs_b,
+        global_alignment_a,
+        global_alignment_b,
+):
+    global_correction = accumulate_sim3(
+        global_alignment_b,
+        closed_form_inverse_sim3(*global_alignment_a),
+    )
+    return accumulate_sim3(
+        closed_form_inverse_sim3(*sim3_abs_b),
+        accumulate_sim3(
+            global_correction,
+            sim3_abs_a,
+        ),
+    )
 
 
 class LoopClosureEngine:
@@ -318,7 +340,12 @@ class LoopClosureEngine:
                 mutual_mask_b,
             )
 
-            s_ab, R_ab, t_ab = compute_sim3_ab((s_a, R_a, t_a), (s_b, R_b, t_b))
+            s_ab, R_ab, t_ab = build_local_loop_constraint(
+                raw_predictions[chunk_idx_a]["sim3_abs"],
+                raw_predictions[chunk_idx_b]["sim3_abs"],
+                (s_a, R_a, t_a),
+                (s_b, R_b, t_b),
+            )
             self.loop_constraints.append(
                 (
                     chunk_idx_a,
