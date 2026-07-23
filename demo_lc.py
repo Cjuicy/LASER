@@ -18,11 +18,11 @@ from loop_closure.utils.config_utils import load_config
 
 import os
 import argparse
-import re
 from tqdm import tqdm
 import glob
 import shutil
 from pathlib import Path
+from utils.image_paths import discover_images, natural_sort_key
 
 # 初始化与设备配置
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -58,22 +58,6 @@ def get_args_parser():
     return parser
 
 
-def natural_sort_key(path):
-    """按文件名中的数字大小生成自然排序键。"""
-    parts = re.split(r'(\d+)', os.path.basename(path).lower())
-    return [(1, int(part)) if part.isdigit() else (0, part) for part in parts]
-
-
-def discover_images(data_path, sample_interval):
-    """筛选并自然排序图片，然后按指定间隔采样。"""
-    image_names = [
-        os.path.join(data_path, name)
-        for name in os.listdir(data_path)
-        if name.lower().endswith(('.png', '.jpg', '.jpeg'))
-    ]
-    return sorted(image_names, key=natural_sort_key)[::sample_interval]
-
-
 # 加载模型
 def load_model(args):
     # model
@@ -102,6 +86,26 @@ def load_model(args):
         normal_method=args.normal_method,
         geometry_seg_profile=args.geometry_seg_profile,
     )
+
+
+def build_loop_closure_engine(
+    config,
+    args,
+    pi3_model,
+    image_paths,
+    cache_path_lc,
+):
+    return LoopClosureEngine(
+        config,
+        args.data_path,
+        cache_path_lc,
+        pi3_model,
+        args.window_size,
+        args.overlap,
+        args.sample_interval,
+        image_paths=image_paths,
+    )
+
 
 # 手动将列表划分为多个重叠窗口
 def sliding_window(lst, window_size, overlap):
@@ -166,7 +170,7 @@ def run_dynamic_scene(args):
     img_names = discover_images(data_path, args.sample_interval)
     print(f'Found {len(img_names)} images.')
     run_model(img_names)
-    return scene_name
+    return scene_name, img_names
 
 # 主程序解析
 if __name__ == "__main__":
@@ -176,20 +180,18 @@ if __name__ == "__main__":
     pi3_model, model = load_model(args)
 
     model.eval()
-    scene_name = run_dynamic_scene(args)
+    scene_name, image_names = run_dynamic_scene(args)
 
     # 📒2️⃣ 创建回环检测引擎
     config = load_config(args.config_path)
     cache_path = Path(args.cache_path)
     cache_path_lc = cache_path.parent / f'{cache_path.name}_lc'
-    lc_engine = LoopClosureEngine(
+    lc_engine = build_loop_closure_engine(
         config,
-        args.data_path,
-        cache_path_lc,
+        args,
         pi3_model,
-        args.window_size,
-        args.overlap,
-        args.sample_interval
+        image_names,
+        cache_path_lc,
     )
 
     # 3️⃣ 读取原始窗口缓存

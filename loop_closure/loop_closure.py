@@ -10,6 +10,7 @@ from utils.load_fn import load_and_preprocess_images
 from pi3.models.pi3 import Pi3
 from inference_engine import StreamingWindowEngine
 from inference_engine.inference_utils import register_adjacent_windows
+from utils.image_paths import discover_images
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -55,7 +56,8 @@ class LoopClosureEngine:
             window_size,
             overlap,
             sample_interval=1,
-            top_conf_percentile=0.5
+            top_conf_percentile=0.5,
+            image_paths=None,
     ):
         self.config = config
 
@@ -65,14 +67,15 @@ class LoopClosureEngine:
         self.top_conf_percentile = top_conf_percentile
 
         self.img_dir = image_dir
-        self.img_list = None
+        self.img_list = image_paths
         self.sample_interval = sample_interval
 
         self.loop_detector = LoopDetector(
             image_dir=image_dir,
             sample_interval=sample_interval,
             output=output_dir,
-            config=config
+            config=config,
+            image_paths=image_paths,
         )
 
         self.chunk_indices = None
@@ -201,8 +204,11 @@ class LoopClosureEngine:
 
     def run(self, raw_predictions):
         print(f"Loading images from {self.img_dir}...")
-        self.img_list = sorted(glob.glob(os.path.join(self.img_dir, "*.jpg")) +
-                               glob.glob(os.path.join(self.img_dir, "*.png")))[::self.sample_interval]
+        if self.img_list is None:
+            self.img_list = discover_images(
+                self.img_dir,
+                sample_interval=self.sample_interval,
+            )
 
         if len(self.img_list) == 0:
             raise ValueError(f"[DIR EMPTY] No images found in {self.img_dir}!")
