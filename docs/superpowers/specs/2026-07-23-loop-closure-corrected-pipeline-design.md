@@ -1,141 +1,137 @@
-# LASER Loop-Closure Corrected Pipeline Design
+# LASER 回环矫正流水线设计
 
-## 1. Purpose
+## 1. 设计目的
 
-This change makes loop-closure reconstruction build on the same forward
-correction pipeline as non-loop reconstruction:
+本次改动使回环重建建立在与非回环重建一致的前向矫正流程之上：
 
-1. process every window sequentially;
-2. immediately apply whole-window Sim(3) alignment;
-3. immediately apply the existing segmentation scale mask;
-4. use the corrected window as the next registration reference;
-5. detect loops only after the initial trajectory is complete;
-6. optimize sequential and loop Sim(3) constraints together; and
-7. apply only the optimized correction delta during final aggregation.
+1. 按顺序处理所有窗口；
+2. 立即应用窗口整体 Sim(3) 对齐；
+3. 立即应用现有的分割尺度 mask；
+4. 使用矫正后的当前窗口作为下一窗口的配准参考；
+5. 完整初始轨迹生成后再检测回环；
+6. 将顺序 Sim(3) 约束和回环 Sim(3) 约束共同送入优化器；
+7. 最终聚合时只应用优化前后的增量变换。
 
-The loop-closure path will also use one canonical image manifest and one
-unambiguous registration-confidence ratio. The approved default is `0.3`,
-meaning that each registration input keeps its highest-confidence
-approximately 30 percent of finite pixels before the two masks are
-intersected.
+回环链路还将统一使用一份规范图像清单和一个语义明确的配准置信度比例。
+已经确认的默认值为 `0.3`，含义是：每个配准输入先从有限置信度像素中
+保留置信度最高的约 30%，然后再对两侧 mask 取交集。
 
-## 2. Baseline and Scope
+## 2. 基线与范围
 
-The implementation branch is `codex/loop-closure-corrected-pipeline`, based
-on commit `98cce5f9f470599aca0cf5a6614f39409d929d58` from
-`codex/unified-segmentation-methods`.
+实现分支为 `codex/loop-closure-corrected-pipeline`，基于
+`codex/unified-segmentation-methods` 的提交
+`98cce5f9f470599aca0cf5a6614f39409d929d58`。
 
-### In scope
+### 2.1 本次范围
 
-- canonical natural image ordering across streaming inference, SALAD, and
-  joint Pi3 loop prediction;
-- a shared `0.3` registration-confidence ratio for adjacent-window and
-  loop-side registration;
-- a backward-compatible registration-confidence hook in the base streaming
-  engine so non-loop and loop first stages can be compared with identical
-  effective settings;
-- immediate forward correction in `StreamingWindowEngineLC`;
-- explicit absolute and sequential Sim(3) cache fields;
-- loop constraints built from already corrected window caches;
-- optimized transform accumulation and one-time final correction;
-- no-loop equivalence; and
-- focused CPU unit tests plus a documented real-sequence validation command.
+- 统一流式推理、SALAD 和回环联合 Pi3 的自然图像排序；
+- 相邻窗口配准与回环两侧配准统一使用 `0.3` 置信度保留比例；
+- 在基础流式引擎中增加向后兼容的独立配准置信度接口，使非回环和回环
+  第一阶段可以在完全相同的有效参数下比较；
+- `StreamingWindowEngineLC` 立即执行前向矫正；
+- 缓存明确的绝对 Sim(3) 和顺序相对 Sim(3)；
+- 使用第一阶段已经矫正的窗口缓存构建回环约束；
+- 重新累积优化后的变换，并且最终只应用一次增量矫正；
+- 保证无回环约束时输出不变；
+- 增加聚焦的 CPU 单元测试，并记录真实序列验证命令。
 
-### Out of scope
+### 2.2 不在本次范围
 
-- changing the three segmentation methods;
-- changing segmentation parameters or confidence selection;
-- changing segment graph construction;
-- changing region matching;
-- changing scale-anchor estimation or propagation;
-- changing `refine_depth_segments()`;
-- changing SALAD descriptor extraction;
-- changing the mathematical form of `Sim3LoopOptimizer`; and
-- changing the default behavior of the non-loop entry point; and
-- adding a new loop-candidate ranking or anchor-propagation algorithm.
+- 修改三种分割方法；
+- 修改分割参数或分割置信度选择；
+- 修改分割图构建；
+- 修改区域匹配；
+- 修改尺度锚点估计或传播；
+- 修改 `refine_depth_segments()`；
+- 修改 SALAD 描述子提取；
+- 修改 `Sim3LoopOptimizer` 的数学形式；
+- 修改非回环入口的默认行为；
+- 增加新的回环候选排序或锚点传播算法。
 
-## 3. Findings in the Current Code
+## 3. 当前代码问题
 
-The current implementation has four independent problems.
+当前实现存在四个相互独立的问题。
 
-### 3.1 Image indices are not stable across the pipeline
+### 3.1 图像索引在各阶段之间不稳定
 
-`demo_lc.py` discovers a naturally sorted, sampled sequence, but
-`LoopClosureEngine` and `LoopDetector` scan the directory again and use
-lexicographic sorting. Numbered names can therefore become
-`frame1, frame10, frame2`, and the three scanners do not accept exactly the
-same extension set. SALAD indices can consequently refer to different frames
-than the window and joint-Pi3 paths.
+`demo_lc.py` 会生成自然排序且已经采样的图像序列，但
+`LoopClosureEngine` 和 `LoopDetector` 会再次扫描目录，并使用普通字符串排序。
+带数字的文件名可能因此变成 `frame1, frame10, frame2`。三个扫描位置支持的
+扩展名集合也不完全一致。
 
-### 3.2 Forward correction is deferred in loop mode
+结果是：SALAD 返回的帧索引可能与窗口推理和回环联合 Pi3 所使用的帧不一致。
 
-`StreamingWindowEngineLC` saves the estimated Sim(3) and scale mask but does
-not immediately apply them. The following window registers against an
-uncorrected cache, so loop mode does not reproduce the non-loop forward
-pipeline.
+### 3.2 回环模式延迟执行前向矫正
 
-### 3.3 Final aggregation applies ambiguous transforms
+`StreamingWindowEngineLC` 当前只保存估计出的 Sim(3) 和分割尺度 mask，
+没有立即应用它们。后一个窗口因此仍然与未矫正缓存配准，回环模式无法复现
+非回环模式的前向传播过程。
 
-The existing loop aggregation accumulates cached transforms and applies
-segmentation masks late. Its mask branch uses the previous cumulative scale
-instead of the current cumulative scale. More importantly, late application
-cannot make the earlier corrected geometry participate in later registration.
+### 3.3 最终聚合阶段的变换语义不明确
 
-### 3.4 The `top_conf_percentile` name has opposite meanings
+当前回环聚合逻辑在序列结束后才累计缓存变换并应用分割 mask。带 mask 的分支
+使用了前一窗口的累计尺度，而不是当前窗口的累计尺度。
 
-The streaming engine converts a keep ratio to a quantile with
-`1 - top_conf_percentile`. `LoopClosureEngine` uses the supplied value
-directly as a quantile. Setting both call sites to `0.3` would therefore keep
-about 30 percent in one path and about 70 percent in the other. The streaming
-value is also forwarded to segmentation, so changing that existing field
-would unintentionally change segmentation behavior.
+更重要的是，即使最终补应用的数值正确，延迟矫正也无法让当前窗口的矫正结果
+参与下一窗口的配准。
 
-## 4. Selected Approach
+### 3.4 `top_conf_percentile` 在两处具有相反语义
 
-The selected approach separates registration confidence from segmentation
-confidence, makes the canonical image manifest an explicit dependency, and
-stores both absolute and relative transforms.
+流式引擎通过 `1 - top_conf_percentile` 将保留比例转换为分位点；
+`LoopClosureEngine` 则直接把传入值当作分位点。
 
-A minimal literal replacement of `0.5` with `0.3` is rejected because it
-preserves the opposite quantile interpretations and changes segmentation
-inputs. An exact combined-confidence top-k selection is also rejected for this
-iteration because it would replace the current per-side thresholding and
-intersection algorithm.
+如果两处都直接写成 `0.3`，一处会保留最高约 30%，另一处会保留约 70%。
+此外，流式引擎的同一个字段还会传给分割模块，直接修改它会意外改变分割行为。
 
-## 5. Canonical Image Manifest
+## 4. 选定方案
 
-Add `utils/image_paths.py` with:
+采用以下方案：
+
+- 将配准置信度与分割置信度解耦；
+- 将规范图像清单作为显式依赖向下传递；
+- 同时缓存绝对变换和相对顺序边；
+- 第一阶段立即应用整体 Sim(3) 和分割 mask；
+- 最终只应用优化前后的变换增量。
+
+不采用仅把源码中的 `0.5` 替换为 `0.3` 的方案，因为它无法消除两处相反的
+分位点解释，还会影响分割输入。
+
+本次也不采用“融合两侧置信度后精确 top-k 30%”的方案，因为这会替换现有的
+“两侧分别筛选、然后取交集”算法，超出当前范围。
+
+## 5. 规范图像清单
+
+新增 `utils/image_paths.py`，提供：
 
 ```python
 natural_sort_key(path) -> list[tuple[int, str | int]]
 discover_images(data_path, sample_interval=1) -> list[str]
 ```
 
-`discover_images()` will:
+`discover_images()` 的约束为：
 
-- require `sample_interval >= 1`;
-- require an existing directory;
-- accept case-insensitive `.png`, `.jpg`, and `.jpeg` files;
-- sort by the numeric portions of the basename; and
-- apply `sample_interval` only after sorting.
+- `sample_interval >= 1`；
+- 输入目录必须存在；
+- 支持大小写不敏感的 `.png`、`.jpg` 和 `.jpeg`；
+- 根据文件名中的数字部分自然排序；
+- 排序完成后再应用 `sample_interval`。
 
-`demo_lc.py` creates this manifest once. The exact list is then passed to:
+`demo_lc.py` 只创建一次规范图像清单，并将同一列表传给：
 
-- `StreamingWindowEngineLC` window inference;
-- `LoopClosureEngine`; and
-- `LoopDetector`.
+- `StreamingWindowEngineLC` 的窗口推理；
+- `LoopClosureEngine`；
+- `LoopDetector`。
 
-An explicitly supplied manifest is already sorted and sampled. Downstream
-components must not rescan, resort, or resample it. Standalone loop APIs may
-use `discover_images()` only when no manifest was supplied.
+显式传入的图像清单已经完成排序和采样。下游模块不能再次扫描、排序或采样。
+只有独立调用回环 API 且没有传入清单时，才允许通过 `discover_images()` 回退
+发现图像。
 
-Before loop detection, the engine verifies that the canonical manifest
-produces the same number of windows as the cache list.
+回环检测开始前，需要验证规范图像清单产生的窗口数量与缓存数量一致。
 
-## 6. Registration Confidence
+## 6. 配准置信度
 
-Add a registration-only helper in
-`inference_engine/utils/registration_confidence.py`:
+在 `inference_engine/utils/registration_confidence.py` 中增加仅供配准使用的
+辅助函数：
 
 ```python
 select_top_confidence_mask(
@@ -144,17 +140,16 @@ select_top_confidence_mask(
 ) -> torch.Tensor
 ```
 
-The contract is:
+接口约束如下：
 
-- `keep_ratio` must satisfy `0 < keep_ratio <= 1`;
-- non-finite confidence values are always excluded;
-- the quantile is `1 - keep_ratio`;
-- quantile interpolation remains `nearest`;
-- the mask uses `confidence >= threshold`; and
-- equal values at the threshold may retain slightly more than the requested
-  ratio.
+- `keep_ratio` 必须满足 `0 < keep_ratio <= 1`；
+- 非有限置信度值始终排除；
+- 使用的分位点为 `1 - keep_ratio`；
+- 分位点插值继续使用 `nearest`；
+- mask 条件为 `confidence >= threshold`；
+- 阈值处存在相同数值时，允许实际保留比例略高于目标比例。
 
-Registration keeps the existing mutual-mask rule:
+配准继续保留现有的双侧 mask 交集规则：
 
 ```python
 mask = (
@@ -163,341 +158,333 @@ mask = (
 )
 ```
 
-This rule is used for:
+该规则统一用于：
 
-- the previous and current overlap during forward registration;
-- the joint-Pi3 A slice and corrected A cache slice; and
-- the joint-Pi3 B slice and corrected B cache slice.
+- 第一阶段前一窗口与当前窗口的重叠区域；
+- 联合 Pi3 的 A 侧切片与矫正缓存 A；
+- 联合 Pi3 的 B 侧切片与矫正缓存 B。
 
-`StreamingWindowEngine` gains an optional
-`registration_top_confidence_ratio=None` compatibility hook. When omitted,
-it derives the existing registration behavior from the legacy
-`top_conf_percentile` argument, so the non-loop default remains unchanged.
-The new field controls registration masks only; the existing
-`top_conf_percentile` field continues to control segmentation exactly as it
-does at the baseline.
+`StreamingWindowEngine` 增加可选参数：
 
-`StreamingWindowEngineLC` sets
-`registration_top_confidence_ratio=0.3` by default and forwards it through
-the base hook. `LoopClosureEngine` uses the same registration argument.
-`demo_lc.py` exposes one argument with a default of `0.3` and forwards the
-same value to both engines. A parity test can instantiate both streaming
-engines with an explicit registration ratio of `0.3` while leaving their
-segmentation setting identical.
+```python
+registration_top_confidence_ratio=None
+```
 
-No segmentation function receives the new registration ratio.
+该参数省略时，从旧的 `top_conf_percentile` 参数推导现有配准行为，因此非回环
+默认行为保持不变。新字段只控制配准 mask；旧的 `top_conf_percentile`
+继续像基线版本一样控制分割。
 
-## 7. Sim(3) Convention
+`StreamingWindowEngineLC` 默认显式设置：
 
-For a Sim(3) `S = (s, R, t)`, application is:
+```python
+registration_top_confidence_ratio=0.3
+```
+
+并通过父类接口转发。`LoopClosureEngine` 使用相同参数。`demo_lc.py` 对外提供
+一个默认值为 `0.3` 的参数，并将同一个值传给两个引擎。
+
+测试非回环一致性时，可以让两个流式引擎显式使用 `0.3` 配准比例，同时保持
+它们的分割置信度参数完全一致。
+
+任何分割函数都不能收到新的配准比例。
+
+## 7. Sim(3) 约定
+
+对于 Sim(3) 变换 `S = (s, R, t)`，其作用为：
 
 ```text
 S(x) = s R x + t
 ```
 
-Composition follows the existing `accumulate_sim3(S1, S2)` convention:
+组合使用现有 `accumulate_sim3(S1, S2)` 的约定：
 
 ```text
 accumulate_sim3(S1, S2) = S1 compose S2
 ```
 
-### 7.1 Absolute transform
+即先应用 `S2`，再应用 `S1`。
 
-Because adjacent registration uses the previous corrected point cloud and
-propagated camera poses as its target, the returned transform maps the current
-raw window into the first-stage global coordinate system. It is stored as:
+### 7.1 绝对变换
+
+相邻窗口配准以已经矫正的前一窗口点云和传播后的相机位姿作为目标，因此返回的
+变换会把当前原始窗口映射到第一阶段的全局坐标系。该变换保存为：
 
 ```text
 G_i = sim3_abs[i]
 ```
 
-The first window uses `G_0 = identity`.
+第一窗口使用：
 
-### 7.2 Sequential edge
+```text
+G_0 = identity
+```
 
-The optimizer requires a relative edge, not the absolute transform:
+### 7.2 顺序相对边
+
+优化器需要相对边，而不是绝对变换：
 
 ```text
 E_(i-1,i) = inverse(G_(i-1)) compose G_i
 ```
 
-The implementation must preserve the invariant:
+实现必须保持以下不变量：
 
 ```text
 G_(i-1) compose E_(i-1,i) == G_i
 ```
 
-The first cache has no sequential edge. For `N` windows, the optimizer
-receives exactly `N - 1` sequential edges.
+第一窗口缓存不包含顺序边。对于 `N` 个窗口，优化器必须收到且只收到
+`N - 1` 条顺序边。
 
-## 8. First-Stage Forward Pipeline
+## 8. 第一阶段前向流水线
 
-`StreamingWindowEngineLC` retains its loop-specific cache metadata but changes
-its per-window processing order to match `StreamingWindowEngine`.
+`StreamingWindowEngineLC` 保留回环专用的缓存元数据，但每个窗口的处理顺序
+改为与 `StreamingWindowEngine` 一致。
 
-### 8.1 First window
+### 8.1 第一窗口
 
-1. run Pi3 inference;
-2. estimate and fix the reference intrinsic;
-3. unproject the depth with that intrinsic;
-4. build the existing segment graph when depth refinement is enabled;
-5. set `sim3_abs` to identity;
-6. omit `sim3_edge`; and
-7. cache the window as the next registration reference.
+1. 运行 Pi3 推理；
+2. 估计并固定参考内参；
+3. 使用固定内参反投影深度；
+4. 启用深度细化时，构建现有分割图；
+5. 将 `sim3_abs` 设置为单位变换；
+6. 不保存 `sim3_edge`；
+7. 将当前窗口缓存为下一窗口的配准参考。
 
-### 8.2 Later windows
+### 8.2 后续窗口
 
-1. unproject the raw Pi3 depth with the fixed intrinsic;
-2. build the mutual registration mask with the shared `0.3` keep ratio;
-3. register the current raw overlap against the previous corrected overlap;
-4. treat the returned `(s, R, t)` as the current `sim3_abs`;
-5. derive `sim3_edge` from the previous and current absolute transforms;
-6. immediately multiply the current local points by the absolute scale;
-7. immediately apply the absolute Sim(3) to current camera poses;
-8. build the existing segment graph on the globally scaled current points;
-9. call the unchanged `refine_depth_segments()` implementation;
-10. immediately multiply local points by the returned scale mask;
-11. retain the mask only as diagnostic metadata; and
-12. cache the corrected points, propagated poses, and current graph as the
-    next registration reference.
+1. 使用固定内参反投影当前原始 Pi3 深度；
+2. 使用统一的 `0.3` 保留比例构建双侧配准 mask；
+3. 将当前原始重叠区域与前一矫正重叠区域配准；
+4. 将返回的 `(s, R, t)` 作为当前 `sim3_abs`；
+5. 根据前一绝对变换和当前绝对变换计算 `sim3_edge`；
+6. 立即将当前局部点云乘以绝对尺度；
+7. 立即将绝对 Sim(3) 应用到当前相机位姿；
+8. 在已经完成整体尺度对齐的当前点云上构建现有分割图；
+9. 调用不变的 `refine_depth_segments()`；
+10. 立即将返回的尺度 mask 乘到当前局部点云；
+11. 将 mask 作为诊断元数据保留，但不再应用；
+12. 将矫正后的点云、传播后的位姿和当前分割图缓存为下一窗口的配准参考。
 
-This ordering guarantees that correction from `W_i` participates in
-registration of `W_(i+1)`.
+该顺序保证 `W_i` 的矫正结果会参与 `W_(i+1)` 的配准。
 
-## 9. Window Cache Contract
+## 9. 窗口缓存契约
 
-Each cache contains:
+每个缓存包含：
 
-| Field | Contract |
+| 字段 | 契约 |
 |---|---|
-| `local_points` | Whole-window scale and segmentation mask already applied |
-| `camera_poses` | First-stage propagated camera poses |
-| `sim3_abs` | First-stage absolute window transform `G_i` |
-| `sim3_edge` | Relative sequential edge for non-first windows |
-| `scale_mask` | Already-applied diagnostic mask; never applied again |
-| `conf` | Original Pi3 confidence |
+| `local_points` | 已经应用窗口整体尺度和分割 mask |
+| `camera_poses` | 第一阶段传播后的相机位姿 |
+| `sim3_abs` | 第一阶段绝对窗口变换 `G_i` |
+| `sim3_edge` | 非首窗口的相对顺序边 |
+| `scale_mask` | 已经应用的诊断 mask，不能再次应用 |
+| `conf` | 原始 Pi3 置信度 |
 
-Existing image and model-output fields remain unchanged. The ambiguous
-loop-only `sim3` field is replaced by the explicit absolute and edge fields,
-and every consumer is updated in the same change.
+现有图像和模型输出字段保持不变。语义模糊的回环专用 `sim3` 字段将替换为明确的
+`sim3_abs` 和 `sim3_edge`，所有消费者必须在同一改动中更新。
 
-## 10. Loop Detection and Constraint Construction
+## 10. 回环检测与约束构建
 
-SALAD runs only after all first-stage caches are complete.
+SALAD 只在所有第一阶段窗口缓存完成后运行。
 
-For each accepted loop pair:
+对于每个接受的回环帧对：
 
-1. map the canonical frame indices to the two window indices and bounded
-   frame ranges;
-2. jointly run Pi3 on the A and B ranges;
-3. select the corresponding slices from corrected cache A and cache B;
-4. build A-side and B-side mutual masks with the shared `0.3` ratio;
-5. register the joint A prediction to corrected cache A, producing `L_A`;
-6. register the joint B prediction to corrected cache B, producing `L_B`;
-   and
-7. construct the existing-direction loop measurement:
+1. 将规范帧索引映射为两个窗口索引和受窗口边界限制的帧范围；
+2. 联合运行 A、B 两侧图像的 Pi3；
+3. 从矫正缓存 A 和 B 中选择对应切片；
+4. 使用统一的 `0.3` 比例构建 A、B 两侧双侧 mask；
+5. 将联合 A 侧预测配准到矫正缓存 A，得到 `L_A`；
+6. 将联合 B 侧预测配准到矫正缓存 B，得到 `L_B`；
+7. 按现有优化器所需方向构建回环测量：
 
 ```text
 C_AB = L_B compose inverse(L_A)
 ```
 
-The loop constraint is stored as:
+回环约束保存为：
 
 ```python
 (window_index_a, window_index_b, C_AB)
 ```
 
-The existing `Sim3LoopOptimizer` receives all `sim3_edge` values and all
-valid loop constraints. Its residuals, solver, damping, and convergence logic
-are unchanged.
+现有 `Sim3LoopOptimizer` 接收所有 `sim3_edge` 和所有有效回环约束。优化器的
+残差、求解器、阻尼和收敛逻辑保持不变。
 
-## 11. Optimization Output and Final Aggregation
+## 11. 优化输出与最终聚合
 
-The optimizer returns `N - 1` optimized sequential edges:
+优化器返回 `N - 1` 条优化后的顺序边：
 
 ```text
 E_hat_(0,1), ..., E_hat_(N-2,N-1)
 ```
 
-They are accumulated from identity to obtain one optimized absolute transform
-per window:
+从单位变换开始重新累积，得到每个窗口的优化后绝对变换：
 
 ```text
 G_hat_0 = identity
 G_hat_i = G_hat_(i-1) compose E_hat_(i-1,i)
 ```
 
-For each already corrected cache, compute only the optimization delta:
+对于每个已经矫正的缓存，只计算优化增量：
 
 ```text
 D_i = G_hat_i compose inverse(G_i)
 ```
 
-Apply `D_i` exactly once:
+`D_i` 只能应用一次：
 
-- multiply `local_points` by the uniform scale of `D_i`;
-- apply the complete `D_i` to `camera_poses`;
-- do not apply `scale_mask`;
-- do not apply `G_i` again; and
-- do not rerun segmentation or anchor propagation.
+- `local_points` 乘以 `D_i` 的统一尺度；
+- `camera_poses` 应用完整的 `D_i`；
+- 不再应用 `scale_mask`；
+- 不再应用原始 `G_i`；
+- 不重新执行分割或锚点传播。
 
-After delta application, final aggregation only:
+应用增量后，最终聚合只负责：
 
-- removes duplicate overlap frames;
-- concatenates local points and camera poses;
-- computes world points from the corrected poses and local points; and
-- saves the existing output format.
+- 删除重复 overlap 帧；
+- 拼接局部点云和相机位姿；
+- 根据矫正后的位姿和局部点云计算世界点云；
+- 保存现有输出格式。
 
-The aggregation helper must not mutate the input cache dictionaries in place.
+聚合辅助函数不能原地修改输入缓存字典。
 
-## 12. No-Loop Behavior
+## 12. 无回环行为
 
-No loop is a valid result, not an error.
+没有回环是合法结果，不是异常。
 
-If SALAD produces no valid loop constraints:
+如果 SALAD 没有产生任何有效回环约束：
 
-- do not run joint Pi3;
-- do not invoke the optimizer;
-- use the original `sim3_abs` list as the optimized absolute list; and
-- apply identity deltas during aggregation.
+- 不运行联合 Pi3；
+- 不调用优化器；
+- 直接将原始 `sim3_abs` 列表作为优化后绝对变换列表；
+- 最终聚合应用单位增量。
 
-The output is therefore the first-stage corrected trajectory. Under the same
-window, overlap, confidence, and segmentation configuration, it must match the
-non-loop forward result within floating-point tolerance.
+最终输出就是第一阶段矫正轨迹。在窗口、overlap、配准置信度和分割配置完全
+相同的情况下，它必须在浮点误差范围内与非回环前向结果一致。
 
-## 13. Validation and Error Handling
+## 13. 校验与异常处理
 
-The implementation fails early for:
+以下情况需要尽早报错：
 
-- `registration_top_confidence_ratio` outside `(0, 1]`;
-- a missing or empty image directory when fallback discovery is used;
-- a non-positive sample interval;
-- a canonical manifest/cache window-count mismatch;
-- an empty finite mutual registration mask;
-- a malformed cached transform; and
-- an optimizer result whose edge count is not `N - 1`.
+- `registration_top_confidence_ratio` 不在 `(0, 1]`；
+- 回退发现图像时，目录不存在或目录中没有有效图像；
+- `sample_interval` 非正数；
+- 规范图像清单产生的窗口数量与缓存数量不一致；
+- 双侧配准 mask 没有任何有限有效像素；
+- 缓存中的变换结构不合法；
+- 优化器返回的顺序边数量不是 `N - 1`。
 
-An invalid loop candidate whose frame indices cannot map to valid cache ranges
-is skipped with the pair and reason recorded. If all candidates are skipped,
-the pipeline follows the valid no-loop path.
+如果某个回环候选的帧索引无法映射到合法缓存范围，则跳过该候选，并记录帧对和
+具体原因。如果所有候选都被跳过，则进入合法的无回环路径。
 
-## 14. File Boundaries
+## 14. 文件边界
 
-### Create
+### 14.1 新增文件
 
-- `utils/image_paths.py`: canonical discovery and natural sorting only.
-- `inference_engine/utils/registration_confidence.py`: registration-only
-  ratio validation and mask selection.
-- `tests/test_loop_image_manifest.py`: manifest ownership and index stability.
-- `tests/test_registration_confidence.py`: `0.3` semantics and validation.
-- `tests/test_streaming_window_engine_lc_pipeline.py`: first-stage propagation,
-  cache invariants, and one-time mask application.
-- `tests/test_loop_closure_pipeline.py`: corrected-cache loop constraints,
-  no-loop behavior, optimizer edge flow, and final deltas.
+- `utils/image_paths.py`：只负责规范图像发现和自然排序；
+- `inference_engine/utils/registration_confidence.py`：只负责配准比例校验和
+  mask 选择；
+- `tests/test_loop_image_manifest.py`：验证清单所有权和索引稳定性；
+- `tests/test_registration_confidence.py`：验证 `0.3` 语义和参数校验；
+- `tests/test_streaming_window_engine_lc_pipeline.py`：验证第一阶段传播、缓存
+  不变量和 mask 只应用一次；
+- `tests/test_loop_closure_pipeline.py`：验证矫正缓存回环约束、无回环行为、
+  优化器顺序边和最终增量。
 
-### Modify
+### 14.2 修改文件
 
-- `demo_lc.py`: create and forward the canonical manifest and shared
-  registration ratio; remove redundant loop-cache rewriting.
-- `loop_closure/loop_model.py`: consume an explicit manifest and avoid
-  rescanning.
-- `loop_closure/loop_closure.py`: consume corrected caches and explicit edges,
-  build loop constraints, and return optimized absolute transforms.
-- `inference_engine/streaming_window_engine.py`: add the
-  backward-compatible registration-only confidence hook and shared mask
-  call; preserve its default effective ratio and all non-loop processing.
-- `inference_engine/streaming_window_engine_lc.py`: immediate first-stage
-  correction, explicit transform cache fields, and delta-only aggregation.
-- existing focused tests where public constructor forwarding must be asserted.
+- `demo_lc.py`：创建并传递规范图像清单和统一配准比例，删除冗余的回环缓存
+  重写过程；
+- `loop_closure/loop_model.py`：消费显式图像清单，不再重复扫描；
+- `loop_closure/loop_closure.py`：消费矫正缓存和明确的顺序边，构建回环约束，
+  返回优化后的绝对变换；
+- `inference_engine/streaming_window_engine.py`：增加向后兼容的配准专用置信度
+  接口并调用公共 mask 函数，同时保持非回环默认有效比例和全部处理流程不变；
+- `inference_engine/streaming_window_engine_lc.py`：立即执行第一阶段矫正，缓存
+  明确的变换字段，并在聚合时只应用增量；
+- 与公共构造参数转发有关的现有聚焦测试。
 
-### Deliberately unchanged
+### 14.3 明确不修改
 
-- segmentation, matching, and propagation modules;
-- `refine_depth_segments()`;
-- SALAD model and descriptor extraction internals; and
-- `loop_closure/utils/sim3loop.py` optimizer mathematics.
+- 分割、匹配和传播模块；
+- `refine_depth_segments()`；
+- SALAD 模型和描述子提取内部实现；
+- `loop_closure/utils/sim3loop.py` 的优化器数学实现。
 
-## 15. Test Matrix
+## 15. 测试矩阵
 
-### 15.1 Image ordering
+### 15.1 图像顺序
 
-- natural ordering of `frame1`, `frame2`, and `frame10`;
-- case-insensitive `.jpg`, `.jpeg`, and `.png`;
-- filtering before sampling;
-- sampling exactly once;
-- explicit manifest identity preserved by `LoopClosureEngine` and
-  `LoopDetector`; and
-- window, SALAD, and joint-Pi3 indices refer to the same paths.
+- `frame1`、`frame2`、`frame10` 自然排序；
+- 大小写不敏感的 `.jpg`、`.jpeg` 和 `.png`；
+- 先过滤再采样；
+- `sample_interval` 只应用一次；
+- `LoopClosureEngine` 和 `LoopDetector` 保留显式清单的对象与顺序；
+- 窗口、SALAD 和联合 Pi3 的索引引用同一图像路径。
 
-### 15.2 Registration confidence
+### 15.2 配准置信度
 
-- `keep_ratio=0.3` uses the `0.7` quantile;
-- non-finite values are excluded;
-- source and target masks are separately selected and intersected;
-- adjacent, loop-A, and loop-B paths call the same helper;
-- the non-loop default keeps its baseline effective ratio when the new
-  argument is omitted;
-- invalid ratios fail early; and
-- segmentation receives its original confidence parameter.
+- `keep_ratio=0.3` 使用 `0.7` 分位点；
+- 排除非有限值；
+- source 和 target 分别筛选后取交集；
+- 相邻窗口、回环 A 侧和回环 B 侧调用同一辅助函数；
+- 省略新参数时，非回环默认有效比例与基线一致；
+- 非法比例尽早报错；
+- 分割模块收到原有置信度参数。
 
-### 15.3 First-stage propagation
+### 15.3 第一阶段传播
 
-- the whole-window scale is applied before refinement;
-- camera poses are propagated immediately;
-- the segmentation mask is applied immediately and once;
-- corrected `W_1` points are the registration source for `W_2`;
-- `sim3_abs` and `sim3_edge` satisfy their composition invariant; and
-- first-stage LC output matches the non-loop engine with the same effective
-  configuration.
+- 整体窗口尺度在分割细化前应用；
+- 相机位姿立即传播；
+- 分割 mask 立即应用且只应用一次；
+- 矫正后的 `W_1` 点云是 `W_2` 的配准源；
+- `sim3_abs` 和 `sim3_edge` 满足组合不变量；
+- 在有效参数完全相同时，LC 第一阶段输出与非回环引擎一致。
 
-### 15.4 Loop constraints
+### 15.4 回环约束
 
-- A and B registrations receive corrected cache point maps;
-- `C_AB` has the approved composition direction;
-- exactly `N - 1` sequential edges reach the optimizer;
-- all valid loop constraints reach the same optimizer call; and
-- invalid loop ranges degrade to the no-loop path when none remain.
+- A、B 两侧配准收到的是矫正缓存点云；
+- `C_AB` 使用已经确认的组合方向；
+- 优化器收到且只收到 `N - 1` 条顺序边；
+- 所有有效回环约束进入同一次优化器调用；
+- 所有回环范围无效时退化到无回环路径。
 
-### 15.5 Final aggregation
+### 15.5 最终聚合
 
-- optimized edges are accumulated from identity;
-- delta scale and pose are each applied once;
-- `scale_mask` is not reapplied;
-- identity deltas preserve cache values;
-- aggregation does not mutate its inputs; and
-- overlap removal and output tensor shapes remain unchanged.
+- 优化后的顺序边从单位变换开始重新累积；
+- 增量尺度和位姿各自只应用一次；
+- `scale_mask` 不重复应用；
+- 单位增量保持缓存数值不变；
+- 聚合不修改输入缓存；
+- overlap 删除规则和输出张量形状保持不变。
 
-### 15.6 Regression and real-sequence validation
+### 15.6 回归与真实序列验证
 
-- build the two repository Cython extensions with
-  `python setup.py build_ext --inplace`;
-- run the complete `pytest -q` suite;
-- run one identical real sequence with loop detection disabled or with no
-  accepted loop and compare against the non-loop result;
-- run one real sequence with an accepted loop and verify that the optimized
-  trajectory uses both sequential and loop constraints; and
-- keep model weights, images, sampling, window size, overlap, segmentation
-  mode, and random environment identical across comparisons.
+- 执行 `python setup.py build_ext --inplace` 构建仓库的两个 Cython 扩展；
+- 运行完整 `pytest -q`；
+- 使用完全相同的真实序列运行无回环约束的 LC 和非回环流程并比较；
+- 使用存在有效回环的真实序列，验证优化轨迹同时使用顺序约束和回环约束；
+- 比较实验必须保持模型权重、图像、采样、窗口大小、overlap、分割方法和
+  随机环境一致。
 
-## 16. Acceptance Criteria
+## 16. 验收标准
 
-The change is accepted when:
+满足以下条件后接受本次改动：
 
-1. one naturally sorted and sampled image manifest drives the complete loop
-   pipeline;
-2. adjacent and loop-side registration use one `0.3` keep-ratio contract;
-3. segmentation methods and parameters are unchanged;
-4. loop-mode first-stage processing follows the non-loop correction order;
-5. each corrected window participates in registration of the next window;
-6. every non-first window caches an explicit relative Sim(3) edge;
-7. every window caches an explicit first-stage absolute Sim(3);
-8. SALAD runs only after the initial trajectory is complete;
-9. joint Pi3 is aligned to already corrected A and B caches;
-10. sequential and loop constraints enter the existing optimizer together;
-11. optimized edges are re-accumulated into absolute transforms;
-12. final aggregation applies only the optimized delta;
-13. the segmentation mask is never applied twice;
-14. the absence of any valid loop produces the unchanged first-stage result;
-15. all new CPU unit tests and the existing test suite pass; and
-16. the three segmentation methods, anchor propagation, SALAD extraction, and
-    optimizer mathematics remain untouched.
+1. 一份自然排序且已经采样的图像清单驱动完整回环链路；
+2. 相邻窗口和回环两侧配准使用同一个 `0.3` 保留比例契约；
+3. 分割方法和分割参数保持不变；
+4. 回环模式第一阶段遵循非回环矫正顺序；
+5. 每个窗口的矫正结果参与下一窗口配准；
+6. 每个非首窗口缓存明确的相对 Sim(3) 顺序边；
+7. 每个窗口缓存明确的第一阶段绝对 Sim(3)；
+8. SALAD 只在完整初始轨迹生成后运行；
+9. 联合 Pi3 与已经矫正的 A、B 两侧缓存配准；
+10. 顺序约束和回环约束共同进入现有优化器；
+11. 优化后的顺序边重新累积为绝对变换；
+12. 最终聚合只应用优化增量；
+13. 分割 mask 不会重复应用；
+14. 不存在任何有效回环时，输出保持为第一阶段结果；
+15. 所有新增 CPU 单元测试和现有测试通过；
+16. 三种分割方法、锚点传播、SALAD 提取和优化器数学形式保持不变。
