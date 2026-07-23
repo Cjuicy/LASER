@@ -14,7 +14,8 @@ from .inference_utils import (
 from .utils.geometry import (
     homogenize_points,
     apply_sim3_to_pose,
-    accumulate_sim3
+    accumulate_sim3,
+    closed_form_inverse_sim3,
 )
 from .utils.registration_confidence import select_top_confidence_mask
 
@@ -99,9 +100,22 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     conf_mask
                 )
 
-                working_window['sim3'] = s_d, R, t
-                # working_window['local_points'] = s_d * working_window.pop('local_points')
-                # working_window['camera_poses'] = apply_sim3_to_pose(working_window.pop('camera_poses'), s_d, R, t)
+                current_sim3_abs = s_d, R, t
+                previous_sim3_abs = self.prev_window_cache['sim3_abs']
+                working_window['sim3_abs'] = current_sim3_abs
+                working_window['sim3_edge'] = accumulate_sim3(
+                    closed_form_inverse_sim3(*previous_sim3_abs),
+                    current_sim3_abs,
+                )
+                working_window['local_points'] = (
+                    s_d * working_window['local_points']
+                )
+                working_window['camera_poses'] = apply_sim3_to_pose(
+                    working_window['camera_poses'],
+                    s_d,
+                    R,
+                    t,
+                )
 
                 if self.depth_refine:
                     tgt_pcd = working_window['local_points'].cpu().numpy()
@@ -116,6 +130,10 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                         tgt_sp_graph,
                         self.overlap
                     )
+                    working_window['local_points'] = (
+                        working_window['scale_mask']
+                        * working_window['local_points']
+                    )
             else:
                 _, intrinsic_ = estimate_pseudo_depth_and_intrinsics(working_window['local_points'])
                 ref_intrinsic = intrinsic_[0]
@@ -123,7 +141,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     working_window.pop('local_points')[..., -1],
                     ref_intrinsic
                 )
-                working_window['sim3'] = (
+                working_window['sim3_abs'] = (
                     1.0,
                     torch.eye(3, device=self.process_device),
                     torch.zeros(3, device=self.process_device)
