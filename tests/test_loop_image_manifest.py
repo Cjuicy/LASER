@@ -214,6 +214,16 @@ def load_loop_engine_module(monkeypatch, detector_calls):
 
     fake_geometry = types.ModuleType("inference_engine.utils.geometry")
     fake_geometry.accumulate_sim3 = lambda first, second: second
+
+    def fake_inverse_sim3(scale, rotation, translation):
+        inverse_scale = 1.0 / scale
+        inverse_rotation = rotation.T
+        inverse_translation = (
+            -inverse_scale * inverse_rotation @ translation
+        )
+        return inverse_scale, inverse_rotation, inverse_translation
+
+    fake_geometry.closed_form_inverse_sim3 = fake_inverse_sim3
     monkeypatch.setitem(
         sys.modules,
         "inference_engine.utils.geometry",
