@@ -207,3 +207,80 @@ def test_build_loop_closure_engine_passes_canonical_manifest(
 
     assert calls[0][1]["image_paths"] is image_paths
     assert calls[0][1]["registration_top_confidence_ratio"] == 0.3
+
+
+def test_prepare_caches_for_aggregation_trims_overlap_without_mutation():
+    first = {
+        "local_points": torch.arange(6).reshape(2, 1, 1, 3),
+        "sim3_abs": (1.0, torch.eye(3), torch.zeros(3)),
+    }
+    second = {
+        "local_points": torch.arange(9).reshape(3, 1, 1, 3),
+        "sim3_abs": (2.0, torch.eye(3), torch.zeros(3)),
+    }
+
+    parsed = demo_lc.prepare_caches_for_aggregation(
+        [first, second],
+        overlap=1,
+    )
+
+    assert parsed[0]["local_points"].shape[0] == 2
+    assert parsed[1]["local_points"].shape[0] == 2
+    torch.testing.assert_close(
+        parsed[1]["local_points"],
+        second["local_points"][1:],
+    )
+    assert second["local_points"].shape[0] == 3
+    assert parsed[1]["sim3_abs"] is second["sim3_abs"]
+
+
+def test_run_loop_closure_pipeline_passes_absolute_transforms_to_aggregate(
+    monkeypatch,
+):
+    raw_predictions = [
+        {"sim3_abs": (1.0, torch.eye(3), torch.zeros(3))},
+        {
+            "sim3_abs": (2.0, torch.eye(3), torch.zeros(3)),
+            "tensor": torch.arange(3),
+        },
+    ]
+    optimized_absolute = [
+        (1.0, torch.eye(3), torch.zeros(3)),
+        (3.0, torch.eye(3), torch.zeros(3)),
+    ]
+    captured = {}
+
+    class RecordingLoopEngine:
+        def run(self, predictions):
+            captured["run_predictions"] = predictions
+            return optimized_absolute
+
+    class RecordingStreamingEngine:
+        @staticmethod
+        def aggregate_caches(caches, transforms):
+            captured["aggregate_caches"] = caches
+            captured["aggregate_transforms"] = transforms
+            return {"aggregated": True}
+
+        @staticmethod
+        def _post_process_pred(prediction):
+            captured["post_process_input"] = prediction
+            return {"finished": True}
+
+    monkeypatch.setattr(
+        demo_lc,
+        "StreamingWindowEngineLC",
+        RecordingStreamingEngine,
+    )
+
+    result = demo_lc.run_loop_closure_pipeline(
+        RecordingLoopEngine(),
+        raw_predictions,
+        overlap=1,
+    )
+
+    assert result == {"finished": True}
+    assert captured["run_predictions"] is raw_predictions
+    assert captured["aggregate_transforms"] is optimized_absolute
+    assert captured["aggregate_caches"][1]["tensor"].tolist() == [1, 2]
+    assert raw_predictions[1]["tensor"].tolist() == [0, 1, 2]

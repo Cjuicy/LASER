@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-from collections import defaultdict
 import time
 
 from .streaming_window_engine import StreamingWindowEngine, STOP_SIGNAL
@@ -12,7 +11,6 @@ from .inference_utils import (
     refine_depth_segments
 )
 from .utils.geometry import (
-    homogenize_points,
     apply_sim3_to_pose,
     accumulate_sim3,
     closed_form_inverse_sim3,
@@ -161,37 +159,36 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             self.latencies.append(total_process_time)
 
     @staticmethod
-    def aggregate_caches(parsed_caches):
-        aggregated_cache = defaultdict(list)
-        ref_sim3 = (
-            1.0,
-            torch.eye(3, device='cpu'),
-            torch.zeros(3, device='cpu')
-        )
-        for cache in parsed_caches:
-            # apply local to world transformation
-            cache_sim3 = cache['sim3']
-            s_d, R, t = accumulate_sim3(ref_sim3, cache_sim3)
-            if 'scale_mask' in cache.keys():
-                cache['local_points'] = ref_sim3[0] * cache.pop('scale_mask') * cache.pop('local_points')
-            else:
-                cache['local_points'] = s_d * cache.pop('local_points')
-            cache['camera_poses'] = apply_sim3_to_pose(cache.pop('camera_poses'), s_d, R, t)
+    def aggregate_caches(parsed_caches, optimized_abs=None):
+        if optimized_abs is None:
+            optimized_abs = [
+                cache['sim3_abs']
+                for cache in parsed_caches
+            ]
+        if len(parsed_caches) != len(optimized_abs):
+            raise ValueError(
+                "optimized transform count does not match cache count"
+            )
 
-            ref_sim3 = s_d, R, t
+        adjusted_caches = []
+        for cache, optimized in zip(parsed_caches, optimized_abs):
+            original_inverse = closed_form_inverse_sim3(
+                *cache['sim3_abs']
+            )
+            delta_scale, delta_rotation, delta_translation = (
+                accumulate_sim3(optimized, original_inverse)
+            )
 
-            for k, v in cache.items():
-                if k == 'points':
-                    continue
-                aggregated_cache[k].append(v)
+            adjusted = dict(cache)
+            adjusted['local_points'] = (
+                delta_scale * cache['local_points']
+            )
+            adjusted['camera_poses'] = apply_sim3_to_pose(
+                cache['camera_poses'],
+                delta_scale,
+                delta_rotation,
+                delta_translation,
+            )
+            adjusted_caches.append(adjusted)
 
-        for k in list(aggregated_cache.keys()):
-            if isinstance(aggregated_cache[k][0], torch.Tensor):
-                aggregated_cache[k] = torch.concat(aggregated_cache.pop(k), dim=0)[None]
-
-        aggregated_cache['points'] = torch.einsum(
-            'bnij, bnhwj -> bnhwi',
-            aggregated_cache['camera_poses'],
-            homogenize_points(aggregated_cache['local_points'])
-        )[..., :3]
-        return aggregated_cache
+        return StreamingWindowEngine.aggregate_caches(adjusted_caches)

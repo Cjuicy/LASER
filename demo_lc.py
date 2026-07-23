@@ -20,7 +20,6 @@ import os
 import argparse
 from tqdm import tqdm
 import glob
-import shutil
 from pathlib import Path
 from utils.image_paths import discover_images, natural_sort_key
 
@@ -119,6 +118,39 @@ def build_loop_closure_engine(
     )
 
 
+def prepare_caches_for_aggregation(raw_predictions, overlap):
+    if overlap < 0:
+        raise ValueError("overlap must be non-negative")
+
+    parsed_caches = []
+    for index, prediction in enumerate(raw_predictions):
+        trim = overlap if index > 0 else 0
+        parsed_caches.append({
+            key: value[trim:]
+            if isinstance(value, torch.Tensor)
+            else value
+            for key, value in prediction.items()
+        })
+    return parsed_caches
+
+
+def run_loop_closure_pipeline(
+    loop_closure_engine,
+    raw_predictions,
+    overlap,
+):
+    optimized_absolute = loop_closure_engine.run(raw_predictions)
+    parsed_caches = prepare_caches_for_aggregation(
+        raw_predictions,
+        overlap,
+    )
+    aggregated = StreamingWindowEngineLC.aggregate_caches(
+        parsed_caches,
+        optimized_absolute,
+    )
+    return StreamingWindowEngineLC._post_process_pred(aggregated)
+
+
 # 手动将列表划分为多个重叠窗口
 def sliding_window(lst, window_size, overlap):
     step = window_size - overlap
@@ -211,28 +243,14 @@ if __name__ == "__main__":
                          key=lambda p: int(p.split('_')[-1].split('.')[0]))
     raw_predictions = [StreamingWindowEngineLC.parse_cache_file(cache_fname) for cache_fname in cache_files]
 
-    # 📒4️⃣ 执行回环修正（⚠️回环修正具体完成的部分）
-    sim3_list_lc = lc_engine.run(raw_predictions)
-    sim3_list_lc.insert(0, raw_predictions[0]['sim3'])
+    # 📒4️⃣ 回环优化后只应用相对于首阶段缓存的增量
+    ret_dict = run_loop_closure_pipeline(
+        lc_engine,
+        raw_predictions,
+        args.overlap,
+    )
 
-    os.makedirs(str(cache_path_lc), exist_ok=True)
-    # 5️⃣ 保存修正后的缓存
-    for idx, (pred, sim3_lc) in enumerate(zip(raw_predictions, sim3_list_lc)):
-        # s, R, t = sim3_lc
-        # pred['sim3'] = s, torch.from_numpy(R.astype(np.float32)), torch.from_numpy(t.astype(np.float32))
-        pred['sim3'] = sim3_lc
-        torch.save(pred, str(cache_path_lc / f'window_cache_{idx}.pt'))
-
-    cache_files_lc = sorted(glob.glob(str(cache_path_lc / 'window_cache_*.pt')),
-                            key=lambda p: int(p.split('_')[-1].split('.')[0]))
-    # 6️⃣ 重新读取并合并窗口（与demo不同，对齐后直接输出，这里是对于每个窗口点云改进后，会回环检测再输出）
-    parsed_caches = [StreamingWindowEngineLC.parse_cache_file(cache_files_lc[0])]
-    for cache_fname in cache_files_lc[1:]:
-        parsed_caches.append(StreamingWindowEngineLC.parse_cache_file(cache_fname, overlap=args.overlap))
-
-    ret_dict = StreamingWindowEngineLC._post_process_pred(StreamingWindowEngineLC.aggregate_caches(parsed_caches))
-    # 7️⃣ 清理并保存结果
-    shutil.rmtree(cache_path_lc)
+    # 5️⃣ 保存结果
     for key in ret_dict.keys():
         if isinstance(ret_dict[key], torch.Tensor):
             ret_dict[key] = ret_dict[key].cpu().numpy().squeeze(0)

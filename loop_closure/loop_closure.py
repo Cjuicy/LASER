@@ -344,10 +344,12 @@ if __name__ == '__main__':
     pi3_model = Pi3.from_pretrained("yyfz233/Pi3").to(device)
 
     config = load_config(args.config_path)
+    output_dir = Path(args.output_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
     loop_closure = LoopClosureEngine(
         config,
         args.data_path,
-        args.output_path,
+        output_dir / "loop_closures.txt",
         pi3_model,
         args.window_size,
         args.overlap,
@@ -356,9 +358,13 @@ if __name__ == '__main__':
     cache_files = sorted(glob.glob(str(Path(args.cache_path) / 'window_cache_*.pt')),
                          key=lambda p: int(p.split('_')[-1].split('.')[0]))
     raw_predictions = [StreamingWindowEngine.parse_cache_file(cache_fname) for cache_fname in cache_files]
-    sim3_list_lc = loop_closure.run(raw_predictions)
-    sim3_list_lc.insert(0, raw_predictions[0]['sim3'])
+    optimized_absolute = loop_closure.run(raw_predictions)
 
-    for idx, (pred, sim3_lc) in enumerate(zip(raw_predictions, sim3_list_lc)):
-        pred['sim3'] = sim3_lc
-        torch.save(pred, f'{args.output_path}/window_cache_{idx}.pt')
+    for idx, (prediction, optimized) in enumerate(
+            zip(raw_predictions, optimized_absolute)):
+        output_prediction = dict(prediction)
+        output_prediction['sim3_optimized_abs'] = optimized
+        torch.save(
+            output_prediction,
+            output_dir / f'window_cache_{idx}.pt',
+        )
