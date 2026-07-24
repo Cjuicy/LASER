@@ -20,7 +20,7 @@ def _point_batch(frames=2, height=12, width=16):
     return np.stack((x, y, depth), axis=-1).copy()
 
 
-@pytest.mark.parametrize("method", ("depth", "geometry"))
+@pytest.mark.parametrize("method", ("depth", "geometry", "atomic"))
 def test_strategy_returns_compact_full_coverage_labels(method):
     config = load_pipeline_config(
         "configs/pipeline/default.yaml",

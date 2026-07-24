@@ -11,7 +11,7 @@ from .geometry_segmentation import (
     segment_geometry_felzenszwalb_rag,
     segment_geometry_felzenszwalb_rag_baseline_params,
 )
-from .layer_atomic_geometry import segment_point_map_layer_atomic
+from .layer_atomic_geometry import segment_point_map_atomic
 
 
 SEGMENT_MODES = ("depth", "geometry", "layer_atomic")
@@ -121,7 +121,7 @@ def make_sp_graph(
         )
     else:
         images = point_maps
-        segmentation_op = segment_point_map_layer_atomic
+        segmentation_op = segment_point_map_atomic
 
     labels = batched_image_op_wrapper(
         images,

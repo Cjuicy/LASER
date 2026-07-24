@@ -11,9 +11,12 @@ if inference_engine_module is not None and not hasattr(inference_engine_module, 
 
 from inference_engine.utils import layer_atomic_geometry
 from inference_engine.utils.layer_atomic_geometry import (
+    AtomMergeResult,
     merge_layer_atoms,
-    segment_point_map_layer_atomic,
+    segment_point_map_atomic,
 )
+from inference_engine.utils.post_merge_split import SplitDiagnostics
+from pipeline.config import AtomicSplitMode
 
 
 def _two_atom_map(top_row, scale=1.0):
@@ -181,45 +184,66 @@ def test_result_is_deterministic():
     "shape",
     [(2, 4), (2, 4, 2), (2, 4, 3, 1)],
 )
-def test_segment_point_map_layer_atomic_validates_shape(shape):
+def test_segment_point_map_atomic_validates_shape(shape):
     with pytest.raises(ValueError, match=r"\(H, W, 3\)"):
-        segment_point_map_layer_atomic(np.zeros(shape), depth_merge_thresh=0.1)
+        segment_point_map_atomic(np.zeros(shape), depth_merge_thresh=0.1)
 
 
-def test_segment_point_map_layer_atomic_forwards_stages_to_atom_merger(monkeypatch):
+def test_segment_point_map_atomic_forwards_merge_metadata_to_split(monkeypatch):
     point_map = np.arange(24, dtype=np.float64).reshape(2, 4, 3)
     conf_map = np.arange(8, dtype=np.float64).reshape(2, 4)
     initial_labels = np.tile(np.asarray([10, 10, 30, 30]), (2, 1))
     coarse_labels = np.tile(np.asarray([7, 7, 8, 8]), (2, 1))
-    baseline_output = np.full((2, 4), 99, dtype=np.int64)
-    merged_output = np.full((2, 4), 5, dtype=np.int64)
+    merge_threshold = np.float64(0.25)
+    merged_output = np.zeros((2, 4), dtype=np.int64)
+    atom_labels = np.tile(np.asarray([0, 0, 1, 1]), (2, 1))
+    atom_scales = np.asarray([1.0, 2.0])
     stage_calls = []
     merger_calls = []
+    split_calls = []
 
     def fake_stages(*args):
         stage_calls.append(args)
-        return initial_labels, coarse_labels, baseline_output
+        return initial_labels, coarse_labels, merge_threshold
 
     def fake_merger(*args):
         merger_calls.append(args)
-        return merged_output
+        return AtomMergeResult(
+            labels=merged_output,
+            atom_labels=atom_labels,
+            atom_scales=atom_scales,
+        )
+
+    def fake_refine(*args, **kwargs):
+        split_calls.append((args, kwargs))
+        return merged_output, SplitDiagnostics(split_mode="none")
 
     monkeypatch.setattr(
         layer_atomic_geometry,
         "segment_depth_felzenszwalb_rag_stages",
         fake_stages,
     )
-    monkeypatch.setattr(layer_atomic_geometry, "merge_layer_atoms", fake_merger)
+    monkeypatch.setattr(
+        layer_atomic_geometry,
+        "_merge_layer_atoms_with_metadata",
+        fake_merger,
+    )
+    monkeypatch.setattr(
+        layer_atomic_geometry,
+        "refine_auto_regions",
+        fake_refine,
+    )
 
-    result = segment_point_map_layer_atomic(
+    labels, diagnostics = segment_point_map_atomic(
         point_map,
         depth_merge_thresh=0.123,
         conf_map=conf_map,
-        top_conf_percentile=87.5,
+        confidence_keep_ratio=0.25,
         seg_scale=411,
         seg_sigma=0.75,
         seg_min_size=23,
         batch_idx=6,
+        split_mode=AtomicSplitMode.NONE,
     )
 
     assert len(stage_calls) == 1
@@ -227,7 +251,7 @@ def test_segment_point_map_layer_atomic_forwards_stages_to_atom_merger(monkeypat
         received_depth,
         received_depth_merge_thresh,
         received_conf,
-        received_top_conf_percentile,
+        received_confidence_keep_ratio,
         received_seg_scale,
         received_seg_sigma,
         received_seg_min_size,
@@ -236,7 +260,7 @@ def test_segment_point_map_layer_atomic_forwards_stages_to_atom_merger(monkeypat
     np.testing.assert_array_equal(received_depth, point_map[..., -1])
     assert received_depth_merge_thresh == 0.123
     assert received_conf is conf_map
-    assert received_top_conf_percentile == 87.5
+    assert received_confidence_keep_ratio == 0.25
     assert received_seg_scale == 411
     assert received_seg_sigma == 0.75
     assert received_seg_min_size == 23
@@ -250,4 +274,12 @@ def test_segment_point_map_layer_atomic_forwards_stages_to_atom_merger(monkeypat
     assert received_initial is initial_labels
     assert received_coarse is coarse_labels
     assert received_merge_thresh == 0.123
-    assert result is merged_output
+    assert len(split_calls) == 1
+    split_args, split_kwargs = split_calls[0]
+    assert split_args[0] is point_map
+    assert split_args[2] is merged_output
+    assert split_args[3] is atom_labels
+    assert split_args[4] is atom_scales
+    assert split_kwargs["split_mode"] is AtomicSplitMode.NONE
+    assert labels is merged_output
+    assert diagnostics.split_mode == "none"

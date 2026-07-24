@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a deterministic CPU smoke test for every segmentation mode."""
+"""Run a deterministic CPU smoke test for every public segmentation method."""
 
 from pathlib import Path
 import sys
@@ -10,11 +10,14 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from inference_engine.utils.lsa import (  # noqa: E402
-    SEGMENT_MODES,
-    get_felzenszwalb_params,
-    make_sp_graph,
+from inference_engine.segmentation import (  # noqa: E402
+    build_segmentation_strategy,
+    build_temporal_graphs,
 )
+from pipeline.config import load_pipeline_config  # noqa: E402
+
+
+SEGMENTATION_METHODS = ("depth", "geometry", "atomic")
 
 
 def make_fixture(frames=2, height=48, width=64):
@@ -36,43 +39,47 @@ def make_fixture(frames=2, height=48, width=64):
     return point_maps, confidence
 
 
-def verify_partition(graph, shape):
-    if not graph:
+def verify_partition(results, shape):
+    if not results:
         raise AssertionError("segmentation returned no frames")
-    for frame_idx, vertices in enumerate(graph):
-        if not vertices:
-            raise AssertionError(f"frame {frame_idx} returned no segments")
-        coverage = np.zeros(shape, dtype=np.int16)
-        for vertex in vertices:
-            mask = np.asarray(vertex.data)
-            if mask.shape != shape or mask.dtype != np.bool_:
-                raise AssertionError(
-                    f"frame {frame_idx} contains an invalid segment mask"
-                )
-            coverage += mask
-        if not np.all(coverage == 1):
+    for frame_idx, result in enumerate(results):
+        labels = np.asarray(result.labels)
+        if labels.shape != shape:
             raise AssertionError(
-                f"frame {frame_idx} masks do not form an exact image partition"
+                f"frame {frame_idx} has invalid label shape"
             )
+        unique = np.unique(labels)
+        np.testing.assert_array_equal(unique, np.arange(unique.size))
 
 
 def main():
     point_maps, confidence = make_fixture()
-    for mode in SEGMENT_MODES:
-        graph = make_sp_graph(
+    for method in SEGMENTATION_METHODS:
+        config = load_pipeline_config(
+            "configs/pipeline/test.yaml",
+            (
+                f"segmentation.method={method}",
+                "segmentation.felzenszwalb.min_size=20",
+            ),
+        ).config.segmentation
+        strategy = build_segmentation_strategy(config)
+        results = strategy.segment(
             point_maps,
-            conf_map=confidence,
-            top_conf_percentile=0.5,
-            segment_mode=mode,
-            normal_method="cross",
-            geometry_seg_profile="baseline_params",
+            confidence,
+            images=None,
         )
-        verify_partition(graph, point_maps.shape[1:3])
-        params = get_felzenszwalb_params(mode, "baseline_params")
+        verify_partition(results, point_maps.shape[1:3])
+        graph = build_temporal_graphs(
+            results,
+            config.temporal_iou_threshold,
+        )
+        if len(graph) != len(results):
+            raise AssertionError("temporal graph frame count mismatch")
         print(
-            f"[PASS] mode={mode} frames={len(graph)} "
-            f"scale={params['seg_scale']} sigma={params['seg_sigma']} "
-            f"min_size={params['seg_min_size']}"
+            f"[PASS] method={method} frames={len(results)} "
+            f"scale={config.felzenszwalb.scale} "
+            f"sigma={config.felzenszwalb.sigma} "
+            f"min_size={config.felzenszwalb.min_size}"
         )
 
 

@@ -15,5 +15,5 @@ def test_smoke_script_verifies_all_segmentation_modes():
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    for mode in ("depth", "geometry", "layer_atomic"):
-        assert f"[PASS] mode={mode} frames=2" in result.stdout
+    for method in ("depth", "geometry", "atomic"):
+        assert f"[PASS] method={method} frames=2" in result.stdout

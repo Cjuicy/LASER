@@ -1,6 +1,16 @@
+from dataclasses import dataclass
+
 import numpy as np
 
 from .depth import segment_depth_felzenszwalb_rag_stages
+from .post_merge_split import SplitDiagnostics, refine_auto_regions
+
+
+@dataclass(frozen=True)
+class AtomMergeResult:
+    labels: np.ndarray
+    atom_labels: np.ndarray
+    atom_scales: np.ndarray
 
 
 def _compact_labels(labels):
@@ -32,12 +42,12 @@ class _DisjointSet:
             self.parent[larger] = smaller
 
 
-def merge_layer_atoms(
+def _merge_layer_atoms_with_metadata(
     point_map,
     initial_labels,
     coarse_labels,
     depth_merge_thresh,
-) -> np.ndarray:
+) -> AtomMergeResult:
     point_map = np.asarray(point_map)
     initial_labels = np.asarray(initial_labels)
     coarse_labels = np.asarray(coarse_labels)
@@ -137,14 +147,50 @@ def merge_layer_atoms(
             dsu.union(int(left), int(right))
 
     roots = np.asarray([dsu.find(atom) for atom in range(n_atoms)])
-    return _compact_labels(roots[atom_labels])
+    labels = _compact_labels(roots[atom_labels])
+    return AtomMergeResult(labels, atom_labels, scales)
 
 
-def segment_point_map_layer_atomic(
+def merge_layer_atoms(
+    point_map,
+    initial_labels,
+    coarse_labels,
+    depth_merge_thresh,
+) -> np.ndarray:
+    return _merge_layer_atoms_with_metadata(
+        point_map,
+        initial_labels,
+        coarse_labels,
+        depth_merge_thresh,
+    ).labels
+
+
+def _select_rgb_frame(rgb_images, batch_idx, height, width):
+    if rgb_images is None:
+        return None
+    rgb = np.asarray(rgb_images)
+    if rgb.ndim == 4:
+        if batch_idx is None:
+            raise ValueError("batch_idx is required for batched rgb_images")
+        rgb = rgb[batch_idx]
+    if rgb.shape == (3, height, width):
+        rgb = np.moveaxis(rgb, 0, -1)
+    if rgb.shape != (height, width, 3):
+        raise ValueError(
+            "rgb_images must contain RGB frames aligned with point_map"
+        )
+    return np.clip(rgb.astype(np.float32, copy=False), 0.0, 1.0)
+
+
+def segment_point_map_atomic(
     point_map,
     depth_merge_thresh,
+    rgb_images=None,
+    normal_method="cross",
+    split_score_threshold=0.10,
+    split_mode="conservative",
     conf_map=None,
-    top_conf_percentile=None,
+    confidence_keep_ratio=None,
     seg_scale=300,
     seg_sigma=1.1,
     seg_min_size=500,
@@ -159,15 +205,32 @@ def segment_point_map_layer_atomic(
         depth_map,
         depth_merge_thresh,
         conf_map,
-        top_conf_percentile,
+        confidence_keep_ratio,
         seg_scale,
         seg_sigma,
         seg_min_size,
         batch_idx,
     )
-    return merge_layer_atoms(
+    merged = _merge_layer_atoms_with_metadata(
         point_map,
         initial_labels,
         coarse_labels,
         depth_merge_thresh,
+    )
+    rgb_image = _select_rgb_frame(
+        rgb_images,
+        batch_idx,
+        point_map.shape[0],
+        point_map.shape[1],
+    )
+    return refine_auto_regions(
+        point_map,
+        rgb_image,
+        merged.labels,
+        merged.atom_labels,
+        merged.atom_scales,
+        seg_min_size=seg_min_size,
+        normal_method=normal_method,
+        split_score_threshold=split_score_threshold,
+        split_mode=split_mode,
     )

@@ -120,7 +120,7 @@ def test_layer_atomic_mode_routes_full_point_maps_with_aligned_parameters(monkey
 
     assert graph == "shared_graph"
     np.testing.assert_array_equal(calls["images"], point_maps)
-    assert calls["op_func"] is lsa.segment_point_map_layer_atomic
+    assert calls["op_func"] is lsa.segment_point_map_atomic
     assert calls["kwargs"] == {
         "depth_merge_thresh": 0.3,
         "conf_map": conf_map,

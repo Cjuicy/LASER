@@ -1,60 +1,69 @@
-from pathlib import Path
-import sys
-
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-inference_engine_module = sys.modules.get("inference_engine")
-if inference_engine_module is not None and not hasattr(inference_engine_module, "__path__"):
-    del sys.modules["inference_engine"]
-
-from inference_engine.utils import lsa
-from inference_engine.utils.layer_atomic_geometry import (
-    segment_point_map_layer_atomic,
+from inference_engine.segmentation import atomic as atomic_module
+from inference_engine.segmentation.registry import (
+    STRATEGY_FACTORIES,
+    build_segmentation_strategy,
 )
+from inference_engine.utils.post_merge_split import SplitDiagnostics
+from pipeline.config import SegmentationMethod, load_pipeline_config
 
 
-def test_make_sp_graph_dispatches_complete_point_maps_to_layer_atomic(monkeypatch):
+def test_atomic_strategy_dispatches_complete_point_maps(monkeypatch):
     point_maps = np.arange(2 * 3 * 4 * 3, dtype=np.float64).reshape(2, 3, 4, 3)
     conf_map = np.arange(2 * 3 * 4, dtype=np.float64).reshape(2, 3, 4)
-    labels = np.arange(2 * 3 * 4, dtype=np.int64).reshape(2, 3, 4)
-    expected_graph = object()
-    batch_calls = []
-    match_calls = []
+    rgb = np.zeros((2, 3, 4, 3), dtype=np.float32)
+    calls = []
 
-    def fake_batched_image_op_wrapper(images, operation, **kwargs):
-        batch_calls.append((images, operation, kwargs))
-        return labels
+    def fake_segment(point_map, **kwargs):
+        calls.append((point_map, kwargs))
+        return (
+            np.zeros(point_map.shape[:2], dtype=np.intp),
+            SplitDiagnostics(split_mode="normal_only"),
+        )
 
-    def fake_match_segmentation_seq(received_labels, *, iou_thresh):
-        match_calls.append((received_labels, iou_thresh))
-        return expected_graph
+    monkeypatch.setattr(
+        atomic_module,
+        "segment_point_map_atomic",
+        fake_segment,
+    )
+    config = load_pipeline_config(
+        "configs/pipeline/default.yaml",
+        (
+            "segmentation.method=atomic",
+            "segmentation.atomic.split_mode=normal_only",
+            "segmentation.confidence_keep_ratio=0.25",
+        ),
+    ).config.segmentation
+    strategy = build_segmentation_strategy(config)
+    results = strategy.segment(point_maps, conf_map, rgb)
 
-    monkeypatch.setattr(lsa, "batched_image_op_wrapper", fake_batched_image_op_wrapper)
-    monkeypatch.setattr(lsa, "match_segmentation_seq", fake_match_segmentation_seq)
-
-    result = lsa.make_sp_graph(
-        point_maps,
-        depth_merge_thresh=0.125,
-        conf_map=conf_map,
-        top_conf_percentile=0.75,
-        corr_iou_thresh=0.35,
+    assert len(results) == 2
+    assert len(calls) == 2
+    for frame_index, (received_points, kwargs) in enumerate(calls):
+        np.testing.assert_array_equal(
+            received_points,
+            point_maps[frame_index],
+        )
+        np.testing.assert_array_equal(
+            kwargs["conf_map"],
+            conf_map[frame_index],
+        )
+        np.testing.assert_array_equal(
+            kwargs["rgb_images"],
+            rgb[frame_index],
+        )
+        assert kwargs["confidence_keep_ratio"] == 0.25
+        assert kwargs["split_mode"].value == "normal_only"
+    assert all(
+        result.diagnostics["split_mode"] == "normal_only"
+        for result in results
     )
 
-    assert len(batch_calls) == 1
-    received_points, operation, kwargs = batch_calls[0]
-    assert received_points is point_maps
-    assert operation is segment_point_map_layer_atomic
-    assert kwargs.keys() == {
-        "depth_merge_thresh",
-        "conf_map",
-        "top_conf_percentile",
+
+def test_segmentation_registry_has_exactly_three_public_methods():
+    assert set(STRATEGY_FACTORIES) == {
+        SegmentationMethod.DEPTH,
+        SegmentationMethod.GEOMETRY,
+        SegmentationMethod.ATOMIC,
     }
-    assert kwargs["depth_merge_thresh"] == 0.125
-    assert kwargs["conf_map"] is conf_map
-    assert kwargs["top_conf_percentile"] == 0.75
-    assert len(match_calls) == 1
-    received_labels, iou_thresh = match_calls[0]
-    assert received_labels is labels
-    assert iou_thresh == 0.35
-    assert result is expected_graph
