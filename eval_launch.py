@@ -1,18 +1,15 @@
 from eval.pose_eval import eval_pose_estimation
 from eval.depth_eval import eval_mono_depth_estimation
 from pi3.models.pi3 import Pi3
-from inference_engine import AnchorPropagator, VanillaEngine
-from inference_engine.segmentation import build_segmentation_strategy
-from loop_closure.methods import (
-    build_loop_strategy,
-    detect_loop_candidates,
-)
+from inference_engine import VanillaEngine
+from loop_closure.methods import detect_loop_candidates
 from pipeline.config import (
     LoopMethod,
     load_pipeline_config,
 )
 from pipeline.manifest import ImageManifest
 from pipeline.runner import (
+    build_default_window_engine,
     complete_reconstruction_payload,
     run_windows,
 )
@@ -115,43 +112,7 @@ dtype = (
 
 
 def build_streaming_eval_engine(delegate, config):
-    segmenter = build_segmentation_strategy(config.segmentation)
-    anchor = AnchorPropagator(
-        config.anchor_propagation.correspondence_iou_threshold
-    )
-    strategy = build_loop_strategy(
-        config.loop.method,
-        optimizer_config=config.loop.optimizer,
-        registration_confidence_keep_ratio=(
-            config.loop.registration.confidence_keep_ratio
-        ),
-    )
-    engine = strategy.create_window_engine(
-        delegate=delegate,
-        inference_device=config.model.inference_device,
-        dtype={
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }[config.model.dtype],
-        segmentation_strategy=segmenter,
-        anchor_propagator=anchor,
-        registration_confidence_keep_ratio=(
-            config.loop.registration.confidence_keep_ratio
-        ),
-        anchor_enabled=config.anchor_propagation.enabled,
-        temporal_iou_threshold=(
-            config.segmentation.temporal_iou_threshold
-        ),
-        window_size=config.window.size,
-        overlap=config.window.overlap,
-        cache_root=config.output.cache_dir,
-        intermediate_device=config.model.inference_device,
-        process_device=config.model.process_device,
-    )
-    engine.pipeline_config = config
-    engine.loop_strategy = strategy
-    return engine
+    return build_default_window_engine(config, delegate)
 
 
 def _run_modular_evaluation(model, imgs, manifest, detect_loops):

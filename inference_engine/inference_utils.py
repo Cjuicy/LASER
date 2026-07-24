@@ -4,8 +4,6 @@ from .utils.geometry import (
     register_camera_poses_kabsch_pytorch,
     apply_sim3_to_pose
 )
-from .anchor_propagation import AnchorPropagator
-from .utils.lsa import make_sp_graph
 
 
 def dict_to_device(data, device):
@@ -120,78 +118,6 @@ def unproject_depth_to_local_points(depth, K):
 
     local_points = torch.stack((x, y, z), dim=-1)
     return local_points
-
-
-def register_extrinsic_windows(
-        pcd_windows,
-        cam_windows,
-        mask_windows,
-        overlap,
-        depth_refine=False,
-        debug=False
-):
-    camera_poses = [cam_windows[0]]
-    local_points = [pcd_windows[0]]
-
-    _, intrinsic_ = estimate_pseudo_depth_and_intrinsics(pcd_windows[0])
-    ref_intrinsic = intrinsic_[0]
-    pcd_windows = [unproject_depth_to_local_points(pcd[..., -1], ref_intrinsic) for pcd in pcd_windows]
-
-    anchor_cam_pose = cam_windows[0]
-    anchor_pcd = pcd_windows[0]
-    anchor_sp_graph = None
-    if depth_refine:
-        anchor_sp_graph = make_sp_graph(
-            pcd_windows[0].cpu().numpy(),
-            conf_map=mask_windows[0].cpu().numpy()
-        )
-
-    for i in range(1, len(cam_windows)):
-        valid_mask = mask_windows[i - 1][-overlap:] & mask_windows[i][:overlap]
-        tgt_pcd = pcd_windows[i]
-
-        tgt_cam_pose = cam_windows[i]
-        s_d, R, t = register_adjacent_windows(
-            anchor_pcd[-overlap:],
-            tgt_pcd[:overlap],
-            anchor_cam_pose[-overlap:],
-            tgt_cam_pose[:overlap],
-            valid_mask
-        )
-
-        # anchor_cam_pose = tgt2src_sim3 @ tgt_cam_pose
-        anchor_cam_pose = apply_sim3_to_pose(tgt_cam_pose, s_d, R, t)
-        tgt_pcd = s_d * tgt_pcd
-
-        # full numpy processing pipeline
-        if depth_refine:
-            tgt_pcd = tgt_pcd.cpu().numpy()
-            tgt_sp_graph = make_sp_graph(
-                tgt_pcd,
-                conf_map=mask_windows[i].cpu().numpy()
-            )
-
-            tgt_pcd_scaled = AnchorPropagator().propagate(
-                anchor_pcd.cpu().numpy(),
-                tgt_pcd,
-                anchor_sp_graph,
-                tgt_sp_graph,
-                overlap
-            ).to(anchor_pcd.device)
-
-            anchor_pcd = tgt_pcd_scaled
-            anchor_sp_graph = tgt_sp_graph
-        else:
-            anchor_pcd = tgt_pcd
-
-        if debug:
-            local_points.append(anchor_pcd)
-            camera_poses.append(anchor_cam_pose)
-        else:
-            local_points.append(anchor_pcd[overlap:])
-            camera_poses.append(anchor_cam_pose[overlap:])
-
-    return torch.cat(camera_poses, dim=0), torch.cat(local_points, dim=0)
 
 
 def register_adjacent_windows(

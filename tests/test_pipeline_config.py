@@ -82,3 +82,43 @@ def test_window_overlap_must_be_strictly_smaller_than_size():
             DEFAULT,
             ("window.size=5", "window.overlap=5"),
         )
+
+
+def test_public_pipeline_source_contains_no_legacy_parameter_names():
+    roots = [
+        Path("pipeline"),
+        Path("run_laser.py"),
+        Path("inference_engine/streaming_window_engine.py"),
+        Path("inference_engine/segmentation"),
+        Path("loop_closure/methods"),
+    ]
+    forbidden = {
+        "top_conf_percentile",
+        "depth_refine",
+        "segment_mode",
+        "geometry_seg_profile",
+        "split_aux_confirmation",
+        "registration_top_confidence_ratio",
+    }
+    text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for root in roots
+        for path in ([root] if root.is_file() else root.rglob("*.py"))
+    )
+    for name in forbidden:
+        assert name not in text
+
+
+def test_new_runtime_source_contains_no_retired_hart_identifiers():
+    roots = [
+        Path("pipeline"),
+        Path("inference_engine/anchor_propagation.py"),
+        Path("loop_closure/methods"),
+    ]
+    text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for root in roots
+        for path in ([root] if root.is_file() else root.rglob("*.py"))
+    )
+    for name in ("HART", "HART_AP", "hart_anchor"):
+        assert name not in text

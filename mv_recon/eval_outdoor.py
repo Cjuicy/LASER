@@ -8,21 +8,25 @@ import open3d as o3d
 import os.path as osp
 import hydra
 import logging
+from dataclasses import replace
 
 from omegaconf import DictConfig
 from pi3.models.pi3 import Pi3
+from pipeline.config import LoopMethod, load_pipeline_config
+from pipeline.runner import build_default_window_engine
 from utils.interfaces import infer_mv_pointclouds, infer_streaming_mv_pointclouds
 from mv_recon.utils import umeyama, accuracy, completion
 from utils.messages import set_default_arg, write_csv
 from utils.load_fn import load_and_preprocess_images
 
-# Additional models
-from inference_engine import StreamingWindowEngine
-
 WINDOW_SIZE = 60
 OVERLAP = 30
-TOP_CONF_PERCENTILE = 0.6
-dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+dtype = (
+    torch.bfloat16
+    if torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] >= 8
+    else torch.float16
+)
 
 
 def create_pi3(cfg):
@@ -34,17 +38,36 @@ def create_pi3(cfg):
 def create_streaming_pi3(cfg):
     pretrained_model_name_or_path: str = cfg.pi3.pretrained_model_name_or_path
     pi3 = Pi3.from_pretrained(pretrained_model_name_or_path)
-    model = StreamingWindowEngine(
-        pi3,
-        inference_device=cfg.device,
-        dtype=dtype,
-        top_conf_percentile=0.3,
-        window_size=WINDOW_SIZE,
-        overlap=OVERLAP,
-        cache_root='cache/',
-        depth_refine=False
-    ).eval()
-    return model
+    config = load_pipeline_config("configs/pipeline/default.yaml").config
+    config = replace(
+        config,
+        model=replace(
+            config.model,
+            inference_device=str(cfg.device),
+            process_device="cpu",
+            dtype=(
+                "bfloat16"
+                if dtype is torch.bfloat16
+                else "float16"
+            ),
+        ),
+        window=replace(
+            config.window,
+            size=WINDOW_SIZE,
+            overlap=OVERLAP,
+        ),
+        anchor_propagation=replace(
+            config.anchor_propagation,
+            enabled=False,
+        ),
+        loop=replace(
+            config.loop,
+            enabled=False,
+            method=LoopMethod.TRADITIONAL,
+        ),
+        output=replace(config.output, cache_dir="cache/"),
+    )
+    return build_default_window_engine(config, pi3).eval()
 
 
 @hydra.main(version_base="1.2", config_path="../configs", config_name="eval_mv_recon_outdoor")

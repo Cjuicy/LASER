@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as tvf
 import time
+from pathlib import Path
 
 from typing import List, Optional, Tuple
 from omegaconf import DictConfig
@@ -11,6 +12,8 @@ from PIL import Image
 from pi3.models.pi3 import Pi3
 from utils.geometry import closed_form_inverse_se3
 from utils.load_fn import load_and_preprocess_images
+from pipeline.manifest import ImageManifest
+from pipeline.runner import run_windows
 
 
 def load_images(filelist: List[str], PIXEL_LIMIT: int = 255000, new_width: Optional[int] = None, verbose: bool = False):
@@ -165,22 +168,31 @@ def infer_mv_pointclouds(filelist: str, model: Pi3, hydra_cfg: DictConfig, data_
 def infer_streaming_mv_pointclouds(filelist: str, inference_engine, hydra_cfg: DictConfig, data_size: Tuple[int, int]):
     # imgs = load_and_resize14(filelist, new_width=hydra_cfg.load_img_size, device=hydra_cfg.device, verbose=hydra_cfg.verbose)
     imgs = load_and_preprocess_images(filelist).to(hydra_cfg.device)
+    manifest = ImageManifest(
+        paths=tuple(Path(path).resolve() for path in filelist)
+    )
+    config = inference_engine.pipeline_config
+    caches = run_windows(inference_engine, manifest, imgs, config)
+    constraints = inference_engine.loop_strategy.build_constraints(
+        caches,
+        (),
+    )
+    solution = inference_engine.loop_strategy.optimize(
+        caches,
+        constraints,
+    )
+    result = inference_engine.loop_strategy.aggregate(caches, solution)
 
-    image_windows = inference_engine.img_sliding_window(imgs)
-
-    inference_engine.begin()
-    for sample in image_windows:
-        inference_engine(sample)
-    inference_engine.end()
-    save_dict = inference_engine.parse_inference_cache_summary()
-    
-    global_points = save_dict['points'][0]  # (N, h, w, 3)
+    global_points = result.payload['points']  # (N, h, w, 3)
     global_points = F.interpolate(
         global_points.permute(0, 3, 1, 2), data_size,
         mode="bilinear", align_corners=False, antialias=True
     ).permute(0, 2, 3, 1)  # align to gt
 
-    return global_points.cpu().numpy(), save_dict['conf'][0].cpu().numpy()
+    return (
+        global_points.cpu().numpy(),
+        result.payload['confidence'].cpu().numpy(),
+    )
 
 def infer_vggt_mv_pointclouds(filelist: str, model, hydra_cfg: DictConfig, data_size: Tuple[int, int]):
     # imgs = load_and_resize14(filelist, new_width=hydra_cfg.load_img_size, device=hydra_cfg.device, verbose=hydra_cfg.verbose)

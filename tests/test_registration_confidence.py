@@ -7,10 +7,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from inference_engine.streaming_window_engine import StreamingWindowEngine
-from inference_engine.streaming_window_engine_lc import StreamingWindowEngineLC
 from inference_engine.anchor_propagation import AnchorPropagator
 from inference_engine.segmentation import build_segmentation_strategy
 from inference_engine.utils import registration_confidence
+from loop_closure.methods import (
+    CorrectedWindowEngine,
+    TraditionalWindowEngine,
+)
 from inference_engine.utils.registration_confidence import (
     select_top_confidence_mask,
     validate_confidence_keep_ratio,
@@ -140,14 +143,19 @@ def test_base_engine_uses_explicit_registration_keep_ratio(tmp_path):
     assert engine.registration_confidence_keep_ratio == 0.3
 
 
-def test_loop_streaming_engine_uses_same_registration_field(
+@pytest.mark.parametrize(
+    "engine_type",
+    (TraditionalWindowEngine, CorrectedWindowEngine),
+)
+def test_loop_window_engines_use_same_registration_field(
     tmp_path,
+    engine_type,
 ):
     segmentation = load_pipeline_config(
         "configs/pipeline/test.yaml",
         ("segmentation.method=depth",),
     ).config.segmentation
-    engine = StreamingWindowEngineLC(
+    engine = engine_type(
         torch.nn.Identity(),
         inference_device="cpu",
         dtype=torch.float32,

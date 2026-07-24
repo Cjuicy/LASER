@@ -216,6 +216,42 @@ def _viser_payload(payload) -> dict[str, np.ndarray]:
     return {key: _to_numpy(payload[key]) for key in required}
 
 
+def build_default_window_engine(config: PipelineConfig, model):
+    segmenter = build_segmentation_strategy(config.segmentation)
+    anchor = AnchorPropagator(
+        config.anchor_propagation.correspondence_iou_threshold
+    )
+    loop_strategy = build_loop_strategy(
+        config.loop.method,
+        optimizer_config=config.loop.optimizer,
+        registration_confidence_keep_ratio=(
+            config.loop.registration.confidence_keep_ratio
+        ),
+    )
+    engine = loop_strategy.create_window_engine(
+        delegate=model,
+        inference_device=config.model.inference_device,
+        dtype=_dtype(config.model.dtype),
+        segmentation_strategy=segmenter,
+        anchor_propagator=anchor,
+        registration_confidence_keep_ratio=(
+            config.loop.registration.confidence_keep_ratio
+        ),
+        anchor_enabled=config.anchor_propagation.enabled,
+        temporal_iou_threshold=(
+            config.segmentation.temporal_iou_threshold
+        ),
+        window_size=config.window.size,
+        overlap=config.window.overlap,
+        cache_root=config.output.cache_dir,
+        intermediate_device=config.model.inference_device,
+        process_device=config.model.process_device,
+    )
+    engine.pipeline_config = config
+    engine.loop_strategy = loop_strategy
+    return engine
+
+
 class PipelineRunner:
     def __init__(
         self,

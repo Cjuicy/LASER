@@ -61,77 +61,35 @@ bash ./scripts/download_weights.sh
 
 ## 🚀 Usage
 
-### Inference
-To run the inference code, you can use the following command:
-```bash
-export PYTHONPATH="./":$PYTHONPATH
+### Modular inference
 
-python demo.py \
-    --data_path DATA_PATH \
-    --output_path "./viser_results" \
-    --cache_path "./cache" \
-    --sample_interval SAMPLE_INTERVAL \
-    --window_size WINDOW_SIZE \
-    --overlap OVERLAP \
-    --depth_refine
-
-# example inference script
-python demo.py \
-    --data_path "examples/titanic" \
-    --output_path "./viser_results" \
-    --cache_path "./cache" \
-    --sample_interval 1 \
-    --window_size 30 \
-    --overlap 10 \
-    --depth_refine
-```
-The results will be saved in the `viser_results/SEQ_NAME`directory for future visualization.
-
-### Unified segmentation methods
-
-The same streaming pipeline can select one of three validated segmentation methods:
+LASER now uses one strict YAML configuration and one public entry point:
 
 ```bash
-python demo.py \
-    --model_ckpt weights/model.safetensors \
-    --data_path DATA_PATH \
-    --cache_path ./cache/depth \
-    --output_path ./viser_results/depth \
-    --sample_interval 1 \
-    --window_size 30 \
-    --overlap 10 \
-    --depth_refine \
-    --segment_mode depth
+python run_laser.py --config configs/pipeline/default.yaml
 ```
 
-Set `--segment_mode` to `depth`, `geometry`, or `layer_atomic`. Geometry defaults to
-`--normal_method cross --geometry_seg_profile baseline_params`. The formal comparison
-profile aligns all three methods to Felzenszwalb `scale=300`, `sigma=1.1`, and
-`min_size=500`; the historical geometry settings are available only with
-`--geometry_seg_profile legacy`.
+Select any segmentation, atomic split, or loop strategy through canonical
+configuration paths:
 
-See [docs/unified-segmentation-cloud-validation.md](docs/unified-segmentation-cloud-validation.md)
-for branch checkout, CPU smoke tests, full regression tests, and matched cloud commands
-for all three modes.
-
-### Loop-closure inference
-Loop-closure requires additional dependencies for package `faiss` can be installed through:
 ```bash
-pip install faiss-gpu-cu12 numpy==1.26.4
+python run_laser.py \
+  --config configs/pipeline/default.yaml \
+  --set segmentation.method=atomic \
+  --set segmentation.atomic.split_mode=normal_only \
+  --set loop.method=traditional
 ```
-Run loop-closure inference for kilometer-scale sequence with the following command:
-```bash
-python demo_lc.py \
-    --config_path "configs/loop_config.yaml" \
-    --data_path DATA_PATH \
-    --output_path "./viser_results" \
-    --cache_path "./cache" \
-    --sample_interval SAMPLE_INTERVAL \
-    --window_size WINDOW_SIZE \
-    --overlap OVERLAP
 
-rm -r cache/
-```
+The exact supported methods are:
+
+- segmentation: `depth`, `geometry`, `atomic`
+- atomic split: `none`, `conservative`, `normal_only`
+- loop closure: `traditional`, `corrected`
+
+Loop closure additionally requires `faiss-gpu-cu12`. See the
+[modular pipeline guide](docs/pipeline-configuration.md) for the complete YAML,
+method semantics, diagnostics, ten-configuration matrix, and AutoDL/KITTI
+commands.
 
 ### Visualization
 To visualize the interactive 4D results, you can use the following command:

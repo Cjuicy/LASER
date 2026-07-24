@@ -36,6 +36,7 @@ import gc
 import tempfile
 import shutil
 import glob
+from contextlib import nullcontext
 from collections import defaultdict
 import time
 
@@ -211,7 +212,13 @@ class StreamingWindowEngine(VanillaEngine):
             t_start = time.perf_counter()
 
             # 4️⃣ 自动混合精度推理
-            with torch.autocast(self.inference_device, dtype=self.dtype):
+            device_type = torch.device(self.inference_device).type
+            autocast_context = (
+                torch.autocast(device_type, dtype=self.dtype)
+                if self.dtype in (torch.float16, torch.bfloat16)
+                else nullcontext()
+            )
+            with autocast_context:
                 prediction_window = self.delegate(sample_window)
 
             # 5️⃣ 记录推理耗时
