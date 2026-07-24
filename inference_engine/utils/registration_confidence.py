@@ -28,7 +28,7 @@ def select_top_confidence_mask(
     threshold = torch.quantile(
         quantile_values,
         1.0 - ratio,
-        interpolation="nearest",
+        interpolation="higher",
     )
     return finite & (confidence >= threshold)
 

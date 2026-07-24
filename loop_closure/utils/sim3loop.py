@@ -3,6 +3,7 @@ import torch
 import pypose as pp
 from typing import List, Tuple
 from scipy.spatial.transform import Rotation as R
+from pipeline.config import OptimizerConfig
 
 cpp_version = False
 try:
@@ -31,11 +32,22 @@ class Sim3LoopOptimizer:
     - Optimized sequential_transforms
     """
 
-    def __init__(self, config, device='cpu'):
+    def __init__(
+        self,
+        config: OptimizerConfig,
+        device: str = "cpu",
+    ):
         self.device = device
         self.config = config
-        self.solve_system_version = self.config['Loop']['SIM3_Optimizer'][
-            'lang_version']  # choose between 'python' and 'cpp'
+        if config.implementation not in {"python", "cpp"}:
+            raise ValueError(
+                "optimizer implementation must be python or cpp"
+            )
+        if not config.use_sim3:
+            raise ValueError("Sim3LoopOptimizer requires use_sim3=true")
+        self.solve_system_version = config.implementation
+        self.max_iterations = config.max_iterations
+        self.initial_damping = config.initial_damping
 
         if not cpp_version:
             self.solve_system_version = 'python'
@@ -175,26 +187,17 @@ class Sim3LoopOptimizer:
 
     def optimize(self,
                  sequential_transforms: List[Tuple[float, np.ndarray, np.ndarray]],
-                 loop_constraints: List[Tuple[int, int, Tuple[float, np.ndarray, np.ndarray]]],
-                 max_iterations: int = None,
-                 lambda_init: float = None) -> List[Tuple[float, torch.Tensor, torch.Tensor]]:
+                 loop_constraints: List[Tuple[int, int, Tuple[float, np.ndarray, np.ndarray]]]
+                 ) -> List[Tuple[float, torch.Tensor, torch.Tensor]]:
         """
         Main optimization function
         
         Args:
             sequential_transforms: Input sequence of transforms
             loop_constraints: List of loop closure constraints
-            max_iterations: Maximum iterations
-            lambda_init: Initial lambda for L-M algorithm
-        
         Returns:
             Optimized sequence of transforms
         """
-        if max_iterations is None:
-            max_iterations = self.config['Loop']['SIM3_Optimizer']['max_iterations']
-        if lambda_init is None:
-            lambda_init = eval(self.config['Loop']['SIM3_Optimizer']['lambda_init'])
-
         input_poses = self.sequential_to_absolute_poses(sequential_transforms)
 
         dSloop, ii_loop, jj_loop = self.build_loop_constraints(loop_constraints)
@@ -204,14 +207,14 @@ class Sim3LoopOptimizer:
             return sequential_transforms
 
         Ginv = pp.Sim3(input_poses).Inv().Log()
-        lmbda = lambda_init
+        lmbda = self.initial_damping
         residual_history = []
 
         print(
             f"Starting optimization with {len(sequential_transforms)} poses and {len(loop_constraints)} loop constraints")
 
         # L-M loop
-        for itr in range(max_iterations):
+        for itr in range(self.max_iterations):
             resid, (J_Ginv_i, J_Ginv_j, iii, jjj) = self.residual(
                 Ginv, input_poses, dSloop, ii_loop, jj_loop, jacobian=True)
 
@@ -268,84 +271,3 @@ class Sim3LoopOptimizer:
         print(f"Optimization completed. Final cost: {residual_history[-1] if residual_history else 'N/A'}")
 
         return optimized_sequential
-
-
-# ======== TEST CODE ========
-
-
-def create_ring_transforms(num_poses=6, radius=5.0, rot_noise_deg=2.0):
-    """Generate a ring of Sim3 transforms with rotation, adding slight rotational noise"""
-    transforms = []
-    angle_step = 2 * np.pi / num_poses
-
-    for i in range(num_poses):
-        angle = angle_step
-
-        # Main rotation (around Z-axis)
-        R_z = R.from_euler('z', angle, degrees=False)
-
-        # Add slight rotational noise (Gaussian noise in degrees)
-        noise_angles_deg = np.random.normal(loc=0.0, scale=rot_noise_deg, size=3)
-        R_noise = R.from_euler('xyz', noise_angles_deg, degrees=True)
-
-        # Combine rotations
-        R_mat = (R_noise * R_z).as_matrix()
-
-        # Translation: simulate a circular trajectory
-        t = np.array([radius * np.sin(angle), radius * (1 - np.cos(angle)), 0.0])
-
-        s = np.random.uniform(0.8, 1.2)
-
-        transforms.append((s, R_mat, t))
-
-    return transforms
-
-
-def example_usage():
-    optimizer = Sim3LoopOptimizer(solve_system_version='cpp')
-
-    # Build rotating ring
-    sequential_transforms = create_ring_transforms(num_poses=20, radius=3.0)
-
-    # Add loop closure constraint: from frame 5 back to frame 0
-    loop_constraints = [
-        (20, 0, (1.0, np.eye(3), np.zeros(3)))  # Temporary unit loop for simulation
-    ]
-
-    # Trajectory before/after optimization
-    input_abs_poses = optimizer.sequential_to_absolute_poses(sequential_transforms)
-    optimized_transforms = optimizer.optimize(sequential_transforms, loop_constraints)
-    optimized_abs_poses = optimizer.sequential_to_absolute_poses(optimized_transforms)
-
-    def extract_xyz(pose_tensor):
-        poses = pose_tensor.cpu().numpy()
-        return poses[:, 0], poses[:, 1], poses[:, 2]
-
-    x0, y0, z0 = extract_xyz(input_abs_poses)
-    x1, y1, z1 = extract_xyz(optimized_abs_poses)
-
-    # Visualize trajectory
-    import matplotlib.pyplot as plt
-    import matplotlib
-    matplotlib.use('Agg')
-
-    plt.figure(figsize=(8, 6))
-    plt.plot(x0, y0, 'o--', label='Before Optimization')
-    plt.plot(x1, y1, 'o-', label='After Optimization')
-    for i, j, _ in loop_constraints:
-        plt.plot([x0[i], x0[j]], [y0[i], y0[j]], 'r--', label='Loop (Before)' if i == 5 else "")
-        plt.plot([x1[i], x1[j]], [y1[i], y1[j]], 'g-', label='Loop (After)' if i == 5 else "")
-    plt.gca().set_aspect('equal')
-    plt.title("Sim3 Loop Closure Optimization (Rotating Ring)")
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.legend()
-    plt.grid(True)
-    plt.axis("equal")
-    plt.show()
-
-    return optimized_transforms
-
-
-if __name__ == "__main__":
-    example_usage()

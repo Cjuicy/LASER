@@ -1,44 +1,43 @@
 import torch
-import argparse
+from pathlib import Path
+
 from PIL import Image
 import torchvision.transforms as T
 from tqdm import tqdm
 
+from pipeline.config import DetectionConfig
+from pipeline.manifest import ImageManifest
+
+from .methods.base import LoopCandidate
 from .vpr_model import VPRModel
-from utils.image_paths import discover_images
 
 
 class LoopDetector:
     """Loop detector class for detecting loop closures in image sequences"""
 
-    def __init__(self,
-                 image_dir,
-                 sample_interval=1,
-                 output="loop_closures.txt",
-                 config=None,
-                 image_paths=None):
-        """Initialize the loop detector
-        
-        Args:
-            image_dir: Directory path containing images
-            sample_interval
-            output: Output file path
-        """
-        self.config = config
-        self.image_dir = image_dir
-        self.sample_interval = sample_interval
-        self.ckpt_path = self.config['Weights']['SALAD']
-        self.image_size = self.config['Loop']['SALAD']['image_size']
-        self.batch_size = self.config['Loop']['SALAD']['batch_size']
-        self.similarity_threshold = self.config['Loop']['SALAD']['similarity_threshold']
-        self.top_k = self.config['Loop']['SALAD']['top_k']
-        self.use_nms = self.config['Loop']['SALAD']['use_nms']
-        self.nms_threshold = self.config['Loop']['SALAD']['nms_threshold']
-        self.output = output
+    def __init__(
+        self,
+        detection_config: DetectionConfig,
+        image_manifest: ImageManifest,
+        output_path: Path,
+    ):
+        self.config = detection_config
+        self.image_manifest = image_manifest
+        self.ckpt_path = detection_config.salad_checkpoint
+        self.image_size = detection_config.image_size
+        self.batch_size = detection_config.batch_size
+        self.similarity_threshold = detection_config.similarity_threshold
+        self.top_k = detection_config.top_k
+        self.use_nms = detection_config.nms_enabled
+        self.nms_threshold = detection_config.nms_frame_radius
+        self.output = Path(output_path)
+        self._vpr_config = {
+            "Weights": {"DINO": detection_config.dino_checkpoint}
+        }
 
         self.model = None
         self.device = None
-        self.image_paths = image_paths
+        self.image_paths = image_manifest.as_strings()
         self.descriptors = None
         self.loop_closures = None
 
@@ -74,10 +73,16 @@ class LoopDetector:
                 'cluster_dim': 128,
                 'token_dim': 256,
             },
-            vggt_long_config=self.config
+            vggt_long_config=self._vpr_config
         )
 
-        model.load_state_dict(torch.load(self.ckpt_path))
+        model.load_state_dict(
+            torch.load(
+                self.ckpt_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        )
         model = model.eval()
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = model.to(device)
@@ -88,12 +93,7 @@ class LoopDetector:
         return model, device
 
     def get_image_paths(self):
-        """Get paths of all image files in directory"""
-        if self.image_paths is None:
-            self.image_paths = discover_images(
-                self.image_dir,
-                sample_interval=self.sample_interval,
-            )
+        """Return the canonical immutable-manifest snapshot."""
         return self.image_paths
 
     def extract_descriptors(self):
@@ -202,7 +202,15 @@ class LoopDetector:
         if self.use_nms and self.nms_threshold > 0:
             loop_closures = self._apply_nms_filter(loop_closures, self.nms_threshold)
 
-        self.loop_closures = self._ensure_decending_order(loop_closures)
+        canonical = self._ensure_decending_order(loop_closures)
+        self.loop_closures = tuple(
+            LoopCandidate(
+                frame_a=int(frame_a),
+                frame_b=int(frame_b),
+                similarity=float(similarity),
+            )
+            for frame_a, frame_b, similarity in canonical
+        )
         return self.loop_closures
 
     def save_results(self):
@@ -210,13 +218,17 @@ class LoopDetector:
         if self.loop_closures is None:
             self.find_loop_closures()
 
-        with open(self.output, 'w') as f:
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        with self.output.open("w", encoding="utf-8") as f:
             f.write("# Loop Detection Results (index1, index2, similarity)\n")
             if self.use_nms:
                 f.write(f"# NMS filtering applied, threshold: {self.nms_threshold}\n")
             f.write("\n# Loop pairs:\n")
-            for i, j, sim in self.loop_closures:
-                f.write(f"{i}, {j}, {sim:.4f}\n")
+            for candidate in self.loop_closures:
+                f.write(
+                    f"{candidate.frame_a}, {candidate.frame_b}, "
+                    f"{candidate.similarity:.4f}\n"
+                )
             f.write("\n# Image path list:\n")
             for i, path in enumerate(self.image_paths):
                 f.write(f"# {i}: {path}\n")
@@ -227,61 +239,32 @@ class LoopDetector:
 
         if self.loop_closures:
             print("\nTop 10 loop pairs:")
-            for i, (idx1, idx2, sim) in enumerate(self.loop_closures[:10]):
-                print(f"{idx1}, {idx2}, similarity: {sim:.4f}")
+            for i, candidate in enumerate(self.loop_closures[:10]):
+                print(
+                    f"{candidate.frame_a}, {candidate.frame_b}, "
+                    f"similarity: {candidate.similarity:.4f}"
+                )
                 if i >= 9:
                     break
 
     def get_loop_list(self):
-        return [(idx1, idx2) for idx1, idx2, _ in self.loop_closures]
+        return [
+            (candidate.frame_a, candidate.frame_b)
+            for candidate in self.loop_closures
+        ]
 
     def run(self):
         """Run complete loop detection pipeline"""
         print('Loading model...')
         self.load_model()
 
-        self.get_image_paths()
         if not self.image_paths:
-            print(f"No image files found in {self.image_dir}")
-            return
+            raise ValueError("image manifest contains no images")
 
         print(f"Found {len(self.image_paths)} image files")
 
         self.extract_descriptors()
 
         self.find_loop_closures()
-
-        # self.save_results()
-
+        self.save_results()
         return self.loop_closures
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Loop detection using SALAD model")
-    parser.add_argument("--image_dir", type=str,
-                        default="/media/deng/Data/KITTIdataset/data_odometry_color/dataset/sequences/00/image_2",
-                        help="Directory path containing images")
-    parser.add_argument("--ckpt_path", type=str, default="./weights/dino_salad.ckpt", help="Model checkpoint path")
-    parser.add_argument("--image_size", nargs=2, type=int, default=[336, 336],
-                        help="Image resize dimensions [height width]")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")
-    parser.add_argument("--similarity_threshold", type=float, default=0.7, help="Similarity threshold for loop closure")
-    parser.add_argument("--top_k", type=int, default=5, help="Number of nearest neighbors to check for each image")
-    parser.add_argument("--output", type=str, default="loop_closures.txt", help="Output file path")
-    parser.add_argument("--use_nms", action="store_true", default=True,
-                        help="Whether to use Non-Maximum Suppression (NMS) filtering")
-    parser.add_argument("--nms_threshold", type=int, default=25,
-                        help="NMS threshold for minimum frame difference between loop pairs")
-
-    args = parser.parse_args()
-
-    detector = LoopDetector(
-        image_dir=args.image_dir,
-        output=args.output
-    )
-
-    detector.run()
-
-
-if __name__ == "__main__":
-    main()

@@ -9,6 +9,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from loop_closure.loop_model import LoopDetector
+from pipeline.config import load_pipeline_config
+from pipeline.manifest import ImageManifest
 from utils.image_paths import discover_images, natural_sort_key
 
 
@@ -74,50 +76,45 @@ def test_loop_detector_uses_explicit_manifest_without_rescanning(
     monkeypatch,
     tmp_path,
 ):
-    image_paths = [
-        str(tmp_path / "frame2.png"),
-        str(tmp_path / "frame10.png"),
+    config = load_pipeline_config(
+        "configs/pipeline/test.yaml"
+    ).config.loop.detection
+    image_paths = (
+        (tmp_path / "frame2.png").resolve(),
+        (tmp_path / "frame10.png").resolve(),
+    )
+    detector = LoopDetector(
+        detection_config=config,
+        image_manifest=ImageManifest(paths=image_paths),
+        output_path=tmp_path / "loops.txt",
+    )
+
+    assert detector.get_image_paths() == [
+        str(path) for path in image_paths
     ]
 
-    def fail_discovery(*args, **kwargs):
-        raise AssertionError("explicit manifest must not rescan")
 
-    monkeypatch.setattr(
-        "loop_closure.loop_model.discover_images",
-        fail_discovery,
-        raising=False,
-    )
-    detector = LoopDetector(
-        image_dir=tmp_path,
-        sample_interval=3,
-        config=loop_config(),
-        image_paths=image_paths,
-    )
-
-    assert detector.get_image_paths() is image_paths
-
-
-def test_loop_detector_fallback_uses_shared_discovery(monkeypatch, tmp_path):
-    expected = [str(tmp_path / "frame1.png")]
-    calls = []
-
-    def fake_discover_images(data_path, sample_interval):
-        calls.append((Path(data_path), sample_interval))
-        return expected
-
-    monkeypatch.setattr(
-        "loop_closure.loop_model.discover_images",
-        fake_discover_images,
-        raising=False,
-    )
-    detector = LoopDetector(
-        image_dir=tmp_path,
-        sample_interval=4,
-        config=loop_config(),
-    )
-
-    assert detector.get_image_paths() is expected
-    assert calls == [(tmp_path, 4)]
+@pytest.mark.parametrize(
+    "legacy_field",
+    ("image_dir", "sample_interval", "config", "image_paths"),
+)
+def test_loop_detector_rejects_legacy_constructor_fields(
+    tmp_path,
+    legacy_field,
+):
+    config = load_pipeline_config(
+        "configs/pipeline/test.yaml"
+    ).config.loop.detection
+    kwargs = {
+        "detection_config": config,
+        "image_manifest": ImageManifest(
+            paths=((tmp_path / "frame1.png").resolve(),)
+        ),
+        "output_path": tmp_path / "loops.txt",
+        legacy_field: object(),
+    }
+    with pytest.raises(TypeError, match=legacy_field):
+        LoopDetector(**kwargs)
 
 
 def load_loop_engine_module(monkeypatch, detector_calls):

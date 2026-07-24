@@ -30,7 +30,7 @@ def test_top_thirty_percent_uses_point_seven_quantile():
         False,
         False,
         False,
-        True,
+        False,
         True,
         True,
         True,
@@ -50,7 +50,7 @@ def test_top_confidence_mask_supports_mixed_precision_cpu_tensors(dtype):
         False,
         False,
         False,
-        True,
+        False,
         True,
         True,
         True,
@@ -62,7 +62,7 @@ def test_non_finite_confidence_is_never_selected():
 
     mask = select_top_confidence_mask(confidence, keep_ratio=0.5)
 
-    assert mask.tolist() == [True, False, False, True]
+    assert mask.tolist() == [False, False, False, True]
 
 
 def test_confidence_selection_rejects_no_finite_values():
