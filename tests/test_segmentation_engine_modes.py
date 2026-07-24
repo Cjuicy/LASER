@@ -2,12 +2,35 @@ import numpy as np
 import pytest
 import torch
 
-from inference_engine import streaming_window_engine as swe_module
+from inference_engine.anchor_propagation import AnchorPropagator
+from inference_engine.segmentation import (
+    SegmentationResult,
+    build_segmentation_strategy,
+)
 from inference_engine.streaming_window_engine import StreamingWindowEngine
 from inference_engine.streaming_window_engine_lc import StreamingWindowEngineLC
+from pipeline.config import SegmentationMethod, load_pipeline_config
 
 
-def _engine(tmp_path, **kwargs):
+def _strategy(method):
+    config = load_pipeline_config(
+        "configs/pipeline/test.yaml",
+        (f"segmentation.method={method}",),
+    ).config.segmentation
+    return build_segmentation_strategy(config)
+
+
+def _engine(tmp_path, method="depth", **kwargs):
+    defaults = {
+        "segmentation_strategy": _strategy(method),
+        "anchor_propagator": AnchorPropagator(),
+        "registration_confidence_keep_ratio": 0.3,
+        "anchor_enabled": True,
+        "temporal_iou_threshold": 0.3,
+        "window_size": 10,
+        "overlap": 5,
+    }
+    defaults.update(kwargs)
     return StreamingWindowEngine(
         torch.nn.Identity(),
         inference_device="cpu",
@@ -15,131 +38,106 @@ def _engine(tmp_path, **kwargs):
         process_device="cpu",
         cache_root=str(tmp_path),
         benchmark_latency=False,
-        **kwargs,
+        **defaults,
     )
-
-
-def test_engine_defaults_to_depth_and_aligned_geometry_configuration(tmp_path):
-    engine = _engine(tmp_path, depth_refine=False)
-
-    assert engine.segment_mode == "depth"
-    assert engine.normal_method == "cross"
-    assert engine.geometry_seg_profile == "baseline_params"
-
-
-@pytest.mark.parametrize("mode", ["depth", "geometry", "layer_atomic"])
-def test_engine_accepts_all_explicit_modes_when_refinement_is_enabled(tmp_path, mode):
-    engine = _engine(tmp_path / mode, segment_mode=mode, depth_refine=True)
-
-    assert engine.segment_mode == mode
-
-
-@pytest.mark.parametrize("mode", ["geometry", "layer_atomic"])
-def test_non_depth_mode_requires_depth_refinement(tmp_path, mode):
-    with pytest.raises(ValueError, match="depth_refine"):
-        _engine(tmp_path / mode, segment_mode=mode, depth_refine=False)
-
-
-def test_engine_rejects_unknown_mode(tmp_path):
-    with pytest.raises(ValueError, match="segment_mode"):
-        _engine(tmp_path, segment_mode="unknown", depth_refine=True)
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("normal_method", "unknown", "normal_method"),
-        ("geometry_seg_profile", "unknown", "geometry_seg_profile"),
-    ],
+    ("method", "expected"),
+    (
+        ("depth", SegmentationMethod.DEPTH),
+        ("geometry", SegmentationMethod.GEOMETRY),
+        ("atomic", SegmentationMethod.ATOMIC),
+    ),
 )
-def test_geometry_mode_rejects_unknown_geometry_options(tmp_path, field, value, message):
-    with pytest.raises(ValueError, match=message):
-        _engine(
-            tmp_path,
-            segment_mode="geometry",
-            depth_refine=True,
-            **{field: value},
-        )
+def test_engine_accepts_each_injected_segmentation_strategy(
+    tmp_path,
+    method,
+    expected,
+):
+    engine = _engine(tmp_path / method, method=method)
+    assert engine.segmentation_strategy.name is expected
 
 
-def test_parent_segment_graph_helper_forwards_effective_configuration(monkeypatch, tmp_path):
-    calls = []
-    expected_graph = object()
-
-    def fake_make_sp_graph(point_maps, **kwargs):
-        calls.append((point_maps, kwargs))
-        return expected_graph
-
-    monkeypatch.setattr(swe_module, "make_sp_graph", fake_make_sp_graph)
+def test_anchor_can_be_disabled_independently_of_segmentation(tmp_path):
     engine = _engine(
         tmp_path,
-        segment_mode="geometry",
-        normal_method="sobel",
-        geometry_seg_profile="legacy",
-        depth_refine=True,
+        method="atomic",
+        anchor_enabled=False,
     )
-    local_points = torch.arange(24, dtype=torch.float32).reshape(2, 2, 2, 3)
-    conf = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
-
-    graph = engine._build_segment_graph(local_points, conf)
-
-    assert graph is expected_graph
-    assert len(calls) == 1
-    point_maps, kwargs = calls[0]
-    np.testing.assert_array_equal(point_maps, local_points.numpy())
-    np.testing.assert_array_equal(kwargs.pop("conf_map"), conf.numpy())
-    assert kwargs == {
-        "top_conf_percentile": engine.top_conf_percentile,
-        "segment_mode": "geometry",
-        "normal_method": "sobel",
-        "geometry_seg_profile": "legacy",
-    }
+    assert engine.anchor_enabled is False
+    assert engine.segmentation_strategy.name is SegmentationMethod.ATOMIC
 
 
-def test_loop_closure_engine_forwards_parent_segmentation_configuration(tmp_path):
+def test_build_segment_graph_passes_images_and_threshold_once(
+    monkeypatch,
+    tmp_path,
+):
+    class SpyStrategy:
+        name = SegmentationMethod.GEOMETRY
+
+        def __init__(self):
+            self.calls = []
+
+        def segment(self, point_maps, confidence, images):
+            self.calls.append((point_maps, confidence, images))
+            return [
+                SegmentationResult(
+                    labels=np.zeros(point_maps.shape[1:3], dtype=np.intp),
+                    diagnostics={"method": "geometry", "region_count": 1},
+                )
+                for _ in point_maps
+            ]
+
+    from inference_engine import streaming_window_engine as engine_module
+
+    graph_calls = []
+
+    def fake_build_temporal_graphs(results, threshold):
+        graph_calls.append((results, threshold))
+        return "graph"
+
+    monkeypatch.setattr(
+        engine_module,
+        "build_temporal_graphs",
+        fake_build_temporal_graphs,
+    )
+    strategy = SpyStrategy()
+    engine = _engine(
+        tmp_path,
+        segmentation_strategy=strategy,
+        temporal_iou_threshold=0.27,
+    )
+    points = torch.zeros((2, 2, 3, 3))
+    confidence = torch.ones((2, 2, 3))
+    images = torch.zeros((2, 3, 2, 3))
+
+    graph = engine._build_segment_graph(points, confidence, images)
+
+    assert graph == "graph"
+    assert len(strategy.calls) == 1
+    assert len(graph_calls) == 1
+    assert graph_calls[0][1] == pytest.approx(0.27)
+    np.testing.assert_array_equal(strategy.calls[0][2], images.numpy())
+
+
+def test_loop_engine_uses_same_injected_services(tmp_path):
+    strategy = _strategy("atomic")
+    propagator = AnchorPropagator(0.35)
     engine = StreamingWindowEngineLC(
         torch.nn.Identity(),
         inference_device="cpu",
         dtype=torch.float32,
-        process_device="cpu",
+        segmentation_strategy=strategy,
+        anchor_propagator=propagator,
+        registration_confidence_keep_ratio=0.3,
+        anchor_enabled=True,
+        temporal_iou_threshold=0.3,
+        window_size=10,
+        overlap=5,
         cache_root=str(tmp_path),
-        depth_refine=True,
-        segment_mode="layer_atomic",
-        normal_method="sobel",
-        geometry_seg_profile="legacy",
+        process_device="cpu",
+        benchmark_latency=False,
     )
-
-    assert engine.segment_mode == "layer_atomic"
-    assert engine.normal_method == "sobel"
-    assert engine.geometry_seg_profile == "legacy"
-
-
-@pytest.mark.parametrize(
-    ("mode", "profile", "expected"),
-    [
-        ("depth", "baseline_params", "scale=300, sigma=1.1, min_size=500"),
-        ("geometry", "baseline_params", "scale=300, sigma=1.1, min_size=500"),
-        ("geometry", "legacy", "scale=200, sigma=1.0, min_size=300"),
-        ("layer_atomic", "baseline_params", "scale=300, sigma=1.1, min_size=500"),
-    ],
-)
-def test_engine_prints_effective_segmentation_configuration(
-    tmp_path,
-    capsys,
-    mode,
-    profile,
-    expected,
-):
-    _engine(
-        tmp_path / f"{mode}-{profile}",
-        segment_mode=mode,
-        geometry_seg_profile=profile,
-        depth_refine=True,
-    )
-
-    output = capsys.readouterr().out
-    assert f"mode={mode}" in output
-    assert expected in output
-    if mode == "geometry":
-        assert f"profile={profile}" in output
-        assert "normal=cross" in output
+    assert engine.segmentation_strategy is strategy
+    assert engine.anchor_propagator is propagator

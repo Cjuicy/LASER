@@ -7,9 +7,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from inference_engine import streaming_window_engine_lc as lc_module
+from inference_engine.anchor_propagation import AnchorPropagator
+from inference_engine.segmentation import build_segmentation_strategy
 from inference_engine.streaming_window_engine import STOP_SIGNAL
 from inference_engine.streaming_window_engine_lc import StreamingWindowEngineLC
 from inference_engine.utils.geometry import accumulate_sim3
+from pipeline.config import load_pipeline_config
 
 
 def make_window(depth):
@@ -46,20 +49,35 @@ def assert_sim3_close(actual, expected):
 
 
 def run_three_window_fixture(monkeypatch, tmp_path):
+    segmentation = load_pipeline_config(
+        "configs/pipeline/test.yaml",
+        ("segmentation.method=depth",),
+    ).config.segmentation
+
+    class FixturePropagator:
+        def __init__(self):
+            self.scales = iter((3.0, 5.0))
+
+        def propagate(self, *args):
+            return torch.full((2, 1, 1, 1), next(self.scales))
+
     engine = StreamingWindowEngineLC(
         torch.nn.Identity(),
         inference_device="cpu",
         dtype=torch.float32,
+        segmentation_strategy=build_segmentation_strategy(segmentation),
+        anchor_propagator=FixturePropagator(),
+        registration_confidence_keep_ratio=0.3,
+        anchor_enabled=True,
+        temporal_iou_threshold=0.3,
         process_device="cpu",
         cache_root=str(tmp_path),
         window_size=2,
         overlap=1,
-        depth_refine=True,
     )
     caches = []
     registration_sources = []
     registration_scales = iter((2.0, 4.0))
-    refinement_scales = iter((3.0, 5.0))
 
     monkeypatch.setattr(
         lc_module,
@@ -90,14 +108,6 @@ def run_three_window_fixture(monkeypatch, tmp_path):
         fake_register,
     )
 
-    def fake_refine(*args):
-        return torch.full((2, 1, 1, 1), next(refinement_scales))
-
-    monkeypatch.setattr(
-        lc_module,
-        "refine_depth_segments",
-        fake_refine,
-    )
     engine._build_segment_graph = lambda *args: object()
     engine._save_cache = lambda: caches.append(
         clone_cache(engine.prev_window_cache)

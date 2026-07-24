@@ -4,11 +4,12 @@ import torch.nn as nn
 import time
 
 from .streaming_window_engine import StreamingWindowEngine, STOP_SIGNAL
+from .anchor_propagation import AnchorPropagator
+from .segmentation import SegmentationStrategy
 from .inference_utils import (
     register_adjacent_windows,
     estimate_pseudo_depth_and_intrinsics,
     unproject_depth_to_local_points,
-    refine_depth_segments
 )
 from .utils.geometry import (
     apply_sim3_to_pose,
@@ -23,35 +24,39 @@ from .utils.registration_confidence import (
 
 class StreamingWindowEngineLC(StreamingWindowEngine):
     def __init__(
-            self,
-            delegate: nn.Module,
-            inference_device: str,
-            dtype: torch.dtype,
-            process_device: str = 'cpu',
-            top_conf_percentile: float = 0.5,
-            window_size: int = 20,
-            overlap: int = 5,
-            depth_refine=False,
-            cache_root: str = './cache',
-            segment_mode: str = "depth",
-            normal_method: str = "cross",
-            geometry_seg_profile: str = "baseline_params",
-            registration_top_confidence_ratio: float = 0.3,
+        self,
+        delegate: nn.Module,
+        inference_device: str,
+        dtype: torch.dtype,
+        segmentation_strategy: SegmentationStrategy,
+        anchor_propagator: AnchorPropagator,
+        registration_confidence_keep_ratio: float,
+        anchor_enabled: bool,
+        temporal_iou_threshold: float,
+        window_size: int,
+        overlap: int,
+        cache_root: str,
+        intermediate_device: str = "cuda",
+        process_device: str = "cpu",
+        benchmark_latency: bool = True,
     ):
         super().__init__(
             delegate=delegate.to(inference_device),
             inference_device=inference_device,
             dtype=dtype,
-            process_device=process_device,
-            top_conf_percentile=top_conf_percentile,
-            registration_top_confidence_ratio=registration_top_confidence_ratio,
+            segmentation_strategy=segmentation_strategy,
+            anchor_propagator=anchor_propagator,
+            registration_confidence_keep_ratio=(
+                registration_confidence_keep_ratio
+            ),
+            anchor_enabled=anchor_enabled,
+            temporal_iou_threshold=temporal_iou_threshold,
             window_size=window_size,
             overlap=overlap,
-            depth_refine=depth_refine,
             cache_root=cache_root,
-            segment_mode=segment_mode,
-            normal_method=normal_method,
-            geometry_seg_profile=geometry_seg_profile,
+            intermediate_device=intermediate_device,
+            process_device=process_device,
+            benchmark_latency=benchmark_latency,
         )
 
     def _registration_worker(self):
@@ -73,7 +78,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
             # camera pose registration
             tgt_mask = select_top_confidence_mask(
                 working_window['conf'][:self.overlap],
-                self.registration_top_confidence_ratio,
+                self.registration_confidence_keep_ratio,
             )
 
             if self.prev_window_cache is not None:
@@ -85,7 +90,7 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                 # mutual conf mask
                 prev_mask = select_top_confidence_mask(
                     self.prev_window_cache['conf'][-self.overlap:],
-                    self.registration_top_confidence_ratio,
+                    self.registration_confidence_keep_ratio,
                 )
                 conf_mask = intersect_confidence_masks(
                     prev_mask,
@@ -122,18 +127,26 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     t,
                 )
 
-                if self.depth_refine:
+                if self.anchor_enabled:
                     tgt_pcd = working_window['local_points'].cpu().numpy()
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get("images"),
                     )
-                    working_window['scale_mask'] = refine_depth_segments(
-                        self.prev_window_cache['local_points'].cpu().numpy(),
-                        tgt_pcd,
-                        self.anchor_sp_graph,
-                        tgt_sp_graph,
-                        self.overlap
+                    working_window['scale_mask'] = (
+                        self.anchor_propagator.propagate(
+                            self.prev_window_cache[
+                                'local_points'
+                            ].cpu().numpy(),
+                            tgt_pcd,
+                            self.anchor_sp_graph,
+                            tgt_sp_graph,
+                            self.overlap,
+                        )
+                    ).to(
+                        device=working_window['local_points'].device,
+                        dtype=working_window['local_points'].dtype,
                     )
                     working_window['local_points'] = (
                         working_window['scale_mask']
@@ -152,10 +165,11 @@ class StreamingWindowEngineLC(StreamingWindowEngine):
                     torch.zeros(3, device=self.process_device)
                 )
 
-                if self.depth_refine:
+                if self.anchor_enabled:
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get("images"),
                     )
 
             self._update_cache(working_window, tgt_sp_graph)

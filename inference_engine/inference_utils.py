@@ -4,7 +4,8 @@ from .utils.geometry import (
     register_camera_poses_kabsch_pytorch,
     apply_sim3_to_pose
 )
-from .utils.lsa import make_sp_graph, refine_depth_segments
+from .anchor_propagation import AnchorPropagator
+from .utils.lsa import make_sp_graph
 
 
 def dict_to_device(data, device):
@@ -170,7 +171,7 @@ def register_extrinsic_windows(
                 conf_map=mask_windows[i].cpu().numpy()
             )
 
-            tgt_pcd_scaled = refine_depth_segments(
+            tgt_pcd_scaled = AnchorPropagator().propagate(
                 anchor_pcd.cpu().numpy(),
                 tgt_pcd,
                 anchor_sp_graph,

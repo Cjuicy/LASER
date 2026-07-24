@@ -40,7 +40,12 @@ from collections import defaultdict
 import time
 
 # 项目内部依赖
-from . import VanillaEngine
+from .vanilla_engine import VanillaEngine
+from .anchor_propagation import AnchorPropagator
+from .segmentation import (
+    SegmentationStrategy,
+    build_temporal_graphs,
+)
 # 继承的基础推理引擎
 from .inference_utils import (
     dict_to_device,
@@ -48,8 +53,6 @@ from .inference_utils import (
     estimate_pseudo_depth_and_intrinsics,
     unproject_depth_to_local_points,
     apply_sim3_to_pose,
-    make_sp_graph,
-    refine_depth_segments,
     sliding_window_t,
     sliding_window_l
 )
@@ -59,12 +62,6 @@ from .utils.registration_confidence import (
     select_top_confidence_mask,
     validate_confidence_keep_ratio,
 )
-from .utils.lsa import (
-    GEOMETRY_SEGMENTATION_PROFILES,
-    NORMAL_METHODS,
-    SEGMENT_MODES,
-    get_felzenszwalb_params,
-)
 
 # 线程停止标志
 STOP_SIGNAL = object()
@@ -72,94 +69,49 @@ STOP_SIGNAL = object()
 # 类定义
 class StreamingWindowEngine(VanillaEngine):
     def __init__(
-            self,
-            delegate: nn.Module,
-            inference_device: str,
-            dtype: torch.dtype,
-            intermediate_device: str = 'cuda',
-            process_device: str = 'cpu',
-            top_conf_percentile: float = 0.5,
-            window_size: int = 20,
-            overlap: int = 5,
-            depth_refine=True,
-            cache_root: str = './cache',
-            benchmark_latency=True,
-            segment_mode: str = "depth",
-            normal_method: str = "cross",
-            geometry_seg_profile: str = "baseline_params",
-            registration_top_confidence_ratio: float = None,
+        self,
+        delegate: nn.Module,
+        inference_device: str,
+        dtype: torch.dtype,
+        segmentation_strategy: SegmentationStrategy,
+        anchor_propagator: AnchorPropagator,
+        registration_confidence_keep_ratio: float,
+        anchor_enabled: bool,
+        temporal_iou_threshold: float,
+        window_size: int,
+        overlap: int,
+        cache_root: str,
+        intermediate_device: str = "cuda",
+        process_device: str = "cpu",
+        benchmark_latency: bool = True,
     ):
-        if segment_mode not in SEGMENT_MODES:
+        if window_size <= overlap or overlap < 1:
             raise ValueError(
-                f"Unknown segment_mode: {segment_mode!r}; expected one of {SEGMENT_MODES}."
+                "window_size must be greater than overlap >= 1"
             )
-        if segment_mode != "depth" and not depth_refine:
+        if not 0.0 <= temporal_iou_threshold <= 1.0:
             raise ValueError(
-                f"segment_mode={segment_mode!r} requires depth_refine=True."
+                "temporal_iou_threshold must be in [0, 1]"
             )
-        if segment_mode == "geometry":
-            if normal_method not in NORMAL_METHODS:
-                raise ValueError(
-                    f"Unknown normal_method: {normal_method!r}; expected one of {NORMAL_METHODS}."
-                )
-            if geometry_seg_profile not in GEOMETRY_SEGMENTATION_PROFILES:
-                raise ValueError(
-                    "Unknown geometry_seg_profile: "
-                    f"{geometry_seg_profile!r}; expected one of "
-                    f"{tuple(GEOMETRY_SEGMENTATION_PROFILES)}."
-                )
 
-        # 1️⃣ 模型初始化
-        super().__init__(
-            delegate=delegate.to(inference_device)
-        )
-        # 2️⃣ 滑动窗口参数
+        super().__init__(delegate=delegate.to(inference_device))
         self.window_size = window_size
         self.overlap = overlap
         self.intermediate_device = intermediate_device
-        # 3️⃣ 置信度阈值参数
-        legacy_registration_ratio = (
-            top_conf_percentile
-            if top_conf_percentile is not None
-            else 1.0
-        )
-        self.registration_top_confidence_ratio = (
+        self.registration_confidence_keep_ratio = (
             validate_confidence_keep_ratio(
-                legacy_registration_ratio
-                if registration_top_confidence_ratio is None
-                else registration_top_confidence_ratio
+                registration_confidence_keep_ratio
             )
         )
-        self.top_conf_percentile = 1 - top_conf_percentile if top_conf_percentile is not None else 0.0
-
-        # 4️⃣ 设备和数据类型
         self.inference_device = inference_device
         self.process_device = process_device
         self.dtype = dtype
-        # 5️⃣ 深度细化
-        self.depth_refine = depth_refine
-        self.segment_mode = segment_mode
-        self.normal_method = normal_method
-        self.geometry_seg_profile = geometry_seg_profile
-        self.felzenszwalb_params = get_felzenszwalb_params(
-            segment_mode,
-            geometry_seg_profile,
-        )
+        self.segmentation_strategy = segmentation_strategy
+        self.anchor_propagator = anchor_propagator
+        self.anchor_enabled = bool(anchor_enabled)
+        self.temporal_iou_threshold = temporal_iou_threshold
+        self.last_segmentation_results = None
 
-        segmentation_details = f"mode={segment_mode}"
-        if segment_mode == "geometry":
-            segmentation_details += (
-                f", profile={geometry_seg_profile}, normal={normal_method}"
-            )
-        print(
-            "[segmentation] "
-            f"{segmentation_details}, "
-            f"scale={self.felzenszwalb_params['seg_scale']}, "
-            f"sigma={self.felzenszwalb_params['seg_sigma']}, "
-            f"min_size={self.felzenszwalb_params['seg_min_size']}"
-        )
-
-        # 6️⃣ 缓存目录
         os.makedirs(cache_root, exist_ok=True)
         self.cache_dir = cache_root
         self.temp_cache_dir = None
@@ -190,20 +142,24 @@ class StreamingWindowEngine(VanillaEngine):
         os.makedirs(cache_dir, exist_ok=True)
         self.cache_dir = cache_dir
 
-    # 开启或关闭深度细化
-    def set_depth_refine(self, flag):
-        if self.running:
-            raise RuntimeError('Cannot change depth refinement mode while running')
-        self.depth_refine = flag
+    @staticmethod
+    def _as_numpy(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy()
+        return value
 
-    def _build_segment_graph(self, local_points, conf):
-        return make_sp_graph(
-            local_points.cpu().numpy(),
-            conf_map=conf.cpu().numpy(),
-            top_conf_percentile=self.top_conf_percentile,
-            segment_mode=self.segment_mode,
-            normal_method=self.normal_method,
-            geometry_seg_profile=self.geometry_seg_profile,
+    def _build_segment_graph(self, local_points, conf, images=None):
+        results = self.segmentation_strategy.segment(
+            self._as_numpy(local_points),
+            self._as_numpy(conf),
+            self._as_numpy(images),
+        )
+        self.last_segmentation_results = results
+        return build_temporal_graphs(
+            results,
+            self.temporal_iou_threshold,
         )
 
     # 把当前已经完成配准的窗口写入磁盘
@@ -284,7 +240,7 @@ class StreamingWindowEngine(VanillaEngine):
             # camera pose registration
             tgt_mask = select_top_confidence_mask(
                 working_window['conf'][:self.overlap],
-                self.registration_top_confidence_ratio,
+                self.registration_confidence_keep_ratio,
             )
 
             # ⚠️ 非首窗口处理
@@ -299,7 +255,7 @@ class StreamingWindowEngine(VanillaEngine):
                 # mutual conf mask
                 prev_mask = select_top_confidence_mask(
                     self.prev_window_cache['conf'][-self.overlap:],
-                    self.registration_top_confidence_ratio,
+                    self.registration_confidence_keep_ratio,
                 )
                 conf_mask = intersect_confidence_masks(
                     prev_mask,
@@ -326,19 +282,28 @@ class StreamingWindowEngine(VanillaEngine):
                 # 6️⃣ 更新相机位姿
                 working_window['camera_poses'] = apply_sim3_to_pose(working_window.pop('camera_poses'), s_d, R, t)
 
-                # 7️⃣ 可选深度细化
-                if self.depth_refine:
+                # 7️⃣ 可选锚点尺度传播
+                if self.anchor_enabled:
                     tgt_pcd = working_window['local_points'].cpu().numpy()
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get("images"),
                     )
-                    working_window['local_points'] = working_window['local_points'] * refine_depth_segments(
+                    scale_mask = self.anchor_propagator.propagate(
                         self.prev_window_cache['local_points'].cpu().numpy(),
                         tgt_pcd,
                         self.anchor_sp_graph,
                         tgt_sp_graph,
-                        self.overlap
+                        self.overlap,
+                    )
+                    scale_mask = scale_mask.to(
+                        device=working_window['local_points'].device,
+                        dtype=working_window['local_points'].dtype,
+                    )
+                    working_window['scale_mask'] = scale_mask
+                    working_window['local_points'] = (
+                        working_window['local_points'] * scale_mask
                     )
             # ⚠️ 首窗口处理
             else:
@@ -352,10 +317,11 @@ class StreamingWindowEngine(VanillaEngine):
                 )
 
                 # 3️⃣ 创建首窗口分割图
-                if self.depth_refine:
+                if self.anchor_enabled:
                     tgt_sp_graph = self._build_segment_graph(
                         working_window['local_points'],
                         working_window['conf'],
+                        working_window.get("images"),
                     )
 
             # ⚠️ 更新并保存窗口

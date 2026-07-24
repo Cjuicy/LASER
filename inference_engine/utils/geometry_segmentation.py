@@ -1,5 +1,7 @@
 """Geometry-aware segmentation label generation from LASER-Geometry."""
 
+import warnings
+
 import numpy as np
 from skimage.segmentation import felzenszwalb
 
@@ -176,13 +178,22 @@ def segment_geometry_felzenszwalb_rag_stages(
         [depth_norm[..., None], geometry_info["normal"]],
         axis=-1,
     )
-    labels = felzenszwalb(
-        geom_img,
-        scale=seg_scale,
-        sigma=seg_sigma,
-        min_size=seg_min_size,
-        channel_axis=-1,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                "Got image with third dimension of 4. "
+                "This image will be interpreted as a multichannel 2d image"
+            ),
+            category=RuntimeWarning,
+        )
+        labels = felzenszwalb(
+            geom_img,
+            scale=seg_scale,
+            sigma=seg_sigma,
+            min_size=seg_min_size,
+            channel_axis=-1,
+        )
 
     if conf_map is not None and confidence_keep_ratio is not None:
         high_conf_mask = select_numpy_top_confidence_mask(
