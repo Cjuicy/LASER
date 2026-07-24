@@ -1,0 +1,71 @@
+version: 1
+
+input:
+  image_dir: tests/fixtures/images
+  sample_stride: 1
+
+output:
+  scene_name: pipeline_test
+  cache_dir: .pytest_cache/laser/cache
+  result_dir: .pytest_cache/laser/results
+  save_diagnostics: true
+
+model:
+  checkpoint: weights/model.safetensors
+  inference_device: cuda
+  process_device: cpu
+  dtype: bfloat16
+
+window:
+  size: 10
+  overlap: 5
+
+segmentation:
+  method: atomic
+  confidence_keep_ratio: 0.5
+  depth_merge_threshold: 0.1
+  temporal_iou_threshold: 0.3
+
+  felzenszwalb:
+    scale: 300
+    sigma: 1.1
+    min_size: 500
+
+  geometry:
+    normal_method: cross
+    normal_threshold_degrees: 20.0
+
+  atomic:
+    split_mode: conservative
+    split_score_threshold: 0.10
+
+anchor_propagation:
+  enabled: true
+  correspondence_iou_threshold: 0.4
+
+loop:
+  enabled: true
+  method: corrected
+
+  registration:
+    confidence_keep_ratio: 0.30
+
+  detection:
+    method: salad
+    salad_checkpoint: weights/dino_salad.ckpt
+    dino_checkpoint: weights/dinov2_vitb14_pretrain.pth
+    image_size: [336, 336]
+    batch_size: 32
+    similarity_threshold: 0.7
+    top_k: 5
+    nms_enabled: true
+    nms_frame_radius: 25
+
+  constraint:
+    chunk_size: 20
+
+  optimizer:
+    implementation: cpp
+    use_sim3: true
+    max_iterations: 30
+    initial_damping: 1.0e-6
