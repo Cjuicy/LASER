@@ -4,8 +4,19 @@ from pathlib import Path
 
 from pipeline.config import DetectionConfig
 from pipeline.manifest import ImageManifest
+from inference_engine.utils.registration_confidence import (
+    intersect_confidence_masks,
+    select_top_confidence_mask,
+)
 
 from .base import LoopCandidate
+
+
+__all__ = [
+    "detect_loop_candidates",
+    "intersect_confidence_masks",
+    "select_top_confidence_mask",
+]
 
 
 def detect_loop_candidates(
