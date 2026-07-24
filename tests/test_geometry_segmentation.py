@@ -152,7 +152,7 @@ def test_geometry_segmentation_selects_batched_auxiliary_inputs(monkeypatch):
         conf_map=conf,
         point_map=point_map,
         intrinsic=intrinsic,
-        top_conf_percentile=0.5,
+        confidence_keep_ratio=0.5,
         normal_method="sobel",
         batch_idx=1,
     )
@@ -191,7 +191,7 @@ def test_geometry_baseline_params_stages_delegates_with_baseline_parameters(monk
         conf_map=conf,
         intrinsic=intrinsic,
         point_map=point_map,
-        top_conf_percentile=0.4,
+        confidence_keep_ratio=0.4,
         depth_merge_thresh=0.2,
         normal_thresh_deg=15.0,
         normal_method="sobel",
@@ -203,7 +203,7 @@ def test_geometry_baseline_params_stages_delegates_with_baseline_parameters(monk
     assert calls["conf_map"] is conf
     assert calls["intrinsic"] is intrinsic
     assert calls["point_map"] is point_map
-    assert calls["top_conf_percentile"] == 0.4
+    assert calls["confidence_keep_ratio"] == 0.4
     assert calls["depth_merge_thresh"] == 0.2
     assert calls["normal_thresh_deg"] == 15.0
     assert calls["seg_scale"] == 300

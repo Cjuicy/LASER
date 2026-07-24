@@ -4,7 +4,10 @@ import numpy as np
 from skimage.segmentation import felzenszwalb
 
 from .geometry import build_geometry_info_np
-from .segmentation_trace import SegmentationStages, confidence_selection
+from .segmentation_trace import SegmentationStages
+from inference_engine.segmentation.confidence import (
+    select_numpy_top_confidence_mask,
+)
 
 
 def _select_batch_item(value, batch_idx, single_frame_ndim):
@@ -146,7 +149,7 @@ def segment_geometry_felzenszwalb_rag_stages(
     conf_map=None,
     intrinsic=None,
     point_map=None,
-    top_conf_percentile=None,
+    confidence_keep_ratio=None,
     depth_merge_thresh=0.1,
     normal_thresh_deg=20.0,
     seg_scale=200,
@@ -178,13 +181,15 @@ def segment_geometry_felzenszwalb_rag_stages(
         scale=seg_scale,
         sigma=seg_sigma,
         min_size=seg_min_size,
+        channel_axis=-1,
     )
 
-    if conf_map is not None and top_conf_percentile is not None:
-        conf_thresh, high_conf_mask = confidence_selection(
+    if conf_map is not None and confidence_keep_ratio is not None:
+        high_conf_mask = select_numpy_top_confidence_mask(
             conf_map,
-            top_conf_percentile,
+            confidence_keep_ratio,
         )
+        conf_thresh = float(np.min(conf_map[high_conf_mask]))
         if high_conf_mask.sum() > 0:
             depth_range = (
                 np.nanmax(depth_map[high_conf_mask])
@@ -219,7 +224,7 @@ def segment_geometry_felzenszwalb_rag(
     conf_map=None,
     intrinsic=None,
     point_map=None,
-    top_conf_percentile=None,
+    confidence_keep_ratio=None,
     depth_merge_thresh=0.1,
     normal_thresh_deg=20.0,
     seg_scale=200,
@@ -233,7 +238,7 @@ def segment_geometry_felzenszwalb_rag(
         conf_map=conf_map,
         intrinsic=intrinsic,
         point_map=point_map,
-        top_conf_percentile=top_conf_percentile,
+        confidence_keep_ratio=confidence_keep_ratio,
         depth_merge_thresh=depth_merge_thresh,
         normal_thresh_deg=normal_thresh_deg,
         seg_scale=seg_scale,
@@ -249,7 +254,7 @@ def segment_geometry_felzenszwalb_rag_baseline_params_stages(
     conf_map=None,
     intrinsic=None,
     point_map=None,
-    top_conf_percentile=None,
+    confidence_keep_ratio=None,
     depth_merge_thresh=0.1,
     normal_thresh_deg=20.0,
     seg_scale=300,
@@ -263,7 +268,7 @@ def segment_geometry_felzenszwalb_rag_baseline_params_stages(
         conf_map=conf_map,
         intrinsic=intrinsic,
         point_map=point_map,
-        top_conf_percentile=top_conf_percentile,
+        confidence_keep_ratio=confidence_keep_ratio,
         depth_merge_thresh=depth_merge_thresh,
         normal_thresh_deg=normal_thresh_deg,
         seg_scale=seg_scale,
@@ -279,7 +284,7 @@ def segment_geometry_felzenszwalb_rag_baseline_params(
     conf_map=None,
     intrinsic=None,
     point_map=None,
-    top_conf_percentile=None,
+    confidence_keep_ratio=None,
     depth_merge_thresh=0.1,
     normal_thresh_deg=20.0,
     seg_scale=300,
@@ -293,7 +298,7 @@ def segment_geometry_felzenszwalb_rag_baseline_params(
         conf_map=conf_map,
         intrinsic=intrinsic,
         point_map=point_map,
-        top_conf_percentile=top_conf_percentile,
+        confidence_keep_ratio=confidence_keep_ratio,
         depth_merge_thresh=depth_merge_thresh,
         normal_thresh_deg=normal_thresh_deg,
         seg_scale=seg_scale,

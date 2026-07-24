@@ -26,17 +26,17 @@ def test_stages_preserve_legacy_coarse_labels_and_threshold(use_confidence):
     if use_confidence:
         frame_conf = (3 * xx + yy).astype(np.float64)
         conf_map = np.stack([np.flipud(frame_conf), frame_conf])
-        top_conf_percentile = 0.75
+        confidence_keep_ratio = 0.25
         batch_idx = 1
         conf_thresh = np.quantile(
             frame_conf.reshape(-1),
-            top_conf_percentile,
+            1.0 - confidence_keep_ratio,
             method="nearest",
         )
         conf_depth = depth[frame_conf >= conf_thresh]
     else:
         conf_map = None
-        top_conf_percentile = None
+        confidence_keep_ratio = None
         batch_idx = None
         conf_depth = depth
 
@@ -53,7 +53,7 @@ def test_stages_preserve_legacy_coarse_labels_and_threshold(use_confidence):
         depth,
         depth_merge_thresh=0.1,
         conf_map=conf_map,
-        top_conf_percentile=top_conf_percentile,
+        confidence_keep_ratio=confidence_keep_ratio,
         seg_scale=300,
         seg_sigma=1.1,
         seg_min_size=20,
@@ -63,7 +63,7 @@ def test_stages_preserve_legacy_coarse_labels_and_threshold(use_confidence):
         depth,
         depth_merge_thresh=0.1,
         conf_map=conf_map,
-        top_conf_percentile=top_conf_percentile,
+        confidence_keep_ratio=confidence_keep_ratio,
         seg_scale=300,
         seg_sigma=1.1,
         seg_min_size=20,

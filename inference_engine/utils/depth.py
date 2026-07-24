@@ -6,6 +6,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .fast_seg import fast_graph_segmentation
 from ._segmentation_cy import merge_regions
 from pi3.utils.graph import Vertex
+from inference_engine.segmentation.confidence import (
+    select_numpy_top_confidence_mask,
+)
 
 
 def align_depth_irls(
@@ -46,7 +49,7 @@ def segment_depth_felzenszwalb_rag_stages(
         depth_map,
         depth_merge_thresh,
         conf_map=None,
-        top_conf_percentile=None,
+        confidence_keep_ratio=None,
         seg_scale=300,
         seg_sigma=1.1,
         seg_min_size=500,
@@ -62,14 +65,18 @@ def segment_depth_felzenszwalb_rag_stages(
     # rag = graph.rag_mean_color(depth_img, seg_mask, mode='distance')
     #
     # seg_mask_merged = graph.cut_threshold(seg_mask, rag, merge_thresh)
-    if conf_map is not None and top_conf_percentile is not None:
-        frame_conf = conf_map[batch_idx]
-        conf_thresh = np.quantile(
-            frame_conf.reshape(-1),
-            top_conf_percentile,
-            method='nearest',
+    if conf_map is not None and confidence_keep_ratio is not None:
+        conf_values = np.asarray(conf_map)
+        frame_conf = (
+            conf_values[batch_idx]
+            if batch_idx is not None and conf_values.ndim == depth_map.ndim + 1
+            else conf_values
         )
-        conf_depth = depth_map[frame_conf >= conf_thresh]
+        high_confidence = select_numpy_top_confidence_mask(
+            frame_conf,
+            confidence_keep_ratio,
+        )
+        conf_depth = depth_map[high_confidence]
     else:
         conf_depth = depth_map
     merge_threshold = depth_merge_thresh * (
@@ -83,7 +90,7 @@ def segment_depth_felzenszwalb_rag(
         depth_map,
         depth_merge_thresh,
         conf_map=None,
-        top_conf_percentile=None,
+        confidence_keep_ratio=None,
         seg_scale=300,
         seg_sigma=1.1,
         seg_min_size=500,
@@ -93,7 +100,7 @@ def segment_depth_felzenszwalb_rag(
         depth_map,
         depth_merge_thresh,
         conf_map,
-        top_conf_percentile,
+        confidence_keep_ratio,
         seg_scale,
         seg_sigma,
         seg_min_size,
@@ -106,13 +113,21 @@ def segment_depth_graph_fast(
         depth_map,
         depth_merge_thresh,
         conf_map=None,
-        top_conf_percentile=None,
+        confidence_keep_ratio=None,
         batch_idx=None
 ):
-    if conf_map is not None and top_conf_percentile is not None:
-        conf_map = conf_map[batch_idx]
-        conf_thresh = np.quantile(conf_map.reshape(-1), top_conf_percentile, method='nearest')
-        conf_depth = depth_map[conf_map >= conf_thresh]
+    if conf_map is not None and confidence_keep_ratio is not None:
+        conf_values = np.asarray(conf_map)
+        frame_conf = (
+            conf_values[batch_idx]
+            if batch_idx is not None and conf_values.ndim == depth_map.ndim + 1
+            else conf_values
+        )
+        high_confidence = select_numpy_top_confidence_mask(
+            frame_conf,
+            confidence_keep_ratio,
+        )
+        conf_depth = depth_map[high_confidence]
     else:
         conf_depth = depth_map
     merge_thresh = depth_merge_thresh * (np.max(conf_depth) - np.min(conf_depth))
