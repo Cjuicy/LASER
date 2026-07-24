@@ -1,13 +1,19 @@
-mkdir weights
-cd weights
+#!/usr/bin/env bash
+set -euo pipefail
 
-# SALAD (~ 350 MiB)
+mkdir -p weights
+
+echo "Downloading Pi3 weights..."
+curl --fail --location --retry 3 \
+  "https://huggingface.co/yyfz233/Pi3/resolve/main/model.safetensors" \
+  --output "weights/model.safetensors"
+
 echo "Downloading SALAD weights..."
-SALAD_URL="https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt"
-curl -L "$SALAD_URL" -o "./dino_salad.ckpt"
+curl --fail --location --retry 3 \
+  "https://github.com/serizba/salad/releases/download/v1.0.0/dino_salad.ckpt" \
+  --output "weights/dino_salad.ckpt"
 
-# DINO (~ 340 MiB)
 echo "Downloading DINO weights..."
-wget https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth
-
-cd ..
+curl --fail --location --retry 3 \
+  "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth" \
+  --output "weights/dinov2_vitb14_pretrain.pth"
