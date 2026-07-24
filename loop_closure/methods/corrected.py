@@ -232,6 +232,14 @@ class CorrectedWindowEngine(StreamingWindowEngine):
                     for result in self.last_segmentation_results
                 )
             )
+            diagnostics = (
+                ()
+                if self.last_segmentation_results is None
+                else tuple(
+                    dict(result.diagnostics)
+                    for result in self.last_segmentation_results
+                )
+            )
             cache = WindowCache(
                 schema_version=WINDOW_CACHE_SCHEMA_VERSION,
                 loop_method=LoopMethod.CORRECTED,
@@ -244,6 +252,7 @@ class CorrectedWindowEngine(StreamingWindowEngine):
                 segmentation_labels=labels,
                 anchor_scale_mask=anchor_scale_mask,
                 loop_state=loop_state,
+                segmentation_diagnostics=diagnostics,
             )
             self._update_cache(cache, target_graph)
             self._save_cache()
@@ -503,4 +512,3 @@ class CorrectedLoopClosureStrategy:
                 ),
             },
         )
-

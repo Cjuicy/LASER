@@ -1,2 +1,1 @@
 """Modular LASER pipeline."""
-

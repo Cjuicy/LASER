@@ -169,6 +169,14 @@ class TraditionalWindowEngine(StreamingWindowEngine):
                     for result in self.last_segmentation_results
                 )
             )
+            diagnostics = (
+                ()
+                if self.last_segmentation_results is None
+                else tuple(
+                    dict(result.diagnostics)
+                    for result in self.last_segmentation_results
+                )
+            )
             cache = WindowCache(
                 schema_version=WINDOW_CACHE_SCHEMA_VERSION,
                 loop_method=LoopMethod.TRADITIONAL,
@@ -185,6 +193,7 @@ class TraditionalWindowEngine(StreamingWindowEngine):
                     "relative_sim3": relative_sim3,
                     "anchor_scale_applied": False,
                 },
+                segmentation_diagnostics=diagnostics,
             )
             self._update_cache(cache, target_graph)
             self._save_cache()

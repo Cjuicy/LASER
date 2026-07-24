@@ -1,13 +1,23 @@
 from eval.pose_eval import eval_pose_estimation
 from eval.depth_eval import eval_mono_depth_estimation
 from pi3.models.pi3 import Pi3
-from inference_engine import VanillaEngine, StreamingWindowEngine, StreamingWindowEngineLC
-from loop_closure.loop_closure import LoopClosureEngine
-from loop_closure.utils.config_utils import load_config
-from inference_engine.utils.cache_utils import (
-    prepare_caches_for_aggregation,
+from inference_engine import AnchorPropagator, VanillaEngine
+from inference_engine.segmentation import build_segmentation_strategy
+from loop_closure.methods import (
+    build_loop_strategy,
+    detect_loop_candidates,
+)
+from pipeline.config import (
+    LoopMethod,
+    load_pipeline_config,
+)
+from pipeline.manifest import ImageManifest
+from pipeline.runner import (
+    complete_reconstruction_payload,
+    run_windows,
 )
 from functools import partial
+from dataclasses import replace
 import eval.misc as misc  # noqa
 import torch
 import torch.backends.cudnn as cudnn
@@ -16,7 +26,6 @@ import os
 import argparse
 import json
 from pathlib import Path
-import glob
 
 
 def get_args_parser():
@@ -80,6 +89,12 @@ def get_args_parser():
                         help='choose model for pose evaluation')
     # checkpoint loading
     parser.add_argument('--ckpt_path', default=None, type=str, help='trained checkpoint for evaluation')
+    parser.add_argument(
+        '--pipeline_config',
+        default='configs/pipeline/default.yaml',
+        type=str,
+        help='typed modular pipeline configuration',
+    )
 
     # for monocular depth eval
     parser.add_argument('--no_crop', action='store_true', default=False,
@@ -90,20 +105,92 @@ def get_args_parser():
     return parser
 
 
-# bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+)
-dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 device = "cuda" if torch.cuda.is_available() else "cpu"
+# bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+)
+dtype = (
+    torch.bfloat16
+    if device == "cuda" and torch.cuda.get_device_capability()[0] >= 8
+    else torch.float16
+)
+
+
+def build_streaming_eval_engine(delegate, config):
+    segmenter = build_segmentation_strategy(config.segmentation)
+    anchor = AnchorPropagator(
+        config.anchor_propagation.correspondence_iou_threshold
+    )
+    strategy = build_loop_strategy(
+        config.loop.method,
+        optimizer_config=config.loop.optimizer,
+        registration_confidence_keep_ratio=(
+            config.loop.registration.confidence_keep_ratio
+        ),
+    )
+    engine = strategy.create_window_engine(
+        delegate=delegate,
+        inference_device=config.model.inference_device,
+        dtype={
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }[config.model.dtype],
+        segmentation_strategy=segmenter,
+        anchor_propagator=anchor,
+        registration_confidence_keep_ratio=(
+            config.loop.registration.confidence_keep_ratio
+        ),
+        anchor_enabled=config.anchor_propagation.enabled,
+        temporal_iou_threshold=(
+            config.segmentation.temporal_iou_threshold
+        ),
+        window_size=config.window.size,
+        overlap=config.window.overlap,
+        cache_root=config.output.cache_dir,
+        intermediate_device=config.model.inference_device,
+        process_device=config.model.process_device,
+    )
+    engine.pipeline_config = config
+    engine.loop_strategy = strategy
+    return engine
+
+
+def _run_modular_evaluation(model, imgs, manifest, detect_loops):
+    config = model.pipeline_config
+    caches = run_windows(model, manifest, imgs, config)
+    candidates = (
+        detect_loop_candidates(
+            config.loop.detection,
+            manifest,
+            Path(config.output.cache_dir) / "loop_candidates.txt",
+        )
+        if detect_loops and config.loop.enabled
+        else ()
+    )
+    constraints = model.loop_strategy.build_constraints(
+        caches,
+        candidates,
+    )
+    solution = model.loop_strategy.optimize(caches, constraints)
+    result = model.loop_strategy.aggregate(caches, solution)
+    result = complete_reconstruction_payload(result, imgs)
+    return {
+        key: value.detach().cpu()
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in result.payload.items()
+    }
 
 
 def inference_streaming_model(model, imgs, *args, **kwargs):
-    image_windows = model.img_sliding_window(imgs)
-
-    model.begin()
-    for sample in image_windows:
-        model(sample)
-    model.end()
-    save_dict = model.parse_inference_cache_summary()
-    return save_dict
+    manifest = ImageManifest(
+        paths=tuple(Path(f"frame_{index:08d}") for index in range(len(imgs)))
+    )
+    return _run_modular_evaluation(
+        model,
+        imgs,
+        manifest,
+        detect_loops=False,
+    )
 
 
 def inference_streaming_model_lc(
@@ -125,48 +212,18 @@ def inference_streaming_model_lc(
             f"{len(image_paths)} != {len(imgs)}"
         )
 
-    image_windows = model.img_sliding_window(imgs)
-
-    model.begin()
-    for sample in image_windows:
-        model(sample)
-    model.end()
-
-    loop_output_path = Path(model.cache_dir) / "loop_closures.txt"
-    lc_engine = LoopClosureEngine(
-        load_config('configs/loop_config.yaml'),
-        img_dir,
-        loop_output_path,
-        model.delegate,
-        model.window_size,
-        model.overlap,
-        registration_top_confidence_ratio=(
-            model.registration_top_confidence_ratio
-        ),
-        image_paths=image_paths,
+    manifest = ImageManifest(
+        paths=tuple(Path(path).resolve() for path in image_paths)
+    )
+    return _run_modular_evaluation(
+        model,
+        imgs,
+        manifest,
+        detect_loops=True,
     )
 
-    cache_files = sorted(glob.glob(str(model.temp_cache_dir / 'window_cache_*.pt')),
-                         key=lambda p: int(p.split('_')[-1].split('.')[0]))
-    raw_predictions = [StreamingWindowEngine.parse_cache_file(cache_fname) for cache_fname in cache_files]
-    optimized_absolute = lc_engine.run(raw_predictions)
-    parsed_caches = prepare_caches_for_aggregation(
-        raw_predictions,
-        model.overlap,
-    )
-    ret_dict = StreamingWindowEngineLC._post_process_pred(
-        StreamingWindowEngineLC.aggregate_caches(
-            parsed_caches,
-            optimized_absolute,
-        )
-    )
-    for key in ret_dict.keys():
-        if isinstance(ret_dict[key], torch.Tensor):
-            ret_dict[key] = ret_dict[key].cpu()
-    return ret_dict
 
-
-def pi3_main(args, engine_cls):
+def pi3_main(args):
     print('Launching Pi3 eval')
     misc.init_distributed_mode(args)
 
@@ -176,7 +233,38 @@ def pi3_main(args, engine_cls):
     np.random.seed(seed)
     cudnn.benchmark = args.cudnn_benchmark
 
-    model = engine_cls(Pi3.from_pretrained("yyfz233/Pi3").to(device))
+    delegate = Pi3.from_pretrained("yyfz233/Pi3").to(device)
+    if args.model == 'pi3':
+        model = VanillaEngine(delegate)
+    else:
+        config = load_pipeline_config(args.pipeline_config).config
+        runtime_model = replace(
+            config.model,
+            inference_device=device,
+            process_device="cpu",
+            dtype=(
+                "bfloat16"
+                if dtype is torch.bfloat16
+                else "float16"
+            ),
+        )
+        runtime_loop = config.loop
+        if args.model == 'streaming_pi3':
+            runtime_loop = replace(
+                runtime_loop,
+                enabled=False,
+                method=LoopMethod.TRADITIONAL,
+            )
+        runtime_config = replace(
+            config,
+            model=runtime_model,
+            loop=runtime_loop,
+            output=replace(
+                config.output,
+                cache_dir=str(Path(args.output_dir) / "inference_cache"),
+            ),
+        )
+        model = build_streaming_eval_engine(delegate, runtime_config)
     model.eval()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -206,21 +294,11 @@ def pi3_main(args, engine_cls):
     if args.mode == 'eval_depth':
         eval_mono_depth_estimation(args, model, device, dtype)
 
-    exit(0)
+    return 0
 
 
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
 
-    model_variant = args.model
-    if model_variant == 'pi3':
-        pi3_main(args, VanillaEngine)
-    elif model_variant == 'streaming_pi3':
-        pi3_main(args, partial(StreamingWindowEngine, dtype=dtype, inference_device=device, window_size=20, overlap=5,
-                               top_conf_percentile=0.5))
-    elif model_variant == 'streaming_pi3_lc':
-        pi3_main(args, partial(StreamingWindowEngineLC, dtype=dtype, inference_device=device, window_size=75, overlap=30,
-                               top_conf_percentile=0.3))
-    else:
-        raise NotImplementedError
+    raise SystemExit(pi3_main(args))

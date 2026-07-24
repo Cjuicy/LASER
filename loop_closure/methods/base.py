@@ -105,6 +105,7 @@ class WindowCache:
     segmentation_labels: tuple[np.ndarray, ...]
     anchor_scale_mask: torch.Tensor | None
     loop_state: dict[str, object]
+    segmentation_diagnostics: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != WINDOW_CACHE_SCHEMA_VERSION:
@@ -142,6 +143,15 @@ class WindowCache:
             raise ValueError("anchor_scale_mask must be a tensor or None")
         if not isinstance(self.loop_state, dict):
             raise ValueError("loop_state must be a dictionary")
+        if not isinstance(self.segmentation_diagnostics, tuple):
+            raise ValueError("segmentation_diagnostics must be a tuple")
+        if not all(
+            isinstance(diagnostics, Mapping)
+            for diagnostics in self.segmentation_diagnostics
+        ):
+            raise ValueError(
+                "each segmentation diagnostic entry must be a mapping"
+            )
         state_tag = self.loop_state.get("tag")
         if state_tag != self.loop_method.value:
             raise ValueError(
@@ -162,6 +172,10 @@ class WindowCache:
             "segmentation_labels": self.segmentation_labels,
             "anchor_scale_mask": self.anchor_scale_mask,
             "loop_state": dict(self.loop_state),
+            "segmentation_diagnostics": tuple(
+                dict(diagnostics)
+                for diagnostics in self.segmentation_diagnostics
+            ),
         }
 
     @classmethod
@@ -210,6 +224,9 @@ class WindowCache:
                 segmentation_labels=payload["segmentation_labels"],
                 anchor_scale_mask=payload["anchor_scale_mask"],
                 loop_state=payload["loop_state"],
+                segmentation_diagnostics=payload[
+                    "segmentation_diagnostics"
+                ],
             )
         except KeyError as exc:
             raise ValueError(
@@ -243,4 +260,3 @@ class LoopClosureStrategy(Protocol):
         solution: LoopSolution,
     ) -> ReconstructionResult:
         raise NotImplementedError
-

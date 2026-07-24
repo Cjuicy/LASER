@@ -127,6 +127,7 @@ class StreamingWindowEngine(VanillaEngine):
         # 9️⃣ 线程对象和运行状态
         self._inference_thread = None
         self._registration_thread = None
+        self._worker_errors = queue.Queue()
 
         self.running = False
 
@@ -184,10 +185,17 @@ class StreamingWindowEngine(VanillaEngine):
 
         self._inference_thread = None
         self._registration_thread = None
+        self._worker_errors = queue.Queue()
 
         self.latencies = []
 
         gc.collect()
+
+    def _run_worker(self, name, worker):
+        try:
+            worker()
+        except BaseException as error:
+            self._worker_errors.put((name, error))
 
     # 模型推理线程
     @torch.no_grad()
@@ -342,8 +350,16 @@ class StreamingWindowEngine(VanillaEngine):
         # 2️⃣ 创建本次运行的临时目录
         self.temp_cache_dir = pathlib.Path(tempfile.mkdtemp(dir=self.cache_dir))
         # 3️⃣ 创建两个后台线程
-        self._inference_thread = threading.Thread(target=self._model_inference_worker, daemon=True)
-        self._registration_thread = threading.Thread(target=self._registration_worker, daemon=True)
+        self._inference_thread = threading.Thread(
+            target=self._run_worker,
+            args=("model inference worker", self._model_inference_worker),
+            daemon=True,
+        )
+        self._registration_thread = threading.Thread(
+            target=self._run_worker,
+            args=("registration worker", self._registration_worker),
+            daemon=True,
+        )
         # 4️⃣ 启动线程
         self._inference_thread.start()
         self._registration_thread.start()
@@ -367,8 +383,12 @@ class StreamingWindowEngine(VanillaEngine):
         self.registration_queue.put(STOP_SIGNAL)
         self._registration_thread.join()
 
+        worker_error = None
+        if not self._worker_errors.empty():
+            worker_error = self._worker_errors.get()
+
         # 4️⃣ 打印性能统计
-        if self.benchmark_latency:
+        if self.benchmark_latency and worker_error is None:
             if self.latencies:
                 print("\n" + "=" * 50)
                 print("        INFERENCE PERFORMANCE SUMMARY        ")
@@ -393,6 +413,9 @@ class StreamingWindowEngine(VanillaEngine):
         # 5️⃣ 重置内存状态
         self._reset_state()
         self.running = False
+        if worker_error is not None:
+            worker_name, error = worker_error
+            raise RuntimeError(f"{worker_name} failed") from error
 
     # 图像滑动窗口
     def img_sliding_window(self, imgs):
