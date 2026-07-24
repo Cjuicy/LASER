@@ -16,16 +16,23 @@
 - 一种保持现有算法不变的锚点传播方法；
 - 两种公开回环方法：`traditional`、`corrected`；
 - 一套严格、唯一的 YAML 配置；
-- 一个统一实验入口和一套六组合成验证工具。
+- 一个统一实验入口、一套三方法乘两回环的核心验证，以及 atomic 三态子矩阵。
 
-公开的 `atomic` 代表最新的 layer-atomic merge 加 guarded post-merge
-split。无 split 的旧 atomic 只作为 `atomic.split_enabled: false` 消融，
-不注册为第四种分割方法。
+公开的 `atomic` 代表 layer-atomic merge，并提供三种互斥状态：
+
+- `none`：不执行 post-merge split；
+- `conservative`：执行保守 split，法向改善还需要 RGB 或归一化三维 gap
+  辅助确认；
+- `normal_only`：执行非保守 split，只使用法向一致性改善分数。
+
+三种状态都属于同一个 `atomic` 方法，不注册额外的公开分割方法。两种 split
+都保留 marker、最小子区、四叶上限、非递归、完整覆盖和有限值检查；
+`normal_only` 只移除辅助确认，不取消结构安全保护。
 
 默认选择：
 
 - `segmentation.method: atomic`；
-- `atomic.split_enabled: true`；
+- `atomic.split_mode: conservative`；
 - `loop.method: corrected`。
 
 ## 2. 非目标
@@ -168,9 +175,8 @@ segmentation:
     normal_threshold_degrees: 20.0
 
   atomic:
-    split_enabled: true
+    split_mode: conservative
     split_score_threshold: 0.10
-    auxiliary_confirmation: true
 
 anchor_propagation:
   enabled: true
@@ -212,6 +218,7 @@ loop:
 - unknown、missing、legacy 字段在模型加载前报错；
 - `window.size > window.overlap >= 1`；
 - 所有 keep ratio 满足 `0 < ratio <= 1`；
+- `atomic.split_mode` 只能是 `none`、`conservative` 或 `normal_only`；
 - 非 depth 分割不再依赖旧的 `depth_refine` 开关；
 - `anchor_propagation.enabled` 是是否应用统一尺度传播的唯一开关。
 
@@ -288,19 +295,31 @@ depth Felzenszwalb atoms
 -> compact labels
 ```
 
-split 开启时保留固定来源的保护：
+`conservative` 和 `normal_only` 都保留固定来源的结构保护：
 
 - 30 度法向屏障；
 - 2 至 4 个有效 marker；
 - 子区面积至少为 `max(min_size, ceil(0.02 * parent_area))`；
 - 单次 watershed，不递归，最多四叶；
 - 候选必须完整覆盖父区域；
-- 统一接受分数 `normal_gain * auxiliary_confirmation`；
 - 默认接受阈值 `0.10`；
-- RGB 或归一化三维 gap 任一可确认法向候选；
 - marker、面积、覆盖、有限值或得分检查失败时保留父区域。
 
-`split_enabled: false` 保留 merge 后 labels，用于同一 atomic 方法的消融。
+三种状态的接受分数为：
+
+```text
+none:
+  不生成 split 候选，直接返回 merge 后 labels
+
+conservative:
+  score = normal_gain * max(rgb_confirmation, normalized_3d_gap_confirmation)
+
+normal_only:
+  score = normal_gain
+```
+
+`conservative` 中 RGB 或归一化三维 gap 任一可确认法向候选。两个 split
+状态共用同一个 `split_score_threshold`，不得为非保守模式增加第二套阈值。
 
 ## 7. 锚点传播
 
@@ -436,7 +455,7 @@ strict config validation
 - 空图片清单；
 - 非法窗口、比例、枚举或数值范围；
 - CUDA 配置与实际环境不匹配；
-- atomic split 参数不合法。
+- atomic split 模式或阈值不合法。
 
 运行时规则：
 
@@ -479,8 +498,10 @@ trajectory and reconstruction artifacts
 
 - 三种分割分别直接测试；
 - labels 全覆盖、紧凑、确定且不修改输入；
-- atomic 覆盖正常 split 和全部保护拒绝原因；
-- split 关闭时输出与 merge-only 固定结果一致。
+- atomic 分别覆盖 `none`、`conservative`、`normal_only`；
+- 两种 split 都覆盖正常接受和全部结构保护拒绝原因；
+- `none` 输出与 merge-only 固定结果一致；
+- conservative 缺少辅助确认时拒绝，而 normal-only 对相同法向候选可以接受。
 
 ### 13.2 公共契约测试
 
@@ -491,7 +512,7 @@ trajectory and reconstruction artifacts
 - 锚点传播固定输入的输出与整合前逐元素一致；
 - strict config 拒绝旧参数、未知字段和非法组合。
 
-### 13.3 六组合成测试
+### 13.3 核心六组合成测试
 
 使用 mock Pi3 和 mock SALAD 参数化运行：
 
@@ -513,11 +534,31 @@ atomic   x corrected
 - 方法专属缓存和约束；
 - 解析后配置、哈希和诊断输出。
 
-### 13.4 真实序列验证
+### 13.4 Atomic 三态子矩阵
 
-在具备本地权重、GPU 和数据的环境，对相同输入运行六组实验。传统与 corrected
-结果允许不同，但必须共享相同的帧清单和 SALAD 候选。同一配置重复运行必须
-确定。
+在核心矩阵之外，atomic 对两种回环分别运行三种 split 状态：
+
+```text
+atomic:none         x traditional
+atomic:none         x corrected
+atomic:conservative x traditional
+atomic:conservative x corrected
+atomic:normal_only  x traditional
+atomic:normal_only  x corrected
+```
+
+core 中的 atomic 默认配置与这里的 `atomic:conservative` 重合，因此完整验证
+共有 10 个唯一运行配置：
+
+- depth 两组；
+- geometry 两组；
+- atomic 三态乘两回环六组。
+
+### 13.5 真实序列验证
+
+在具备本地权重、GPU 和数据的环境，对相同输入运行上述 10 个唯一配置。
+传统与 corrected 结果允许不同，但必须共享相同的帧清单和 SALAD 候选。
+同一配置重复运行必须确定。
 
 验证入口：
 
@@ -534,11 +575,12 @@ python scripts/verify_pipeline_matrix.py \
 
 1. 公开分割枚举恰好为 `depth`、`geometry`、`atomic`；
 2. 公开回环枚举恰好为 `traditional`、`corrected`；
-3. atomic 默认启用 guarded split；
+3. atomic 提供 `none`、`conservative`、`normal_only` 三态，并默认选择
+   `conservative`；
 4. 锚点传播固定回归输出不变；
 5. 两种回环共享候选与公共参数但保留独立算法语义；
 6. 旧参数和未知字段被严格拒绝；
-7. 六组合成测试全部通过；
+7. 核心六组合成测试和 atomic 三态子矩阵的 10 个唯一配置全部通过；
 8. 现有相关算法测试迁移到新接口后通过；
 9. 真实序列运行命令、配置和输出诊断完整；
 10. 实现代码不包含 HART-AP 新传播逻辑。
