@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Callable, Sequence
 
@@ -33,6 +34,9 @@ from .base import (
     WindowCache,
     validate_sim3,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _identity_sim3(device: str = "cpu") -> Sim3:
@@ -252,68 +256,63 @@ class TraditionalLoopClosureStrategy:
             raise ValueError(f"loop candidate frame {frame} is not cached")
         return max(matches, key=lambda cache: cache.frame_start)
 
-    def _estimate_direct_pair(
-        self,
-        cache_a: WindowCache,
-        cache_b: WindowCache,
-        candidate: LoopCandidate,
-        keep_ratio: float,
-    ) -> tuple[Sim3, Sim3]:
-        index_a = candidate.frame_a - cache_a.frame_start
-        index_b = candidate.frame_b - cache_b.frame_start
-        points_a = cache_a.local_points[index_a : index_a + 1]
-        points_b = cache_b.local_points[index_b : index_b + 1]
-        poses_a = cache_a.camera_poses[index_a : index_a + 1]
-        poses_b = cache_b.camera_poses[index_b : index_b + 1]
-        mask_a = shared.select_top_confidence_mask(
-            cache_a.confidence[index_a : index_a + 1],
-            keep_ratio,
-        )
-        mask_b = shared.select_top_confidence_mask(
-            cache_b.confidence[index_b : index_b + 1],
-            keep_ratio,
-        )
-        mutual = shared.intersect_confidence_masks(
-            mask_a,
-            mask_b,
-            context="traditional loop candidate",
-        )
-        transform_b = register_adjacent_windows(
-            points_a,
-            points_b,
-            poses_a,
-            poses_b,
-            mutual,
-        )
-        return _identity_sim3(str(points_a.device)), transform_b
-
     def build_constraints(
         self,
         caches: Sequence[WindowCache],
         candidates: tuple[LoopCandidate, ...],
+        *,
+        constraint_estimator: ConstraintEstimator | None = None,
     ) -> list[LoopConstraint]:
         constraints = []
-        estimator = self.constraint_estimator or self._estimate_direct_pair
+        seen_pairs = set()
+        estimator = constraint_estimator or self.constraint_estimator
         for candidate in candidates:
-            cache_a = self._cache_for_frame(caches, candidate.frame_a)
-            cache_b = self._cache_for_frame(caches, candidate.frame_b)
-            if cache_a.window_index == cache_b.window_index:
+            try:
+                cache_a = self._cache_for_frame(caches, candidate.frame_a)
+                cache_b = self._cache_for_frame(caches, candidate.frame_b)
+            except ValueError as error:
+                logger.warning(
+                    "Skipping %s loop candidate frames=%s->%s: %s",
+                    self.name.value,
+                    candidate.frame_a,
+                    candidate.frame_b,
+                    error,
+                )
                 continue
-            transform_a, transform_b = estimator(
-                cache_a,
-                cache_b,
-                candidate,
-                self.registration_confidence_keep_ratio,
-            )
-            measurement = compute_sim3_ab(transform_a, transform_b)
-            validate_sim3(
-                measurement,
-                context="traditional loop measurement",
-            )
+            pair = (cache_a.window_index, cache_b.window_index)
+            if pair[0] == pair[1] or pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            if estimator is None:
+                raise ValueError(
+                    f"{self.name.value} loop constraints require "
+                    "a joint constraint estimator"
+                )
+            try:
+                alignment_a, alignment_b = estimator(
+                    cache_a,
+                    cache_b,
+                    candidate,
+                    self.registration_confidence_keep_ratio,
+                )
+                measurement = compute_sim3_ab(alignment_a, alignment_b)
+                validate_sim3(
+                    measurement,
+                    context="traditional loop measurement",
+                )
+            except ValueError as error:
+                logger.warning(
+                    "Skipping %s loop candidate frames=%s->%s: %s",
+                    self.name.value,
+                    candidate.frame_a,
+                    candidate.frame_b,
+                    error,
+                )
+                continue
             constraints.append(
                 LoopConstraint(
-                    window_a=cache_a.window_index,
-                    window_b=cache_b.window_index,
+                    window_a=pair[0],
+                    window_b=pair[1],
                     measurement=measurement,
                     candidate=candidate,
                 )

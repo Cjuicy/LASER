@@ -162,7 +162,7 @@ def traditional_cache_fixture():
     return (first, second)
 
 
-def strategy_fixture(optimizer=None):
+def strategy_fixture(optimizer=None, constraint_estimator=None):
     optimizer_config = load_pipeline_config(
         "configs/pipeline/test.yaml",
         ("loop.optimizer.implementation=python",),
@@ -171,6 +171,7 @@ def strategy_fixture(optimizer=None):
         optimizer_config=optimizer_config,
         registration_confidence_keep_ratio=0.3,
         optimizer=optimizer,
+        constraint_estimator=constraint_estimator,
     )
 
 
@@ -194,57 +195,31 @@ def test_traditional_aggregation_applies_delayed_transforms_once():
         )
 
 
-def test_traditional_constraint_keeps_baseline_compute_sim3_ab(
-    monkeypatch,
-):
-    from loop_closure.methods import traditional as traditional_module
-
-    calls = []
-    expected = identity_sim3(scale=2.0)
-
-    def fake_compute(left, right):
-        calls.append((left, right))
-        return expected
-
-    monkeypatch.setattr(
-        traditional_module,
-        "compute_sim3_ab",
-        fake_compute,
-    )
-    monkeypatch.setattr(
-        traditional_module,
-        "register_adjacent_windows",
-        lambda *args: identity_sim3(scale=2.0),
-    )
+def test_traditional_cross_window_constraint_requires_joint_estimator():
     candidate = (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),)
-    constraint = strategy_fixture().build_constraints(
-        traditional_cache_fixture(),
-        candidate,
-    )[0]
-    assert calls
-    assert constraint.measurement is expected
+
+    with pytest.raises(ValueError, match="joint constraint estimator"):
+        strategy_fixture().build_constraints(
+            traditional_cache_fixture(),
+            candidate,
+        )
 
 
-def test_traditional_uses_positive_shared_confidence_ratio(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        shared,
-        "select_top_confidence_mask",
-        lambda confidence, keep_ratio: calls.append(keep_ratio)
-        or torch.ones_like(confidence, dtype=torch.bool),
+def test_traditional_converts_joint_estimator_alignments_to_common_frame():
+    alignment_a = identity_sim3(scale=2.0)
+    alignment_b = identity_sim3(scale=6.0)
+    strategy = strategy_fixture(
+        constraint_estimator=lambda *arguments: (alignment_a, alignment_b)
     )
-    from loop_closure.methods import traditional as traditional_module
 
-    monkeypatch.setattr(
-        traditional_module,
-        "register_adjacent_windows",
-        lambda *args: identity_sim3(),
-    )
-    strategy_fixture().build_constraints(
+    constraint = strategy.build_constraints(
         traditional_cache_fixture(),
         (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),),
+    )[0]
+
+    assert torch.as_tensor(constraint.measurement[0]).item() == pytest.approx(
+        3.0
     )
-    assert calls and set(calls) == {0.3}
 
 
 def test_traditional_no_loop_does_not_invoke_optimizer():

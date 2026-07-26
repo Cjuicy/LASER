@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Mapping, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 import torch
@@ -244,6 +244,12 @@ class LoopClosureStrategy(Protocol):
         self,
         caches: Sequence[WindowCache],
         candidates: tuple[LoopCandidate, ...],
+        *,
+        constraint_estimator: Callable[
+            [WindowCache, WindowCache, LoopCandidate, float],
+            tuple[Sim3, Sim3],
+        ]
+        | None = None,
     ) -> list[LoopConstraint]:
         raise NotImplementedError
 

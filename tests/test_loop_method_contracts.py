@@ -12,6 +12,8 @@ from loop_closure.methods.base import (
     LoopSolution,
     WindowCache,
 )
+from loop_closure.methods.corrected import CorrectedLoopClosureStrategy
+from loop_closure.methods.traditional import TraditionalLoopClosureStrategy
 from loop_closure.loop_model import LoopDetector
 from loop_closure.utils.sim3loop import Sim3LoopOptimizer
 from pipeline.config import LoopMethod, load_pipeline_config
@@ -131,7 +133,13 @@ class RecordingStrategy:
         self.name = name
         self.received_candidates = None
 
-    def build_constraints(self, caches, candidates):
+    def build_constraints(
+        self,
+        caches,
+        candidates,
+        *,
+        constraint_estimator=None,
+    ):
         self.received_candidates = candidates
         return []
 
@@ -146,6 +154,92 @@ def test_both_methods_receive_same_candidate_tuple():
     corrected.build_constraints([], candidates)
     assert traditional.received_candidates is candidates
     assert corrected.received_candidates is candidates
+
+
+def _strategy_and_caches(loop_method, constraint_estimator):
+    optimizer_config = load_pipeline_config(
+        "configs/pipeline/test.yaml",
+        ("loop.optimizer.implementation=python",),
+    ).config.loop.optimizer
+    strategy_type = {
+        LoopMethod.TRADITIONAL: TraditionalLoopClosureStrategy,
+        LoopMethod.CORRECTED: CorrectedLoopClosureStrategy,
+    }[loop_method]
+    state = (
+        {
+            "tag": loop_method.value,
+            "relative_sim3": _identity_sim3(),
+            "anchor_scale_applied": False,
+        }
+        if loop_method is LoopMethod.TRADITIONAL
+        else {
+            "tag": loop_method.value,
+            "sim3_abs": _identity_sim3(),
+            "sim3_edge": _identity_sim3(),
+            "anchor_scale_applied": True,
+        }
+    )
+    caches = tuple(
+        WindowCache(
+            schema_version=WINDOW_CACHE_SCHEMA_VERSION,
+            loop_method=loop_method,
+            window_index=index,
+            frame_start=index * 2,
+            frame_end=index * 2 + 2,
+            local_points=torch.ones((2, 1, 1, 3)),
+            camera_poses=torch.eye(4).repeat(2, 1, 1),
+            confidence=torch.ones((2, 1, 1)),
+            segmentation_labels=(
+                np.zeros((1, 1), dtype=np.intp),
+                np.zeros((1, 1), dtype=np.intp),
+            ),
+            anchor_scale_mask=None,
+            loop_state=state,
+        )
+        for index in range(3)
+    )
+    return strategy_type(
+        optimizer_config=optimizer_config,
+        registration_confidence_keep_ratio=0.3,
+        constraint_estimator=constraint_estimator,
+    ), caches
+
+
+@pytest.mark.parametrize("loop_method", tuple(LoopMethod))
+def test_loop_constraint_value_error_isolated_and_pair_deduplicated(
+    loop_method,
+):
+    calls = []
+
+    def estimate(*arguments):
+        calls.append(arguments[2])
+        if len(calls) == 1:
+            raise ValueError("no mutual confidence")
+        return _identity_sim3(), _identity_sim3()
+
+    strategy, caches = _strategy_and_caches(loop_method, estimate)
+    first = LoopCandidate(frame_a=2, frame_b=0, similarity=0.8)
+    second = LoopCandidate(frame_a=4, frame_b=0, similarity=0.7)
+    third = LoopCandidate(frame_a=3, frame_b=1, similarity=0.6)
+
+    constraints = strategy.build_constraints(caches, (first, second, third))
+
+    assert [constraint.candidate for constraint in constraints] == [second]
+    assert calls == [first, second]
+
+
+@pytest.mark.parametrize("loop_method", tuple(LoopMethod))
+def test_loop_constraint_system_error_escapes_candidate_isolation(loop_method):
+    def estimate(*arguments):
+        raise RuntimeError("CUDA out of memory")
+
+    strategy, caches = _strategy_and_caches(loop_method, estimate)
+
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        strategy.build_constraints(
+            caches,
+            (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),),
+        )
 
 
 def test_loop_detector_consumes_typed_config_and_explicit_manifest(tmp_path):

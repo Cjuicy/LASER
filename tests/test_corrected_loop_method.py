@@ -241,6 +241,31 @@ def strategy_fixture(optimizer=None, constraint_estimator=None):
     )
 
 
+def test_corrected_cross_window_constraint_requires_joint_estimator():
+    candidate = (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),)
+
+    with pytest.raises(ValueError, match="joint constraint estimator"):
+        strategy_fixture().build_constraints(corrected_caches(), candidate)
+
+
+def test_corrected_converts_joint_estimator_alignments_to_local_measurement():
+    alignment_a = sim3(scale=2.0)
+    alignment_b = sim3(scale=6.0)
+    strategy = strategy_fixture(
+        constraint_estimator=lambda *arguments: (alignment_a, alignment_b)
+    )
+
+    constraint = strategy.build_constraints(
+        corrected_caches(),
+        (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),),
+    )[0]
+
+    # abs_a=2, abs_b=1, and joint_b / joint_a=3, so local scale=3 * 2.
+    assert torch.as_tensor(constraint.measurement[0]).item() == pytest.approx(
+        6.0
+    )
+
+
 def test_corrected_aggregation_applies_only_optimization_delta_once():
     caches = corrected_caches()
     solution = LoopSolution(
