@@ -42,7 +42,7 @@ class JointPi3AlignmentEstimator:
         self,
         model: torch.nn.Module,
         images: torch.Tensor,
-        image_manifest: ImageManifest,
+        manifest: ImageManifest,
         inference_device: str | torch.device,
         dtype: torch.dtype,
         chunk_size: int,
@@ -52,9 +52,9 @@ class JointPi3AlignmentEstimator:
             raise ValueError("joint Pi3 model must be a torch.nn.Module")
         if not isinstance(images, torch.Tensor) or images.ndim != 4:
             raise ValueError("joint Pi3 images must have shape (frames, C, H, W)")
-        if not isinstance(image_manifest, ImageManifest):
-            raise ValueError("joint Pi3 image_manifest must be an ImageManifest")
-        if images.shape[0] != len(image_manifest):
+        if not isinstance(manifest, ImageManifest):
+            raise ValueError("joint Pi3 manifest must be an ImageManifest")
+        if images.shape[0] != len(manifest):
             raise ValueError("joint Pi3 image and manifest lengths must match")
         if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
             raise ValueError("loop constraint chunk_size must be an integer")
@@ -65,7 +65,7 @@ class JointPi3AlignmentEstimator:
 
         self.model = model
         self.images = images
-        self.image_manifest = image_manifest
+        self.manifest = manifest
         self.inference_device = torch.device(inference_device)
         self.dtype = dtype
         self.chunk_size = chunk_size

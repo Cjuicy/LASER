@@ -101,7 +101,7 @@ def _estimator(model, images=None, manifest=None):
     return JointPi3AlignmentEstimator(
         model=model,
         images=_images() if images is None else images,
-        image_manifest=_manifest() if manifest is None else manifest,
+        manifest=_manifest() if manifest is None else manifest,
         inference_device="cpu",
         dtype=torch.float32,
         chunk_size=4,
@@ -152,9 +152,22 @@ def test_joint_estimator_infers_once_and_registers_each_cached_side(
     assert alignment_b[0] == 1.0
 
 
-def test_joint_estimator_rejects_image_manifest_length_mismatch():
+def test_joint_estimator_rejects_image_and_manifest_length_mismatch():
     with pytest.raises(ValueError, match="image.*manifest.*length"):
         _estimator(RecordingPi3(), images=_images(9))
+
+
+def test_joint_estimator_rejects_legacy_image_manifest_keyword():
+    with pytest.raises(TypeError, match="image_manifest"):
+        JointPi3AlignmentEstimator(
+            model=RecordingPi3(),
+            images=_images(),
+            image_manifest=_manifest(),
+            inference_device="cpu",
+            dtype=torch.float32,
+            chunk_size=4,
+            confidence_keep_ratio=0.5,
+        )
 
 
 def test_joint_estimator_rejects_call_time_keep_ratio_mismatch():
