@@ -11,6 +11,7 @@ import torch
 from inference_engine.streaming_window_engine import StreamingWindowEngine
 from loop_closure.methods.base import (
     WINDOW_CACHE_SCHEMA_VERSION,
+    LoopCandidate,
     LoopSolution,
     ReconstructionResult,
     WindowCache,
@@ -36,6 +37,12 @@ class RecordingState:
     salad_manifests: list[object] = field(default_factory=list)
     optimizer_calls: int = 0
     constraint_model_calls: int = 0
+    constraint_estimators: list[object] = field(default_factory=list)
+    estimator_factory_kwargs: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    loaded_models: list[object] = field(default_factory=list)
+    loaded_images: list[torch.Tensor] = field(default_factory=list)
 
 
 class RecordingLoopStrategy:
@@ -47,8 +54,15 @@ class RecordingLoopStrategy:
         self.state.calls.append("create_window_engine")
         return object()
 
-    def build_constraints(self, caches, candidates):
+    def build_constraints(
+        self,
+        caches,
+        candidates,
+        *,
+        constraint_estimator=None,
+    ):
         self.state.calls.append("build_constraints")
+        self.state.constraint_estimators.append(constraint_estimator)
         if candidates:
             self.state.constraint_model_calls += 1
         return []
@@ -120,20 +134,24 @@ def _cache(method, frame_count=3):
     )
 
 
-def recording_dependencies(state):
+def recording_dependencies(state, *, candidates=()):
     def preflight(config, manifest, cuda_available):
         state.calls.append("preflight")
 
     def load_pi3(config):
         state.calls.append("load_pi3")
-        return object()
+        model = object()
+        state.loaded_models.append(model)
+        return model
 
     def build_segmenter(config):
         state.segmentation_calls.append(config.method.value)
         return object()
 
     def load_images(manifest):
-        return torch.zeros((len(manifest), 3, 2, 2))
+        images = torch.zeros((len(manifest), 3, 2, 2))
+        state.loaded_images.append(images)
+        return images
 
     def build_loop(method, **dependencies):
         state.loop_calls.append(method.value)
@@ -146,7 +164,11 @@ def recording_dependencies(state):
 
     def detect_candidates(config, manifest, output_path):
         state.salad_manifests.append(manifest)
-        return ()
+        return candidates
+
+    def build_estimator(**kwargs):
+        state.estimator_factory_kwargs.append(kwargs)
+        return object()
 
     def save_result(payload, scene_name, result_dir, inverse_extrinsic):
         state.calls.append("save_result")
@@ -160,6 +182,7 @@ def recording_dependencies(state):
         build_loop_strategy=build_loop,
         run_windows=run_windows,
         detect_loop_candidates=detect_candidates,
+        build_constraint_estimator=build_estimator,
         save_for_viser=save_result,
         cuda_available=lambda: False,
         git_commit=lambda: "test-commit",
@@ -275,9 +298,43 @@ def test_no_loop_candidates_skip_constraint_model_and_optimizer(tmp_path):
         overrides,
         dependencies=recording_dependencies(state),
     )
+    assert state.estimator_factory_kwargs == []
     assert state.constraint_model_calls == 0
     assert state.optimizer_calls == 0
     assert result.summary["used_no_loop_path"] is True
+
+
+def test_runner_builds_estimator_with_active_pipeline_inputs(tmp_path):
+    state = RecordingState()
+    sentinel_estimator = object()
+
+    def build_estimator(**kwargs):
+        state.estimator_factory_kwargs.append(kwargs)
+        return sentinel_estimator
+
+    dependencies = recording_dependencies(
+        state,
+        candidates=(LoopCandidate(frame_a=2, frame_b=0, similarity=0.9),),
+    )
+    dependencies = PipelineDependencies(
+        **{
+            **dependencies.__dict__,
+            "build_constraint_estimator": build_estimator,
+        }
+    )
+    config_path, overrides, _ = _pipeline_args(tmp_path)
+
+    run_from_config(config_path, overrides, dependencies=dependencies)
+
+    kwargs = state.estimator_factory_kwargs[0]
+    assert kwargs["model"] is state.loaded_models[0]
+    assert kwargs["images"] is state.loaded_images[0]
+    assert kwargs["manifest"] is state.inference_manifests[0]
+    assert kwargs["chunk_size"] == 20
+    assert kwargs["confidence_keep_ratio"] == pytest.approx(0.30)
+    assert kwargs["inference_device"] == "cpu"
+    assert kwargs["dtype"] is torch.float32
+    assert state.constraint_estimators == [sentinel_estimator]
 
 
 def test_diagnostics_contain_resolved_config_hash(tmp_path):

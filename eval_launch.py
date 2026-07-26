@@ -3,6 +3,7 @@ from eval.depth_eval import eval_mono_depth_estimation
 from pi3.models.pi3 import Pi3
 from inference_engine import VanillaEngine
 from loop_closure.methods import detect_loop_candidates
+from loop_closure.constraint_estimation import JointPi3AlignmentEstimator
 from pipeline.config import (
     LoopMethod,
     load_pipeline_config,
@@ -11,6 +12,7 @@ from pipeline.manifest import ImageManifest
 from pipeline.runner import (
     build_default_window_engine,
     complete_reconstruction_payload,
+    resolve_model_dtype,
     run_windows,
 )
 from functools import partial
@@ -127,9 +129,25 @@ def _run_modular_evaluation(model, imgs, manifest, detect_loops):
         if detect_loops and config.loop.enabled
         else ()
     )
+    constraint_estimator = (
+        JointPi3AlignmentEstimator(
+            model=model.delegate,
+            images=imgs,
+            manifest=manifest,
+            chunk_size=config.loop.constraint.chunk_size,
+            confidence_keep_ratio=(
+                config.loop.registration.confidence_keep_ratio
+            ),
+            inference_device=config.model.inference_device,
+            dtype=resolve_model_dtype(config.model.dtype),
+        )
+        if candidates
+        else None
+    )
     constraints = model.loop_strategy.build_constraints(
         caches,
         candidates,
+        constraint_estimator=constraint_estimator,
     )
     solution = model.loop_strategy.optimize(caches, constraints)
     result = model.loop_strategy.aggregate(caches, solution)

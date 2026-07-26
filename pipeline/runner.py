@@ -15,6 +15,7 @@ from inference_engine.inference_utils import (
     estimate_pseudo_depth_and_intrinsics,
 )
 from inference_engine.segmentation import build_segmentation_strategy
+from loop_closure.constraint_estimation import JointPi3AlignmentEstimator
 from loop_closure.methods.base import (
     ReconstructionResult,
     WindowCache,
@@ -64,7 +65,7 @@ def _load_images(manifest: ImageManifest) -> torch.Tensor:
     return load_and_preprocess_images(manifest.as_strings())
 
 
-def _dtype(name: str) -> torch.dtype:
+def resolve_model_dtype(name: str) -> torch.dtype:
     return {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -170,6 +171,7 @@ class PipelineDependencies:
     build_loop_strategy: Callable = build_loop_strategy
     run_windows: Callable = run_windows
     detect_loop_candidates: Callable = detect_loop_candidates
+    build_constraint_estimator: Callable = JointPi3AlignmentEstimator
     save_for_viser: Callable = _save_for_viser
     cuda_available: Callable = torch.cuda.is_available
     git_commit: Callable = _git_commit
@@ -231,7 +233,7 @@ def build_default_window_engine(config: PipelineConfig, model):
     engine = loop_strategy.create_window_engine(
         delegate=model,
         inference_device=config.model.inference_device,
-        dtype=_dtype(config.model.dtype),
+        dtype=resolve_model_dtype(config.model.dtype),
         segmentation_strategy=segmenter,
         anchor_propagator=anchor,
         registration_confidence_keep_ratio=(
@@ -304,7 +306,7 @@ class PipelineRunner:
         engine = loop_strategy.create_window_engine(
             delegate=model,
             inference_device=config.model.inference_device,
-            dtype=_dtype(config.model.dtype),
+            dtype=resolve_model_dtype(config.model.dtype),
             segmentation_strategy=segmenter,
             anchor_propagator=anchor,
             registration_confidence_keep_ratio=(
@@ -362,9 +364,25 @@ class PipelineRunner:
         ) * 1000
 
         started = time.perf_counter()
+        constraint_estimator = (
+            dependencies.build_constraint_estimator(
+                model=model,
+                images=images,
+                manifest=manifest,
+                chunk_size=config.loop.constraint.chunk_size,
+                confidence_keep_ratio=(
+                    config.loop.registration.confidence_keep_ratio
+                ),
+                inference_device=config.model.inference_device,
+                dtype=resolve_model_dtype(config.model.dtype),
+            )
+            if candidates
+            else None
+        )
         constraints = loop_strategy.build_constraints(
             caches,
             candidates,
+            constraint_estimator=constraint_estimator,
         )
         timings["loop_constraints"] = (
             time.perf_counter() - started
