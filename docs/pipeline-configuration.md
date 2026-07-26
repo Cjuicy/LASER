@@ -117,6 +117,13 @@ The public enums are intentionally closed:
 `(0, 1]`. For example, `0.30` keeps the highest-confidence 30 percent of
 finite pixels. They are not rejection quantiles.
 
+`loop.constraint.chunk_size` is the maximum number of consecutive frames
+selected around each candidate on each side of joint Pi3 inference. The
+selection is centered, shifts at cache boundaries, and never crosses the
+selected cache range. `loop.registration.confidence_keep_ratio` is applied
+independently to cached and joint predictions before their confidence masks
+are intersected.
+
 All three segmentation methods share the configured Felzenszwalb parameters.
 `depth` segments the depth map. `geometry` segments surface-normal geometry.
 `atomic` first merges layer atoms and then applies exactly one of these split
