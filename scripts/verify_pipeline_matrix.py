@@ -9,7 +9,11 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pipeline.config import load_pipeline_config
+from pipeline.config import (
+    ModelName,
+    PredictionCacheMode,
+    load_pipeline_config,
+)
 
 
 def run_from_config(*args, **kwargs):
@@ -51,54 +55,86 @@ class MatrixEntry:
         return tuple(values)
 
 
-def build_matrix() -> tuple[MatrixEntry, ...]:
+def effective_matrix_cache_mode(
+    requested: PredictionCacheMode,
+    entry_index: int,
+) -> PredictionCacheMode:
+    if not isinstance(requested, PredictionCacheMode):
+        raise ValueError(
+            "requested matrix cache mode must be a PredictionCacheMode"
+        )
+    if (
+        isinstance(entry_index, bool)
+        or not isinstance(entry_index, int)
+        or entry_index < 0
+    ):
+        raise ValueError("matrix entry index must be a non-negative integer")
+    if requested is PredictionCacheMode.REFRESH and entry_index > 0:
+        return PredictionCacheMode.READONLY
+    return requested
+
+
+def build_matrix(model_name: ModelName) -> tuple[MatrixEntry, ...]:
+    if not isinstance(model_name, ModelName):
+        raise ValueError("matrix model name must be a ModelName")
+    prefix = f"{model_name.value}_"
     return (
-        MatrixEntry("depth_traditional", "depth", None, "traditional"),
-        MatrixEntry("depth_corrected", "depth", None, "corrected"),
         MatrixEntry(
-            "geometry_traditional",
+            f"{prefix}depth_traditional",
+            "depth",
+            None,
+            "traditional",
+        ),
+        MatrixEntry(
+            f"{prefix}depth_corrected",
+            "depth",
+            None,
+            "corrected",
+        ),
+        MatrixEntry(
+            f"{prefix}geometry_traditional",
             "geometry",
             None,
             "traditional",
         ),
         MatrixEntry(
-            "geometry_corrected",
+            f"{prefix}geometry_corrected",
             "geometry",
             None,
             "corrected",
         ),
         MatrixEntry(
-            "atomic_none_traditional",
+            f"{prefix}atomic_none_traditional",
             "atomic",
             "none",
             "traditional",
         ),
         MatrixEntry(
-            "atomic_none_corrected",
+            f"{prefix}atomic_none_corrected",
             "atomic",
             "none",
             "corrected",
         ),
         MatrixEntry(
-            "atomic_conservative_traditional",
+            f"{prefix}atomic_conservative_traditional",
             "atomic",
             "conservative",
             "traditional",
         ),
         MatrixEntry(
-            "atomic_conservative_corrected",
+            f"{prefix}atomic_conservative_corrected",
             "atomic",
             "conservative",
             "corrected",
         ),
         MatrixEntry(
-            "atomic_normal_only_traditional",
+            f"{prefix}atomic_normal_only_traditional",
             "atomic",
             "normal_only",
             "traditional",
         ),
         MatrixEntry(
-            "atomic_normal_only_corrected",
+            f"{prefix}atomic_normal_only_corrected",
             "atomic",
             "normal_only",
             "corrected",
@@ -125,16 +161,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     base = load_pipeline_config(args.config, args.overrides)
-    entries = build_matrix()
+    entries = build_matrix(base.config.model.name)
     resolved_hashes = set()
 
-    for entry in entries:
+    for entry_index, entry in enumerate(entries):
+        cache_mode = effective_matrix_cache_mode(
+            base.config.prediction_cache.mode,
+            entry_index,
+        )
         entry_overrides = entry.overrides(
             base_scene=base.config.output.scene_name,
             cache_root=base.config.output.cache_dir,
             result_root=base.config.output.result_dir,
         )
-        overrides = (*args.overrides, *entry_overrides)
+        overrides = (
+            *args.overrides,
+            *entry_overrides,
+            f"prediction_cache.mode={cache_mode.value}",
+        )
         loaded = load_pipeline_config(args.config, overrides)
         if loaded.sha256 in resolved_hashes:
             raise RuntimeError(

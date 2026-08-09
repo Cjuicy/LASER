@@ -1,7 +1,8 @@
 # LASER Modular Pipeline
 
 This branch has one streaming reconstruction entry point, one strict
-configuration schema, three segmentation strategies, one anchor-propagation
+configuration schema, one validated Pi3 adapter, a persistent ordinary
+prediction cache, three segmentation strategies, one anchor-propagation
 implementation, and two loop-closure strategies.
 
 ## Quick start
@@ -42,10 +43,15 @@ output:
   save_diagnostics: true
 
 model:
+  name: pi3
   checkpoint: weights/model.safetensors
   inference_device: cuda
   process_device: cpu
   dtype: bfloat16
+
+prediction_cache:
+  root: inference_cache/predictions
+  mode: auto
 
 window:
   size: 10
@@ -110,7 +116,9 @@ The public enums are intentionally closed:
 - `segmentation.atomic.split_mode`: `none`, `conservative`, `normal_only`
 - `loop.method`: `traditional`, `corrected`
 - `segmentation.geometry.normal_method`: `cross`, `sobel`
+- `model.name`: `pi3`
 - `model.dtype`: `float16`, `bfloat16`, `float32`
+- `prediction_cache.mode`: `auto`, `refresh`, `readonly`, `off`
 
 `segmentation.confidence_keep_ratio` and
 `loop.registration.confidence_keep_ratio` are positive keep ratios in
@@ -118,7 +126,7 @@ The public enums are intentionally closed:
 finite pixels. They are not rejection quantiles.
 
 `loop.constraint.chunk_size` is the maximum number of consecutive frames
-selected around each candidate on each side of joint Pi3 inference. The
+selected around each candidate on each side of joint model inference. The
 selection is centered, shifts at cache boundaries, and never crosses the
 selected cache range. `loop.registration.confidence_keep_ratio` is applied
 independently to cached and joint predictions before their confidence masks
@@ -199,7 +207,26 @@ python scripts/verify_pipeline_matrix.py \
   --set output.scene_name=kitti_00
 ```
 
-Each entry gets unique scene, cache, and result directory suffixes.
+Every name is prefixed with `pi3_`. Each entry gets unique scene,
+method-cache, and result directory suffixes while retaining one shared
+`prediction_cache.root`. If the requested cache mode is `refresh`, entry zero
+refreshes the prediction entry and entries one through nine use `readonly`;
+`auto`, `readonly`, and `off` are unchanged for all entries.
+
+## Ordinary prediction reuse
+
+The content-addressed cache stores the Pi3 output that is invariant across
+segmentation and loop-method experiments: per-window depth, confidence, and
+camera poses, plus the sequence reference intrinsic. On replay, local points
+are reconstructed from cached depth and the reference intrinsic, and current
+RGB images are attached in memory.
+
+The cache deliberately excludes segmentation labels, anchor state,
+traditional/corrected method caches, SALAD results, loop candidates,
+optimization state, and joint A/B inference. See the
+[Pi3 prediction-cache validation guide](pi3-prediction-cache-validation.md)
+for fingerprint rules, the v2 layout, corruption behavior, and cold/warm
+acceptance commands.
 
 ## Outputs and diagnostics
 
@@ -214,14 +241,17 @@ run writes the reconstruction artifacts plus:
 
 `run_summary.json` records the SHA-256 hash of the resolved configuration, Git
 commit, selected methods, atomic split mode, manifest endpoints, image/window/
-candidate/constraint counts, no-loop status, split totals, and stage timings.
+candidate/constraint counts, no-loop status, split totals, stage timings,
+model/checkpoint/prediction-key identity, cache mode, hit/miss/corruption
+counts, ordinary and joint forward counts, cache I/O time, saved-window count,
+and stored bytes.
 Writes use a temporary file followed by an atomic replacement.
 
 ## AutoDL / cloud example
 
 ```bash
 git clone --recursive \
-  --branch codex/modular-segmentation-loop-integration \
+  --branch codex/pi3-ordinary-prediction-cache \
   https://github.com/Cjuicy/LASER.git
 cd LASER
 
@@ -242,6 +272,7 @@ python run_laser.py \
   --set input.image_dir=data/00/image_2 \
   --set output.scene_name=kitti_00 \
   --set output.cache_dir=inference_cache/kitti_00 \
+  --set prediction_cache.root=inference_cache/predictions \
   --set output.result_dir=viser_results
 ```
 

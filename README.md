@@ -82,14 +82,31 @@ python run_laser.py \
 
 The exact supported methods are:
 
+- reconstruction model: `pi3`
 - segmentation: `depth`, `geometry`, `atomic`
 - atomic split: `none`, `conservative`, `normal_only`
 - loop closure: `traditional`, `corrected`
 
+Pi3 ordinary sliding-window predictions can be shared across segmentation and
+loop-method experiments:
+
+```bash
+python run_laser.py \
+  --config configs/pipeline/default.yaml \
+  --set model.name=pi3 \
+  --set prediction_cache.mode=auto
+```
+
+The cache stores ordinary depth, confidence, poses, and one sequence reference
+intrinsic. RGB images, SALAD descriptors, loop candidates, and candidate joint
+A/B inference are not cached.
+
 Loop closure additionally requires `faiss-gpu-cu12`. See the
 [modular pipeline guide](docs/pipeline-configuration.md) for the complete YAML,
 method semantics, diagnostics, ten-configuration matrix, and AutoDL/KITTI
-commands.
+commands. See the
+[Pi3 prediction-cache validation guide](docs/pi3-prediction-cache-validation.md)
+for cache modes, storage layout, cold/warm tests, and acceptance criteria.
 
 ### Visualization
 To visualize the interactive 4D results, you can use the following command:
