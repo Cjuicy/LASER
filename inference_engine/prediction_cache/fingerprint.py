@@ -12,7 +12,11 @@ from inference_engine.models.adapters import (
 from pipeline.config import ModelConfig, ModelName
 from pipeline.manifest import ImageManifest
 
-from .types import PREDICTION_CACHE_SCHEMA_VERSION, WindowSpec
+from .types import (
+    PREDICTION_CACHE_SCHEMA_VERSION,
+    WindowSpec,
+    validate_window_specs,
+)
 
 
 PREPROCESSING_CONTRACT_VERSION = (
@@ -147,16 +151,12 @@ def build_prediction_fingerprint(
         raise ValueError(
             "window_size must be greater than overlap >= 1"
         )
-    normalized_specs = tuple(specs)
-    if (
-        not normalized_specs
-        or any(not isinstance(spec, WindowSpec) for spec in normalized_specs)
-        or normalized_specs[0].frame_start != 0
-        or normalized_specs[-1].frame_end != len(manifest)
-    ):
-        raise ValueError(
-            "prediction fingerprint requires complete WindowSpecs"
-        )
+    normalized_specs = validate_window_specs(
+        specs,
+        frame_count=len(manifest),
+        window_size=window_size,
+        overlap=overlap,
+    )
 
     checkpoint_digest = sha256_file(model.checkpoint)
     manifest_digest = digest_image_manifest(manifest)

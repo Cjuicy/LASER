@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -155,3 +156,31 @@ def test_build_model_handle_is_lazy(tmp_path, monkeypatch):
         kind=ModelForwardKind.ORDINARY,
     )
     assert construction_calls == [config]
+
+
+def test_digest_bound_handle_rejects_replaced_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    config = _model_config(tmp_path)
+    expected_digest = hashlib.sha256(
+        Path(config.checkpoint).read_bytes()
+    ).hexdigest()
+    construction_calls = []
+    monkeypatch.setattr(
+        "inference_engine.models.loader._construct_pi3",
+        lambda: construction_calls.append("constructed"),
+    )
+    handle = build_model_handle(
+        config,
+        expected_checkpoint_sha256=expected_digest,
+    )
+    torch.save(
+        {"marker": torch.tensor([9.0])},
+        config.checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint digest"):
+        handle.get()
+
+    assert construction_calls == []

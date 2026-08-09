@@ -20,13 +20,20 @@ def run_model_inference(
         image_dir,
         image_paths,
 ):
-    if args.model == 'streaming_pi3_lc':
+    if args.model in {'streaming_pi3', 'streaming_pi3_lc'}:
         return model(
             images,
             image_dir,
             image_paths=image_paths,
         )
     return model(images)
+
+
+def load_model_images(model_name, filelist, device):
+    images = load_and_preprocess_images(filelist)
+    if model_name == 'pi3':
+        return images.to(device)
+    return images
 
 
 def eval_pose_estimation(args, model, device, dtype, save_dir=None, inverse_extrinsic=True):
@@ -113,7 +120,7 @@ def eval_pose_estimation_dist(args, model, device, dtype, img_path, save_dir=Non
             #     filelist, size=load_img_size, verbose=False,
             #     dynamic_mask_root=mask_path_seq, crop=not args.no_crop
             # )
-            imgs = load_and_preprocess_images(filelist).to(device)
+            imgs = load_model_images(args.model, filelist, device)
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=dtype):

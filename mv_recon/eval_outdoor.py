@@ -39,10 +39,9 @@ def create_pi3(cfg):
 
 
 def create_streaming_pi3(cfg):
-    pretrained_model_name_or_path: str = cfg.pi3.pretrained_model_name_or_path
     config = load_pipeline_config("configs/pipeline/default.yaml").config
     local_checkpoint = require_local_model_checkpoint(
-        pretrained_model_name_or_path
+        cfg.pi3.checkpoint
     )
     config = replace(
         config,
@@ -87,7 +86,7 @@ def main(hydra_cfg: DictConfig):
 
     ##################################################
     logger = logging.getLogger("mv_recon-eval")
-    logger.info(f"Loaded Pi3 from {hydra_cfg.pi3.pretrained_model_name_or_path}")
+    logger.info(f"Loaded streaming Pi3 from {hydra_cfg.pi3.checkpoint}")
     output_dir = hydra_cfg.output_dir if hydra_cfg.dir_suffix is None else f'{hydra_cfg.output_dir}_{hydra_cfg.dir_suffix}'
 
     for idx_dataset, dataset_name in enumerate(all_eval_datasets, start=1):

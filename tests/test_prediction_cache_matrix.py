@@ -201,7 +201,13 @@ def _matrix_dependencies(
     fail_model_factory,
     salad_calls,
 ):
-    def build_model_handle(config):
+    def build_model_handle(
+        config,
+        *,
+        expected_checkpoint_sha256=None,
+    ):
+        assert expected_checkpoint_sha256 is not None
+
         def factory():
             if fail_model_factory:
                 raise AssertionError(
@@ -244,9 +250,9 @@ def test_ten_configurations_reuse_two_ordinary_window_forwards(tmp_path):
         )
     (tmp_path / "model.safetensors").write_bytes(b"fake-checkpoint")
     images = torch.arange(
-        15 * 3 * 2 * 2,
+        15 * 3 * 4 * 4,
         dtype=torch.float32,
-    ).reshape(15, 3, 2, 2)
+    ).reshape(15, 3, 4, 4)
     entries = build_matrix(ModelName.PI3)
 
     first_salad_calls = []

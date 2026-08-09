@@ -197,3 +197,23 @@ class SequenceArtifact:
             raise ValueError(
                 "reference_intrinsic must have shape (3,3)"
             )
+        if (
+            self.reference_intrinsic[0, 0] <= 0
+            or self.reference_intrinsic[1, 1] <= 0
+        ):
+            raise ValueError(
+                "reference intrinsic focal lengths must be positive"
+            )
+        expected_last_row = self.reference_intrinsic.new_tensor(
+            [0.0, 0.0, 1.0]
+        )
+        if not torch.allclose(
+            self.reference_intrinsic[2],
+            expected_last_row,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError(
+                "reference intrinsic must have homogeneous last row "
+                "[0,0,1]"
+            )

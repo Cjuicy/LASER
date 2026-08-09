@@ -140,3 +140,20 @@ def test_sequence_artifact_requires_finite_three_by_three_intrinsic():
         SequenceArtifact(torch.eye(4))
     with pytest.raises(ValueError, match="finite"):
         SequenceArtifact(torch.full((3, 3), float("nan")))
+
+
+@pytest.mark.parametrize(
+    "intrinsic",
+    (
+        torch.zeros((3, 3)),
+        torch.tensor(
+            [[-1.0, 0.0, 1.0], [0.0, 2.0, 1.0], [0.0, 0.0, 1.0]]
+        ),
+        torch.tensor(
+            [[2.0, 0.0, 1.0], [0.0, 2.0, 1.0], [1.0, 0.0, 1.0]]
+        ),
+    ),
+)
+def test_sequence_artifact_rejects_unusable_intrinsic(intrinsic):
+    with pytest.raises(ValueError, match="intrinsic"):
+        SequenceArtifact(intrinsic)

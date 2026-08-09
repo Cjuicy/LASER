@@ -81,9 +81,21 @@ def require_local_model_checkpoint(checkpoint: str | Path) -> str:
     return str(path.resolve())
 
 
-def build_model_handle(config: ModelConfig) -> LazyModelHandle:
+def build_model_handle(
+    config: ModelConfig,
+    *,
+    expected_checkpoint_sha256: str | None = None,
+) -> LazyModelHandle:
+    def construct():
+        if expected_checkpoint_sha256 is None:
+            return build_model_adapter(config)
+        return build_model_adapter(
+            config,
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
+        )
+
     return LazyModelHandle(
-        lambda: build_model_adapter(config),
+        construct,
         inference_device=config.inference_device,
         dtype=resolve_model_dtype(config.dtype),
     )
@@ -293,21 +305,26 @@ def prepare_default_window_engine(
     images: torch.Tensor,
     manifest: ImageManifest,
     model_handle: LazyModelHandle,
+    *,
+    specs: Sequence[WindowSpec] | None = None,
+    fingerprint: PredictionFingerprint | None = None,
 ):
-    specs = build_window_specs(
-        len(manifest),
-        config.window.size,
-        config.window.overlap,
-    )
-    fingerprint = build_prediction_fingerprint(
-        model=config.model,
-        manifest=manifest,
-        image_shape=tuple(int(size) for size in images.shape),
-        sample_stride=config.input.sample_stride,
-        window_size=config.window.size,
-        overlap=config.window.overlap,
-        specs=specs,
-    )
+    if specs is None:
+        specs = build_window_specs(
+            len(manifest),
+            config.window.size,
+            config.window.overlap,
+        )
+    if fingerprint is None:
+        fingerprint = build_prediction_fingerprint(
+            model=config.model,
+            manifest=manifest,
+            image_shape=tuple(int(size) for size in images.shape),
+            sample_stride=config.input.sample_stride,
+            window_size=config.window.size,
+            overlap=config.window.overlap,
+            specs=specs,
+        )
     store = OrdinaryPredictionStore(
         root=config.prediction_cache.root,
         fingerprint=fingerprint,
@@ -337,18 +354,43 @@ class StreamingPipelineModel(torch.nn.Module):
                 "streaming pipeline model requires a PipelineConfig"
             )
         self.pipeline_config = config
-        self.model_handle = build_model_handle(config.model)
+        self.model_handle: LazyModelHandle | None = None
+        self._checkpoint_sha256: str | None = None
 
     def prepare(
         self,
         images: torch.Tensor,
         manifest: ImageManifest,
     ):
+        specs = build_window_specs(
+            len(manifest),
+            self.pipeline_config.window.size,
+            self.pipeline_config.window.overlap,
+        )
+        fingerprint = build_prediction_fingerprint(
+            model=self.pipeline_config.model,
+            manifest=manifest,
+            image_shape=tuple(int(size) for size in images.shape),
+            sample_stride=self.pipeline_config.input.sample_stride,
+            window_size=self.pipeline_config.window.size,
+            overlap=self.pipeline_config.window.overlap,
+            specs=specs,
+        )
+        if self._checkpoint_sha256 != fingerprint.checkpoint_sha256:
+            self.model_handle = build_model_handle(
+                self.pipeline_config.model,
+                expected_checkpoint_sha256=(
+                    fingerprint.checkpoint_sha256
+                ),
+            )
+            self._checkpoint_sha256 = fingerprint.checkpoint_sha256
         return prepare_default_window_engine(
             self.pipeline_config,
             images,
             manifest,
             self.model_handle,
+            specs=specs,
+            fingerprint=fingerprint,
         )
 
 
@@ -408,7 +450,12 @@ class PipelineRunner:
             mode=config.prediction_cache.mode,
             expected_specs=specs,
         )
-        model = dependencies.build_model_handle(config.model)
+        model = dependencies.build_model_handle(
+            config.model,
+            expected_checkpoint_sha256=(
+                fingerprint.checkpoint_sha256
+            ),
+        )
         prediction_provider = dependencies.build_prediction_provider(
             store=store,
             model=model,

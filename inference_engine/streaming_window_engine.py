@@ -68,6 +68,12 @@ from .utils.registration_confidence import (
 
 # 线程停止标志
 STOP_SIGNAL = object()
+QUEUE_CAPACITY = 4
+QUEUE_POLL_SECONDS = 0.05
+
+
+class _WorkerCancelled(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -134,8 +140,8 @@ class StreamingWindowEngine(VanillaEngine):
         self.temp_cache_dir = None
         self.cache_id = 0
         # 7️⃣ 两个线程队列
-        self.inference_queue = queue.Queue()
-        self.registration_queue = queue.Queue()
+        self.inference_queue = queue.Queue(maxsize=QUEUE_CAPACITY)
+        self.registration_queue = queue.Queue(maxsize=QUEUE_CAPACITY)
 
         # 8️⃣ 相邻窗口状态
         self.prev_window_cache = None
@@ -144,7 +150,9 @@ class StreamingWindowEngine(VanillaEngine):
         # 9️⃣ 线程对象和运行状态
         self._inference_thread = None
         self._registration_thread = None
-        self._worker_errors = queue.Queue()
+        self._cancel_event = threading.Event()
+        self._worker_failure_lock = threading.Lock()
+        self._worker_failure = None
 
         self.running = False
 
@@ -195,25 +203,58 @@ class StreamingWindowEngine(VanillaEngine):
     # 将引擎恢复到未运行状态
     def _reset_state(self):
         self.cache_id = 0
-        self.inference_queue = queue.Queue()
-        self.registration_queue = queue.Queue()
+        self.inference_queue = queue.Queue(maxsize=QUEUE_CAPACITY)
+        self.registration_queue = queue.Queue(maxsize=QUEUE_CAPACITY)
 
         self.prev_window_cache = None
         self.anchor_sp_graph = None
 
         self._inference_thread = None
         self._registration_thread = None
-        self._worker_errors = queue.Queue()
+        self._cancel_event = threading.Event()
+        self._worker_failure_lock = threading.Lock()
+        self._worker_failure = None
 
         self.latencies = []
+        self._submitted_window_count = 0
 
         gc.collect()
 
     def _run_worker(self, name, worker):
         try:
             worker()
+        except _WorkerCancelled:
+            return
         except BaseException as error:
-            self._worker_errors.put((name, error))
+            with self._worker_failure_lock:
+                if self._worker_failure is None:
+                    self._worker_failure = (name, error)
+            self._cancel_event.set()
+
+    def _queue_put(self, target, item):
+        while not self._cancel_event.is_set():
+            try:
+                target.put(item, timeout=QUEUE_POLL_SECONDS)
+                return
+            except queue.Full:
+                continue
+        raise _WorkerCancelled("streaming worker was cancelled")
+
+    def _queue_get(self, source):
+        while not self._cancel_event.is_set():
+            try:
+                return source.get(timeout=QUEUE_POLL_SECONDS)
+            except queue.Empty:
+                continue
+        raise _WorkerCancelled("streaming worker was cancelled")
+
+    def _raise_worker_failure(self):
+        with self._worker_failure_lock:
+            worker_failure = self._worker_failure
+        if worker_failure is None:
+            raise RuntimeError("streaming workers were cancelled")
+        worker_name, error = worker_failure
+        raise RuntimeError(f"{worker_name} failed") from error
 
     # 模型推理线程
     @torch.no_grad()
@@ -221,7 +262,7 @@ class StreamingWindowEngine(VanillaEngine):
         # 1️⃣ 持续读取输入
         while True:
             # 2️⃣ 检查停止信号
-            request = self.inference_queue.get()
+            request = self._queue_get(self.inference_queue)
             if request is STOP_SIGNAL:
                 return
             if not isinstance(request, WindowRequest):
@@ -244,12 +285,13 @@ class StreamingWindowEngine(VanillaEngine):
             # 6️⃣ 把结果移到后处理设备
             processed_window = dict_to_device(prediction_window, self.process_device)
             # 7️⃣ 发送给配准线程
-            self.registration_queue.put(
+            self._queue_put(
+                self.registration_queue,
                 (
                     request.spec,
                     processed_window,
                     inference_duration,
-                )
+                ),
             )
             # 8️⃣ 清理 CUDA 缓存
             if self.inference_device == 'cuda':
@@ -261,7 +303,7 @@ class StreamingWindowEngine(VanillaEngine):
 
         # 1️⃣ 从配准队列取结果
         while True:
-            item = self.registration_queue.get()
+            item = self._queue_get(self.registration_queue)
             if item is STOP_SIGNAL:
                 return
 
@@ -396,10 +438,14 @@ class StreamingWindowEngine(VanillaEngine):
             raise ValueError(
                 "window tensor does not match its WindowSpec"
             )
+        try:
+            self._queue_put(
+                self.inference_queue,
+                WindowRequest(spec=window_spec, images=sample),
+            )
+        except _WorkerCancelled:
+            self._raise_worker_failure()
         self._submitted_window_count += 1
-        self.inference_queue.put(
-            WindowRequest(spec=window_spec, images=sample)
-        )
 
     # 结束引擎
     def end(self):
@@ -408,15 +454,20 @@ class StreamingWindowEngine(VanillaEngine):
             raise RuntimeError('Cannot terminate a stopped inference engine')
 
         # 2️⃣ 等待推理线程处理完全部输入
-        self.inference_queue.put(STOP_SIGNAL)
+        try:
+            self._queue_put(self.inference_queue, STOP_SIGNAL)
+        except _WorkerCancelled:
+            pass
         self._inference_thread.join()
         # 3️⃣ 等待配准线程处理完全部预测结果
-        self.registration_queue.put(STOP_SIGNAL)
+        try:
+            self._queue_put(self.registration_queue, STOP_SIGNAL)
+        except _WorkerCancelled:
+            pass
         self._registration_thread.join()
 
-        worker_error = None
-        if not self._worker_errors.empty():
-            worker_error = self._worker_errors.get()
+        with self._worker_failure_lock:
+            worker_error = self._worker_failure
 
         # 4️⃣ 打印性能统计
         if self.benchmark_latency and worker_error is None:

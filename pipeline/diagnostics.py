@@ -153,6 +153,9 @@ def collect_prediction_diagnostics(
         "prediction_cache_write_ms": float(store_stats.write_ms),
         "saved_window_count": int(store_stats.saved_window_count),
         "stored_bytes": int(store_stats.stored_bytes),
+        "prediction_cache_events": [
+            dict(event) for event in store_stats.events
+        ],
     }
 
 

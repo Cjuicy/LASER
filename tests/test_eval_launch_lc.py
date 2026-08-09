@@ -1,8 +1,11 @@
+import ast
 from dataclasses import replace
 from pathlib import Path
 import sys
 import types
 
+from omegaconf import OmegaConf
+import pytest
 import torch
 
 pose_eval = types.ModuleType("eval.pose_eval")
@@ -54,6 +57,109 @@ class FakeEngine:
         self.model_handle = model_handle
         self.pipeline_config = config
         self.loop_strategy = loop_strategy
+
+
+def _load_pose_function(name):
+    source_path = Path(__file__).resolve().parents[1] / "eval/pose_eval.py"
+    module = ast.parse(source_path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == name
+    )
+    namespace = {}
+    exec(
+        compile(
+            ast.Module(body=[function], type_ignores=[]),
+            str(source_path),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace[name]
+
+
+def test_pose_evaluation_passes_exact_paths_to_both_streaming_modes():
+    dispatch = _load_pose_function("run_model_inference")
+    images = object()
+    image_paths = ["frame-0.png", "frame-1.png"]
+
+    for model_name in ("streaming_pi3", "streaming_pi3_lc"):
+        calls = []
+
+        def model(*args, **kwargs):
+            calls.append((args, kwargs))
+            return object()
+
+        dispatch(
+            types.SimpleNamespace(model=model_name),
+            model,
+            images,
+            "/frames",
+            image_paths,
+        )
+
+        assert calls == [
+            ((images, "/frames"), {"image_paths": image_paths})
+        ]
+
+
+def test_pose_evaluation_keeps_streaming_images_on_cpu():
+    source_path = Path(__file__).resolve().parents[1] / "eval/pose_eval.py"
+    module = ast.parse(source_path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "load_model_images"
+    )
+    transfers = []
+    moved = object()
+
+    class Images:
+        def to(self, device):
+            transfers.append(device)
+            return moved
+
+    images = Images()
+    namespace = {
+        "load_and_preprocess_images": lambda paths: images,
+    }
+    exec(
+        compile(
+            ast.Module(body=[function], type_ignores=[]),
+            str(source_path),
+            "exec",
+        ),
+        namespace,
+    )
+    load_images = namespace["load_model_images"]
+
+    for model_name in ("streaming_pi3", "streaming_pi3_lc"):
+        assert load_images(model_name, ["frame.png"], "cuda") is images
+        assert transfers == []
+
+    assert load_images("pi3", ["frame.png"], "cuda") is moved
+    assert transfers == ["cuda"]
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    ("mv_recon_dense.yaml", "mv_recon_kf15.yaml", "mv_recon_outdoor.yaml"),
+)
+def test_shipped_mv_streaming_configs_define_local_checkpoint(config_name):
+    repository_root = Path(__file__).resolve().parents[1]
+    config = OmegaConf.load(
+        repository_root / "configs/evaluation" / config_name
+    )
+    assert config.pi3.checkpoint == "weights/model.safetensors"
+
+    for relative_path in ("mv_recon/eval.py", "mv_recon/eval_outdoor.py"):
+        source = (repository_root / relative_path).read_text(
+            encoding="utf-8"
+        )
+        assert "cfg.pi3.checkpoint" in source
 
 
 def test_eval_launch_does_not_import_pi3_directly():

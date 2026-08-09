@@ -10,7 +10,10 @@ from inference_engine.prediction_cache import fingerprint as fingerprint_module
 from inference_engine.prediction_cache.fingerprint import (
     build_prediction_fingerprint,
 )
-from inference_engine.prediction_cache.types import build_window_specs
+from inference_engine.prediction_cache.types import (
+    WindowSpec,
+    build_window_specs,
+)
 from pipeline.config import ModelName, load_pipeline_config
 from pipeline.manifest import ImageManifest
 
@@ -208,4 +211,17 @@ def test_invalid_preprocessed_shape_is_rejected(tmp_path, shape):
     with pytest.raises(ValueError, match="shape"):
         build_prediction_fingerprint(
             **{**inputs, "image_shape": shape}
+        )
+
+
+def test_noncanonical_window_schedule_is_rejected(tmp_path):
+    inputs = _inputs(tmp_path)
+    noncanonical = (
+        WindowSpec(0, 0, 2),
+        WindowSpec(1, 0, 2),
+    )
+
+    with pytest.raises(ValueError, match="canonical sliding schedule"):
+        build_prediction_fingerprint(
+            **{**inputs, "specs": noncanonical}
         )

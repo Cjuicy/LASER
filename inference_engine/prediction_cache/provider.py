@@ -14,7 +14,11 @@ from inference_engine.models.lazy import (
 )
 from pipeline.config import PredictionCacheMode
 
-from .store import OrdinaryPredictionStore
+from .store import (
+    OrdinaryPredictionStore,
+    PredictionCacheCorruptError,
+    PredictionCacheMissError,
+)
 from .types import (
     OrdinaryWindowArtifact,
     SequenceArtifact,
@@ -128,6 +132,10 @@ class OrdinaryPredictionProvider(torch.nn.Module):
             artifact.depth.clone(),
             self._reference_intrinsic.clone(),
         )
+        if not torch.isfinite(local_points).all():
+            raise ValueError(
+                "cached depth produced non-finite reconstructed local points"
+            )
         return {
             "local_points": local_points.unsqueeze(0),
             "camera_poses": artifact.camera_poses.clone().unsqueeze(0),
@@ -143,7 +151,13 @@ class OrdinaryPredictionProvider(torch.nn.Module):
         if spec not in self.store.expected_specs:
             raise ValueError("WindowSpec does not belong to this provider")
         self._validate_images(spec, images)
-        self._load_sequence_once()
+        try:
+            self._load_sequence_once()
+        except (
+            PredictionCacheMissError,
+            PredictionCacheCorruptError,
+        ) as exc:
+            raise self.store.contextualize_read_error(spec, exc) from exc
 
         artifact = self.store.read_window(spec)
         if artifact is not None and self._reference_intrinsic is not None:
@@ -177,10 +191,9 @@ class OrdinaryPredictionProvider(torch.nn.Module):
                 raise ValueError(
                     "first ordinary prediction produced invalid intrinsic"
                 )
+            sequence = SequenceArtifact(reference.clone())
             self._reference_intrinsic = reference.clone()
-            self.store.write_sequence(
-                SequenceArtifact(reference.clone())
-            )
+            self.store.write_sequence(sequence)
 
         compact = OrdinaryWindowArtifact(
             spec=spec,

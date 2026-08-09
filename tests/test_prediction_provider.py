@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from inference_engine.inference_utils import (
     unproject_depth_to_local_points,
@@ -20,8 +21,12 @@ from inference_engine.prediction_cache.store import (
     OrdinaryPredictionStore,
     PredictionCacheCorruptError,
     PredictionCacheMissError,
+    _sequence_artifact_digest,
 )
-from inference_engine.prediction_cache.types import WindowSpec
+from inference_engine.prediction_cache.types import (
+    PREDICTION_CACHE_SCHEMA_VERSION,
+    WindowSpec,
+)
 from pipeline.config import PredictionCacheMode
 
 
@@ -43,6 +48,7 @@ def _fingerprint():
         canonical_payload={
             "model_name": "pi3",
             "image_shape": [3, 3, 4, 4],
+            "window_specs": [spec.to_payload() for spec in SPECS],
         },
     )
 
@@ -246,8 +252,8 @@ def test_readonly_missing_cache_fails_before_model_construction(tmp_path):
 
     try:
         provider.get(SPECS[0], IMAGES[0:2])
-    except PredictionCacheMissError:
-        pass
+    except PredictionCacheMissError as error:
+        assert "window 000000 [0,2)" in str(error)
     else:
         raise AssertionError("readonly miss did not fail")
 
@@ -300,3 +306,81 @@ def test_provider_rejects_later_window_before_reference_intrinsic(tmp_path):
         raise AssertionError("out-of-order first access was accepted")
 
     assert handle.stats.model_constructed is False
+
+
+def test_provider_rejects_degenerate_generated_intrinsic(
+    tmp_path,
+    monkeypatch,
+):
+    from inference_engine.prediction_cache import provider as provider_module
+
+    monkeypatch.setattr(
+        provider_module,
+        "estimate_pseudo_depth_and_intrinsics",
+        lambda points: (
+            points[..., -1],
+            torch.zeros((points.shape[0], 3, 3)),
+        ),
+    )
+    provider = OrdinaryPredictionProvider(
+        store=_store(tmp_path),
+        model=_handle([]),
+    )
+
+    with pytest.raises(ValueError, match="intrinsic"):
+        provider.get(SPECS[0], IMAGES[0:2])
+
+
+def test_readonly_provider_rejects_cached_degenerate_intrinsic(tmp_path):
+    cold = OrdinaryPredictionProvider(
+        store=_store(tmp_path),
+        model=_handle([]),
+    )
+    cold.get(SPECS[0], IMAGES[0:2])
+    intrinsic = torch.zeros((3, 3))
+    raw_artifact = SimpleNamespace(reference_intrinsic=intrinsic)
+    cold.store._atomic_write_json(
+        cold.store.sequence_path,
+        {
+            "schema_version": PREDICTION_CACHE_SCHEMA_VERSION,
+            "key": cold.store.fingerprint.key,
+            "artifact_sha256": _sequence_artifact_digest(
+                cold.store.fingerprint.key,
+                raw_artifact,
+            ),
+            "reference_intrinsic": intrinsic.tolist(),
+        },
+    )
+    constructions = []
+    readonly = OrdinaryPredictionProvider(
+        store=_store(tmp_path, PredictionCacheMode.READONLY),
+        model=_handle(constructions),
+    )
+
+    with pytest.raises(PredictionCacheCorruptError, match="000000"):
+        readonly.get(SPECS[0], IMAGES[0:2])
+
+    assert constructions == []
+
+
+def test_provider_rejects_nonfinite_reconstructed_points(
+    tmp_path,
+    monkeypatch,
+):
+    from inference_engine.prediction_cache import provider as provider_module
+
+    monkeypatch.setattr(
+        provider_module,
+        "unproject_depth_to_local_points",
+        lambda depth, intrinsic: torch.full(
+            (*depth.shape, 3),
+            float("inf"),
+        ),
+    )
+    provider = OrdinaryPredictionProvider(
+        store=_store(tmp_path),
+        model=_handle([]),
+    )
+
+    with pytest.raises(ValueError, match="reconstructed local points"):
+        provider.get(SPECS[0], IMAGES[0:2])

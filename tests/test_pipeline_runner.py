@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from inference_engine.streaming_window_engine import StreamingWindowEngine
+from inference_engine.streaming_window_engine import (
+    STOP_SIGNAL,
+    StreamingWindowEngine,
+)
 from inference_engine.prediction_cache.types import WindowSpec
 from inference_engine.models.lazy import ModelExecutionStats
 from inference_engine.prediction_cache.fingerprint import (
@@ -28,6 +33,7 @@ from pipeline.config import LoopMethod, ModelName, load_pipeline_config
 from pipeline.runner import (
     PipelineDependencies,
     PipelineRunner,
+    StreamingPipelineModel,
     require_local_model_checkpoint,
     run_windows,
     run_from_config,
@@ -163,8 +169,13 @@ def recording_dependencies(state, *, candidates=()):
     def preflight(config, manifest, cuda_available):
         state.calls.append("preflight")
 
-    def build_model_handle(config):
+    def build_model_handle(
+        config,
+        *,
+        expected_checkpoint_sha256=None,
+    ):
         state.calls.append("build_model_handle")
+        assert expected_checkpoint_sha256 == "a" * 64
         handle = SimpleNamespace(stats=ModelExecutionStats())
         state.loaded_models.append(handle)
         return handle
@@ -488,6 +499,7 @@ def test_diagnostics_contain_resolved_config_hash(tmp_path):
     assert summary["model_constructed"] is False
     assert summary["ordinary_forward_count"] == 0
     assert summary["joint_forward_count"] == 0
+    assert summary["prediction_cache_events"] == []
     assert {
         "loop_candidates.json",
         "loop_constraints.json",
@@ -542,6 +554,19 @@ class RaisingDelegate(torch.nn.Module):
         raise ValueError("delegate exploded")
 
 
+class FastDelegate(torch.nn.Module):
+    def get(self, spec, sample):
+        frames, _, height, width = sample.shape
+        return {
+            "local_points": torch.zeros(
+                (1, frames, height, width, 3)
+            ),
+            "camera_poses": torch.eye(4).repeat(1, frames, 1, 1),
+            "conf": torch.ones((1, frames, height, width)),
+            "images": sample.unsqueeze(0),
+        }
+
+
 class UnusedSegmenter:
     def segment(self, point_maps, confidence, images):
         raise AssertionError("registration must not run")
@@ -572,3 +597,164 @@ def test_background_worker_exception_propagates_to_main_thread(tmp_path):
     with pytest.raises(RuntimeError, match="model inference worker"):
         engine.end()
     assert engine.running is False
+
+
+def test_slow_registration_applies_bounded_backpressure(tmp_path):
+    engine = StreamingWindowEngine(
+        FastDelegate(),
+        inference_device="cpu",
+        dtype=torch.float32,
+        segmentation_strategy=UnusedSegmenter(),
+        anchor_propagator=object(),
+        registration_confidence_keep_ratio=0.5,
+        anchor_enabled=False,
+        temporal_iou_threshold=0.3,
+        window_size=2,
+        overlap=1,
+        cache_root=str(tmp_path),
+        intermediate_device="cpu",
+        process_device="cpu",
+        benchmark_latency=False,
+    )
+    release_registration = threading.Event()
+
+    def slow_registration():
+        release_registration.wait()
+        while True:
+            item = engine.registration_queue.get()
+            if item is STOP_SIGNAL:
+                return
+
+    engine._registration_worker = slow_registration
+    errors = []
+
+    def execute():
+        try:
+            engine.begin()
+            for index in range(12):
+                engine(
+                    torch.zeros((2, 3, 2, 2)),
+                    window_spec=WindowSpec(index, index, index + 2),
+                )
+            engine.end()
+        except BaseException as error:
+            errors.append(error)
+
+    execution = threading.Thread(target=execute)
+    execution.start()
+    deadline = time.monotonic() + 2.0
+    while (
+        engine.registration_queue.qsize() < 5
+        and execution.is_alive()
+        and time.monotonic() < deadline
+    ):
+        threading.Event().wait(0.01)
+
+    observed_maxsize = engine.registration_queue.maxsize
+    observed_depth = engine.registration_queue.qsize()
+    observed_running = execution.is_alive()
+    release_registration.set()
+    execution.join(timeout=2.0)
+
+    assert observed_maxsize == 4
+    assert observed_depth <= 4
+    assert observed_running
+    assert not execution.is_alive()
+    assert errors == []
+
+
+def test_registration_failure_cancels_blocked_producer(tmp_path):
+    engine = StreamingWindowEngine(
+        FastDelegate(),
+        inference_device="cpu",
+        dtype=torch.float32,
+        segmentation_strategy=UnusedSegmenter(),
+        anchor_propagator=object(),
+        registration_confidence_keep_ratio=0.5,
+        anchor_enabled=False,
+        temporal_iou_threshold=0.3,
+        window_size=2,
+        overlap=1,
+        cache_root=str(tmp_path),
+        intermediate_device="cpu",
+        process_device="cpu",
+        benchmark_latency=False,
+    )
+
+    def fail_registration():
+        engine.registration_queue.get()
+        raise ValueError("registration exploded")
+
+    engine._registration_worker = fail_registration
+    engine.begin()
+    forward_error = None
+    end_error = None
+    try:
+        for index in range(20):
+            engine(
+                torch.zeros((2, 3, 2, 2)),
+                window_spec=WindowSpec(index, index, index + 2),
+            )
+    except RuntimeError as error:
+        forward_error = error
+    try:
+        engine.end()
+    except RuntimeError as error:
+        end_error = error
+
+    assert "registration worker" in str(forward_error)
+    assert "registration worker" in str(end_error)
+    assert engine.running is False
+
+
+def test_streaming_model_rebuilds_lazy_handle_after_checkpoint_change(
+    tmp_path,
+):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    image_paths = []
+    for index in range(3):
+        path = image_dir / f"frame-{index}.png"
+        path.write_bytes(f"frame-{index}".encode("ascii"))
+        image_paths.append(path)
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint-one")
+    loaded = load_pipeline_config("configs/pipeline/test.yaml")
+    config = replace(
+        loaded.config,
+        input=replace(
+            loaded.config.input,
+            image_dir=str(image_dir),
+            sample_stride=1,
+        ),
+        model=replace(
+            loaded.config.model,
+            checkpoint=str(checkpoint),
+            inference_device="cpu",
+            process_device="cpu",
+            dtype="float32",
+        ),
+        prediction_cache=replace(
+            loaded.config.prediction_cache,
+            root=str(tmp_path / "predictions"),
+        ),
+        output=replace(
+            loaded.config.output,
+            cache_dir=str(tmp_path / "method-cache"),
+        ),
+        window=replace(loaded.config.window, size=3, overlap=1),
+    )
+    manifest = ImageManifest(paths=tuple(image_paths))
+    images = torch.zeros((3, 3, 2, 2))
+    model = StreamingPipelineModel(config)
+
+    first = model.prepare(images, manifest)
+    first_handle = first.model_handle
+    second = model.prepare(images, manifest)
+    assert second.model_handle is first_handle
+
+    checkpoint.write_bytes(b"checkpoint-two")
+    third = model.prepare(images, manifest)
+    assert third.model_handle is not first_handle
+    fourth = model.prepare(images, manifest)
+    assert fourth.model_handle is third.model_handle

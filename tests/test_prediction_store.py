@@ -32,6 +32,7 @@ def _fingerprint(key: str = "a" * 64) -> PredictionFingerprint:
             "model_name": "pi3",
             "dtype": "float32",
             "image_shape": [3, 3, 2, 3],
+            "window_specs": [spec.to_payload() for spec in SPECS],
         },
     )
 
@@ -60,6 +61,16 @@ def _store(
         mode=mode,
         expected_specs=SPECS,
     )
+
+
+def test_store_rejects_specs_that_do_not_match_fingerprint(tmp_path):
+    with pytest.raises(ValueError, match="do not match fingerprint"):
+        OrdinaryPredictionStore(
+            root=tmp_path / "predictions",
+            fingerprint=_fingerprint(),
+            mode=PredictionCacheMode.AUTO,
+            expected_specs=(WindowSpec(0, 0, 3),),
+        )
 
 
 def test_auto_store_round_trips_exact_layout(tmp_path):
@@ -109,7 +120,10 @@ def test_valid_partial_auto_entry_resumes_only_missing_windows(tmp_path):
 def test_readonly_missing_entry_never_creates_directories(tmp_path):
     store = _store(tmp_path, PredictionCacheMode.READONLY)
 
-    with pytest.raises(PredictionCacheMissError, match="readonly"):
+    with pytest.raises(
+        PredictionCacheMissError,
+        match=r"window 000000 \[0,2\).*readonly",
+    ):
         store.read_window(SPECS[0])
 
     assert not (tmp_path / "predictions").exists()
@@ -139,6 +153,13 @@ def test_auto_quarantines_truncated_window_and_returns_miss(tmp_path):
     assert store.stats.corrupt_count == 1
     assert store.stats.ordinary_misses == 1
     assert list((store.entry_path / "invalid").rglob("000000.pt"))
+    event = store.stats.events[-1]
+    assert event["event"] == "quarantine"
+    assert event["reason"] == "window-000000-corrupt"
+    assert event["original_path"] == str(
+        (store.entry_path / "windows/000000.pt").resolve()
+    )
+    assert Path(event["quarantine_path"]).is_file()
 
 
 def test_auto_rejects_window_copied_from_another_prediction_key(tmp_path):
@@ -289,3 +310,58 @@ def test_failed_atomic_window_write_leaves_no_final_file(
 
     assert not (store.entry_path / "windows/000000.pt").exists()
     assert not list((store.entry_path / "windows").glob("*.tmp"))
+
+
+def test_warm_validation_and_size_scan_run_once_per_store(
+    tmp_path,
+    monkeypatch,
+):
+    cold = _store(tmp_path)
+    cold.write_sequence(SequenceArtifact(torch.eye(3)))
+    cold.write_window(_artifact(SPECS[0]))
+    cold.write_window(_artifact(SPECS[1]))
+    cold.finalize()
+
+    warm = _store(tmp_path)
+    manifest_calls = 0
+    size_calls = 0
+    original_manifest = warm._manifest_is_valid
+    original_size = warm._update_stored_bytes
+
+    def count_manifest():
+        nonlocal manifest_calls
+        manifest_calls += 1
+        return original_manifest()
+
+    def count_size():
+        nonlocal size_calls
+        size_calls += 1
+        return original_size()
+
+    monkeypatch.setattr(warm, "_manifest_is_valid", count_manifest)
+    monkeypatch.setattr(warm, "_update_stored_bytes", count_size)
+
+    assert warm.read_sequence() is not None
+    assert warm.read_window(SPECS[0]) is not None
+    assert warm.read_window(SPECS[1]) is not None
+    assert manifest_calls == 1
+    assert size_calls == 1
+
+
+def test_cold_size_scan_runs_only_at_finalize(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    size_calls = 0
+    original_size = store._update_stored_bytes
+
+    def count_size():
+        nonlocal size_calls
+        size_calls += 1
+        return original_size()
+
+    monkeypatch.setattr(store, "_update_stored_bytes", count_size)
+    store.write_sequence(SequenceArtifact(torch.eye(3)))
+    store.write_window(_artifact(SPECS[0]))
+    store.write_window(_artifact(SPECS[1]))
+    store.finalize()
+
+    assert size_calls == 1

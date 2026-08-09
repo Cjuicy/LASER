@@ -8,7 +8,7 @@ import pickle
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
@@ -42,6 +42,7 @@ class PredictionStoreStats:
     write_ms: float = 0.0
     saved_window_count: int = 0
     stored_bytes: int = 0
+    events: list[dict[str, object]] = field(default_factory=list)
 
 
 def _update_digest(digest, value: bytes) -> None:
@@ -149,6 +150,16 @@ class OrdinaryPredictionStore:
             raise ValueError(
                 "prediction fingerprint image_shape is invalid"
             )
+        fingerprint_specs = fingerprint.canonical_payload.get(
+            "window_specs"
+        )
+        expected_specs_payload = [
+            spec.to_payload() for spec in specs
+        ]
+        if fingerprint_specs != expected_specs_payload:
+            raise ValueError(
+                "prediction store WindowSpecs do not match fingerprint"
+            )
         self.expected_spatial_shape = (
             image_shape[2],
             image_shape[3],
@@ -160,6 +171,7 @@ class OrdinaryPredictionStore:
         )
         self.stats = PredictionStoreStats()
         self._refresh_prepared = False
+        self._read_validation_cached = False
         self._lock_depth = 0
         self._lock_stream = None
 
@@ -195,6 +207,33 @@ class OrdinaryPredictionStore:
         self.invalid_path.mkdir(parents=True, exist_ok=True)
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path.touch(exist_ok=True)
+
+    def _invalidate_read_validation(self) -> None:
+        self._read_validation_cached = False
+
+    @staticmethod
+    def _window_description(spec: WindowSpec) -> str:
+        return (
+            f"window {spec.index:06d} "
+            f"[{spec.frame_start},{spec.frame_end})"
+        )
+
+    def contextualize_read_error(
+        self,
+        spec: WindowSpec,
+        error: PredictionCacheMissError | PredictionCacheCorruptError,
+    ) -> PredictionCacheMissError | PredictionCacheCorruptError:
+        description = self._window_description(spec)
+        self.stats.events.append(
+            {
+                "event": "readonly_error",
+                "window_index": spec.index,
+                "frame_start": spec.frame_start,
+                "frame_end": spec.frame_end,
+                "reason": str(error),
+            }
+        )
+        return type(error)(f"{description}: {error}")
 
     @contextmanager
     def entry_lock(
@@ -349,16 +388,29 @@ class OrdinaryPredictionStore:
         paths: Sequence[Path],
         *,
         reason: str,
-    ) -> None:
+    ) -> tuple[Path, ...]:
         self._ensure_layout()
         snapshot = self._snapshot_name(reason)
         snapshot.mkdir(parents=True, exist_ok=False)
+        destinations = []
         for path in paths:
             if not path.exists():
                 continue
             destination = snapshot / path.name
+            original_path = str(path.resolve())
             path.replace(destination)
+            destinations.append(destination)
+            self.stats.events.append(
+                {
+                    "event": "quarantine",
+                    "reason": reason,
+                    "original_path": original_path,
+                    "quarantine_path": str(destination.resolve()),
+                }
+            )
         self.stats.corrupt_count += 1
+        self._invalidate_read_validation()
+        return tuple(destinations)
 
     def _snapshot_entry(self, *, reason: str) -> None:
         self._ensure_layout()
@@ -370,16 +422,38 @@ class OrdinaryPredictionStore:
             self.complete_path,
         ):
             if path.exists():
-                path.replace(snapshot / path.name)
+                destination = snapshot / path.name
+                original_path = str(path.resolve())
+                path.replace(destination)
+                self.stats.events.append(
+                    {
+                        "event": "quarantine",
+                        "reason": reason,
+                        "original_path": original_path,
+                        "quarantine_path": str(destination.resolve()),
+                    }
+                )
         window_files = tuple(self.windows_path.glob("*.pt"))
         if window_files:
             destination = snapshot / "windows"
             destination.mkdir()
             for path in window_files:
-                path.replace(destination / path.name)
+                target = destination / path.name
+                original_path = str(path.resolve())
+                path.replace(target)
+                self.stats.events.append(
+                    {
+                        "event": "quarantine",
+                        "reason": reason,
+                        "original_path": original_path,
+                        "quarantine_path": str(target.resolve()),
+                    }
+                )
+        self._invalidate_read_validation()
 
     def _write_manifest(self) -> None:
         self._ensure_layout()
+        self._invalidate_read_validation()
         self._atomic_write_json(
             self.manifest_path,
             self._manifest_payload(),
@@ -425,6 +499,8 @@ class OrdinaryPredictionStore:
 
     def _validate_manifest_for_read(self) -> bool:
         self._prepare_refresh()
+        if self._read_validation_cached:
+            return True
         if not self.manifest_path.is_file():
             if self.mode is PredictionCacheMode.READONLY:
                 raise PredictionCacheMissError(
@@ -453,6 +529,7 @@ class OrdinaryPredictionStore:
             return False
         self._validate_completion_for_read()
         self._update_stored_bytes()
+        self._read_validation_cached = True
         return True
 
     def _validate_completion_for_read(self) -> None:
@@ -621,7 +698,7 @@ class OrdinaryPredictionStore:
                     payload,
                     validate_payload=self._sequence_from_payload,
                 )
-                self._update_stored_bytes()
+                self._invalidate_read_validation()
         finally:
             self.stats.write_ms += (
                 time.perf_counter() - started
@@ -638,51 +715,57 @@ class OrdinaryPredictionStore:
             return None
         started = time.perf_counter()
         try:
-            with self.entry_lock():
-                if not self._validate_manifest_for_read():
-                    self.stats.ordinary_misses += 1
-                    return None
-                path = self._window_path(spec)
-                if not path.is_file():
-                    if self.mode is PredictionCacheMode.READONLY:
-                        raise PredictionCacheMissError(
-                            "readonly prediction cache window is missing: "
-                            f"{spec.index}"
+            try:
+                with self.entry_lock():
+                    if not self._validate_manifest_for_read():
+                        self.stats.ordinary_misses += 1
+                        return None
+                    path = self._window_path(spec)
+                    if not path.is_file():
+                        if self.mode is PredictionCacheMode.READONLY:
+                            raise PredictionCacheMissError(
+                                "readonly prediction cache window is missing"
+                            )
+                        self.stats.ordinary_misses += 1
+                        return None
+                    try:
+                        payload = torch.load(
+                            path,
+                            map_location="cpu",
+                            weights_only=False,
                         )
-                    self.stats.ordinary_misses += 1
-                    return None
-                try:
-                    payload = torch.load(
-                        path,
-                        map_location="cpu",
-                        weights_only=False,
-                    )
-                    artifact = self._window_from_payload(
-                        payload,
-                        spec,
-                    )
-                except (
-                    EOFError,
-                    KeyError,
-                    OSError,
-                    pickle.UnpicklingError,
-                    RuntimeError,
-                    TypeError,
-                    ValueError,
-                ) as exc:
-                    if self.mode is PredictionCacheMode.READONLY:
-                        raise PredictionCacheCorruptError(
-                            f"prediction cache window "
-                            f"{spec.index:06d} is corrupt"
-                        ) from exc
-                    self._quarantine_paths(
-                        (path,),
-                        reason=f"window-{spec.index:06d}-corrupt",
-                    )
-                    self.stats.ordinary_misses += 1
-                    return None
-                self.stats.ordinary_hits += 1
-                return artifact
+                        artifact = self._window_from_payload(
+                            payload,
+                            spec,
+                        )
+                    except (
+                        EOFError,
+                        KeyError,
+                        OSError,
+                        pickle.UnpicklingError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        if self.mode is PredictionCacheMode.READONLY:
+                            raise PredictionCacheCorruptError(
+                                "readonly prediction cache window is corrupt"
+                            ) from exc
+                        self._quarantine_paths(
+                            (path,),
+                            reason=f"window-{spec.index:06d}-corrupt",
+                        )
+                        self.stats.ordinary_misses += 1
+                        return None
+                    self.stats.ordinary_hits += 1
+                    return artifact
+            except (
+                PredictionCacheMissError,
+                PredictionCacheCorruptError,
+            ) as exc:
+                if self.mode is PredictionCacheMode.READONLY:
+                    raise self.contextualize_read_error(spec, exc) from exc
+                raise
         finally:
             self.stats.read_ms += (
                 time.perf_counter() - started
@@ -733,7 +816,7 @@ class OrdinaryPredictionStore:
                     ),
                 )
                 self.stats.saved_window_count += 1
-                self._update_stored_bytes()
+                self._invalidate_read_validation()
         finally:
             self.stats.write_ms += (
                 time.perf_counter() - started
@@ -773,6 +856,7 @@ class OrdinaryPredictionStore:
                     "window_count": len(self.expected_specs),
                 },
             )
+            self._invalidate_read_validation()
             self._update_stored_bytes()
 
     def _update_stored_bytes(self) -> None:

@@ -236,8 +236,10 @@ global points 或方法派生状态。tensor 按模型实际输出 dtype 存储�
   locks/entry.lock
 ```
 
-写入使用同目录临时文件、flush/fsync、重新读取验证和原子 replace。读取验证 schema、
-prediction key、WindowSpec、shape、dtype、finite 值与 payload digest。
+写入使用同目录临时文件、flush/fsync 和原子 replace。tensor 临时文件在发布前重新读取
+验证；JSON 在写入前验证规范化序列化结果。该协议保证原子可见性，但由于未同步父目录，
+不承诺突然断电时的持久性。读取验证 schema、prediction key、WindowSpec、shape、dtype、
+finite 值与 payload digest。
 
 模式语义：
 

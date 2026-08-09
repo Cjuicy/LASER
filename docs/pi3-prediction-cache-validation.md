@@ -135,8 +135,12 @@ Changing only a downstream experiment method reuses the same key.
           ...
 ```
 
-Writes use a temporary file, validation readback, filesystem sync, and atomic
-replacement. A process-level file lock serializes one prediction entry.
+Writes use a same-directory temporary file, sync that temporary file, and
+atomically replace the destination. Tensor payloads are read back and validated;
+JSON validates its canonical serialized representation before publication. This
+provides atomic visibility, but does not claim power-loss durability because the
+parent directory is not synced. A process-level file lock serializes one
+prediction entry.
 Partially written valid entries are resumable: existing windows hit, and only
 missing windows forward through Pi3.
 
@@ -163,7 +167,12 @@ prediction_cache_read_ms
 prediction_cache_write_ms
 saved_window_count
 stored_bytes
+prediction_cache_events
 ```
+
+`prediction_cache_events` records readonly failures with the exact window and
+absolute frame range, and records automatic quarantine with its reason plus the
+absolute original and quarantine paths.
 
 Expected cold/warm behavior for a two-window sequence:
 
