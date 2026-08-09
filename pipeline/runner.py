@@ -14,6 +14,7 @@ from inference_engine.anchor_propagation import AnchorPropagator
 from inference_engine.inference_utils import (
     estimate_pseudo_depth_and_intrinsics,
 )
+from inference_engine.prediction_cache.types import build_window_specs
 from inference_engine.segmentation import build_segmentation_strategy
 from loop_closure.constraint_estimation import JointPi3AlignmentEstimator
 from loop_closure.methods.base import (
@@ -78,11 +79,12 @@ def expected_window_count(
     window_size: int,
     overlap: int,
 ) -> int:
-    step = window_size - overlap
-    return sum(
-        1
-        for start in range(0, image_count, step)
-        if start == 0 or image_count - start > overlap
+    return len(
+        build_window_specs(
+            image_count,
+            window_size,
+            overlap,
+        )
     )
 
 
