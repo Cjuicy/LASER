@@ -1,7 +1,7 @@
 # LASER Pi3 普通窗口预测共享缓存设计
 
 - 日期：2026-08-09
-- 状态：待书面复核
+- 状态：已于 2026-08-09 获用户批准
 - 目标分支：`codex/pi3-ordinary-prediction-cache`
 - 精确基线：`origin/codex/modular-segmentation-loop-integration@3f8a3b8277f22ef1c6d820987cab1ff707b0741d`
 - 参考实现：`origin/codex/pi3x-ordinary-prediction-cache@b930a9c933457199ea5d2e0b15ccc2182353a1fa`
