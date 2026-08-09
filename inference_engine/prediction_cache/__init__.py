@@ -1,3 +1,7 @@
+from .fingerprint import (
+    PredictionFingerprint,
+    build_prediction_fingerprint,
+)
 from .types import (
     PREDICTION_CACHE_SCHEMA_VERSION,
     OrdinaryWindowArtifact,
@@ -8,6 +12,8 @@ from .types import (
 )
 
 __all__ = [
+    "PredictionFingerprint",
+    "build_prediction_fingerprint",
     "PREDICTION_CACHE_SCHEMA_VERSION",
     "OrdinaryWindowArtifact",
     "SequenceArtifact",
