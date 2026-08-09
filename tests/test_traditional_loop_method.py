@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from inference_engine.segmentation import SegmentationResult
+from inference_engine.prediction_cache.types import WindowSpec
 from inference_engine.streaming_window_engine import STOP_SIGNAL
 from loop_closure.methods import shared
 from loop_closure.methods.base import (
@@ -15,7 +16,16 @@ from loop_closure.methods.traditional import (
     TraditionalLoopClosureStrategy,
     TraditionalWindowEngine,
 )
-from pipeline.config import LoopMethod, SegmentationMethod, load_pipeline_config
+from pipeline.config import (
+    LoopMethod,
+    ModelName,
+    SegmentationMethod,
+    load_pipeline_config,
+)
+
+
+PREDICTION_KEY = "prediction-key"
+CHECKPOINT_DIGEST = "a" * 64
 
 
 def identity_sim3(scale=1.0):
@@ -78,16 +88,23 @@ def test_traditional_window_defers_sim3_and_anchor_scale_application(
         intermediate_device="cpu",
         process_device="cpu",
         benchmark_latency=False,
+        prediction_key=PREDICTION_KEY,
+        model_name=ModelName.PI3,
+        checkpoint_digest=CHECKPOINT_DIGEST,
     )
     monkeypatch.setattr(
         traditional_module,
         "estimate_pseudo_depth_and_intrinsics",
-        lambda points: (points[..., 2], torch.eye(3)[None]),
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("provider already normalized the intrinsic")
+        ),
     )
     monkeypatch.setattr(
         traditional_module,
         "unproject_depth_to_local_points",
-        lambda depth, intrinsic: depth[..., None].repeat(1, 1, 1, 3),
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("provider already unprojected local points")
+        ),
     )
     monkeypatch.setattr(
         traditional_module,
@@ -95,10 +112,17 @@ def test_traditional_window_defers_sim3_and_anchor_scale_application(
         lambda *args: identity_sim3(scale=2.0),
     )
     caches = []
-    engine._save_cache = lambda: caches.append(engine.prev_window_cache)
+    engine._save_cache = lambda: (
+        caches.append(engine.prev_window_cache),
+        setattr(engine, "cache_id", engine.cache_id + 1),
+    )
 
-    engine.registration_queue.put((make_window(), 0.0))
-    engine.registration_queue.put((make_window(), 0.0))
+    engine.registration_queue.put(
+        (WindowSpec(0, 0, 2), make_window(), 0.0)
+    )
+    engine.registration_queue.put(
+        (WindowSpec(1, 1, 3), make_window(), 0.0)
+    )
     engine.registration_queue.put(STOP_SIGNAL)
     engine._registration_worker()
 
@@ -122,6 +146,9 @@ def traditional_cache_fixture():
     first = WindowCache(
         schema_version=WINDOW_CACHE_SCHEMA_VERSION,
         loop_method=LoopMethod.TRADITIONAL,
+        prediction_key=PREDICTION_KEY,
+        model_name=ModelName.PI3,
+        checkpoint_digest=CHECKPOINT_DIGEST,
         window_index=0,
         frame_start=0,
         frame_end=2,
@@ -142,6 +169,9 @@ def traditional_cache_fixture():
     second = WindowCache(
         schema_version=WINDOW_CACHE_SCHEMA_VERSION,
         loop_method=LoopMethod.TRADITIONAL,
+        prediction_key=PREDICTION_KEY,
+        model_name=ModelName.PI3,
+        checkpoint_digest=CHECKPOINT_DIGEST,
         window_index=1,
         frame_start=1,
         frame_end=3,
@@ -240,6 +270,9 @@ def test_traditional_cache_payload_round_trips_with_method_tag():
     restored = WindowCache.from_payload(
         cache.to_payload(),
         expected_method=LoopMethod.TRADITIONAL,
+        expected_prediction_key=PREDICTION_KEY,
+        expected_model_name=ModelName.PI3,
+        expected_checkpoint_digest=CHECKPOINT_DIGEST,
     )
     assert restored.loop_state["tag"] == "traditional"
     assert restored.loop_state["anchor_scale_applied"] is False

@@ -8,10 +8,10 @@ import numpy as np
 import torch
 
 from inference_engine.streaming_window_engine import StreamingWindowEngine
-from pipeline.config import LoopMethod
+from pipeline.config import LoopMethod, ModelName
 
 
-WINDOW_CACHE_SCHEMA_VERSION = 1
+WINDOW_CACHE_SCHEMA_VERSION = 2
 Sim3 = tuple[torch.Tensor | float, torch.Tensor, torch.Tensor]
 
 
@@ -96,6 +96,9 @@ class ReconstructionResult:
 class WindowCache:
     schema_version: int
     loop_method: LoopMethod
+    prediction_key: str
+    model_name: ModelName
+    checkpoint_digest: str
     window_index: int
     frame_start: int
     frame_end: int
@@ -118,6 +121,24 @@ class WindowCache:
                 self.loop_method = LoopMethod(self.loop_method)
             except (TypeError, ValueError) as exc:
                 raise ValueError("window cache loop_method is invalid") from exc
+        if not isinstance(self.model_name, ModelName):
+            try:
+                self.model_name = ModelName(self.model_name)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("window cache model name is invalid") from exc
+        if not isinstance(self.prediction_key, str) or not self.prediction_key:
+            raise ValueError("window cache prediction key must be non-empty")
+        if (
+            not isinstance(self.checkpoint_digest, str)
+            or len(self.checkpoint_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.checkpoint_digest.casefold()
+            )
+        ):
+            raise ValueError(
+                "window cache checkpoint digest must be SHA256 hex"
+            )
         if self.window_index < 0:
             raise ValueError("window_index must be non-negative")
         if self.frame_start < 0 or self.frame_end <= self.frame_start:
@@ -163,6 +184,9 @@ class WindowCache:
         return {
             "schema_version": self.schema_version,
             "loop_method": self.loop_method.value,
+            "prediction_key": self.prediction_key,
+            "model_name": self.model_name.value,
+            "checkpoint_digest": self.checkpoint_digest,
             "window_index": self.window_index,
             "frame_start": self.frame_start,
             "frame_end": self.frame_end,
@@ -184,6 +208,9 @@ class WindowCache:
         payload: Mapping[str, object],
         *,
         expected_method: LoopMethod,
+        expected_prediction_key: str,
+        expected_model_name: ModelName,
+        expected_checkpoint_digest: str,
     ) -> "WindowCache":
         if not isinstance(payload, Mapping):
             raise ValueError("window cache payload must be a mapping")
@@ -211,10 +238,23 @@ class WindowCache:
                 f"{actual_method.value} cache cannot load as "
                 f"{expected_method.value}"
             )
+        if payload.get("prediction_key") != expected_prediction_key:
+            raise ValueError("window cache prediction key mismatch")
+        try:
+            actual_model_name = ModelName(payload.get("model_name"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("window cache model name is invalid") from exc
+        if actual_model_name is not expected_model_name:
+            raise ValueError("window cache model name mismatch")
+        if payload.get("checkpoint_digest") != expected_checkpoint_digest:
+            raise ValueError("window cache checkpoint digest mismatch")
         try:
             return cls(
                 schema_version=int(schema_version),
                 loop_method=actual_method,
+                prediction_key=payload["prediction_key"],
+                model_name=actual_model_name,
+                checkpoint_digest=payload["checkpoint_digest"],
                 window_index=payload["window_index"],
                 frame_start=payload["frame_start"],
                 frame_end=payload["frame_end"],

@@ -16,7 +16,7 @@ from loop_closure.methods.corrected import CorrectedLoopClosureStrategy
 from loop_closure.methods.traditional import TraditionalLoopClosureStrategy
 from loop_closure.loop_model import LoopDetector
 from loop_closure.utils.sim3loop import Sim3LoopOptimizer
-from pipeline.config import LoopMethod, load_pipeline_config
+from pipeline.config import LoopMethod, ModelName, load_pipeline_config
 from pipeline.manifest import ImageManifest
 
 
@@ -24,10 +24,17 @@ def _identity_sim3(scale=1.0):
     return scale, torch.eye(3), torch.zeros(3)
 
 
+PREDICTION_KEY = "prediction-key"
+CHECKPOINT_DIGEST = "a" * 64
+
+
 def window_cache_fixture(loop_method=LoopMethod.TRADITIONAL):
     return WindowCache(
         schema_version=WINDOW_CACHE_SCHEMA_VERSION,
         loop_method=loop_method,
+        prediction_key=PREDICTION_KEY,
+        model_name=ModelName.PI3,
+        checkpoint_digest=CHECKPOINT_DIGEST,
         window_index=0,
         frame_start=0,
         frame_end=2,
@@ -69,6 +76,9 @@ def test_cache_rejects_cross_method_loading():
         WindowCache.from_payload(
             cache.to_payload(),
             expected_method=LoopMethod.CORRECTED,
+            expected_prediction_key=PREDICTION_KEY,
+            expected_model_name=ModelName.PI3,
+            expected_checkpoint_digest=CHECKPOINT_DIGEST,
         )
 
 
@@ -80,6 +90,9 @@ def test_cache_rejects_schema_version_and_state_tag():
         WindowCache.from_payload(
             wrong_version,
             expected_method=LoopMethod.TRADITIONAL,
+            expected_prediction_key=PREDICTION_KEY,
+            expected_model_name=ModelName.PI3,
+            expected_checkpoint_digest=CHECKPOINT_DIGEST,
         )
 
     wrong_tag = cache.to_payload()
@@ -88,6 +101,9 @@ def test_cache_rejects_schema_version_and_state_tag():
         WindowCache.from_payload(
             wrong_tag,
             expected_method=LoopMethod.TRADITIONAL,
+            expected_prediction_key=PREDICTION_KEY,
+            expected_model_name=ModelName.PI3,
+            expected_checkpoint_digest=CHECKPOINT_DIGEST,
         )
 
 
@@ -98,6 +114,30 @@ def test_cache_rejects_invalid_frame_span():
         WindowCache.from_payload(
             payload,
             expected_method=LoopMethod.TRADITIONAL,
+            expected_prediction_key=PREDICTION_KEY,
+            expected_model_name=ModelName.PI3,
+            expected_checkpoint_digest=CHECKPOINT_DIGEST,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("prediction_key", "other-key", "prediction key"),
+        ("model_name", "pi3x", "model name"),
+        ("checkpoint_digest", "b" * 64, "checkpoint"),
+    ),
+)
+def test_cache_rejects_wrong_prediction_provenance(field, value, message):
+    payload = window_cache_fixture().to_payload()
+    payload[field] = value
+    with pytest.raises(ValueError, match=message):
+        WindowCache.from_payload(
+            payload,
+            expected_method=LoopMethod.TRADITIONAL,
+            expected_prediction_key=PREDICTION_KEY,
+            expected_model_name=ModelName.PI3,
+            expected_checkpoint_digest=CHECKPOINT_DIGEST,
         )
 
 
@@ -183,6 +223,9 @@ def _strategy_and_caches(loop_method, constraint_estimator):
         WindowCache(
             schema_version=WINDOW_CACHE_SCHEMA_VERSION,
             loop_method=loop_method,
+            prediction_key=PREDICTION_KEY,
+            model_name=ModelName.PI3,
+            checkpoint_digest=CHECKPOINT_DIGEST,
             window_index=index,
             frame_start=index * 2,
             frame_end=index * 2 + 2,

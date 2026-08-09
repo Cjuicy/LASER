@@ -39,10 +39,12 @@ import glob
 from contextlib import nullcontext
 from collections import defaultdict
 import time
+from dataclasses import dataclass
 
 # 项目内部依赖
 from .vanilla_engine import VanillaEngine
 from .anchor_propagation import AnchorPropagator
+from .prediction_cache.types import WindowSpec
 from .segmentation import (
     SegmentationStrategy,
     build_temporal_graphs,
@@ -67,6 +69,13 @@ from .utils.registration_confidence import (
 # 线程停止标志
 STOP_SIGNAL = object()
 
+
+@dataclass(frozen=True)
+class WindowRequest:
+    spec: WindowSpec
+    images: torch.Tensor
+
+
 # 类定义
 class StreamingWindowEngine(VanillaEngine):
     def __init__(
@@ -85,6 +94,9 @@ class StreamingWindowEngine(VanillaEngine):
         intermediate_device: str = "cuda",
         process_device: str = "cpu",
         benchmark_latency: bool = True,
+        prediction_key: str = "",
+        model_name=None,
+        checkpoint_digest: str = "",
     ):
         if window_size <= overlap or overlap < 1:
             raise ValueError(
@@ -112,6 +124,10 @@ class StreamingWindowEngine(VanillaEngine):
         self.anchor_enabled = bool(anchor_enabled)
         self.temporal_iou_threshold = temporal_iou_threshold
         self.last_segmentation_results = None
+        self.prediction_key = prediction_key
+        self.model_name = model_name
+        self.checkpoint_digest = checkpoint_digest
+        self._submitted_window_count = 0
 
         os.makedirs(cache_root, exist_ok=True)
         self.cache_dir = cache_root
@@ -135,6 +151,7 @@ class StreamingWindowEngine(VanillaEngine):
         # 1️⃣0️⃣ 延迟统计
         self.benchmark_latency = benchmark_latency
         self.latencies = []
+        self._submitted_window_count = 0
         self.warmup_steps = 2
 
     # 修改缓存根目录
@@ -204,22 +221,22 @@ class StreamingWindowEngine(VanillaEngine):
         # 1️⃣ 持续读取输入
         while True:
             # 2️⃣ 检查停止信号
-            sample_window = self.inference_queue.get()
-            if sample_window is STOP_SIGNAL:
+            request = self.inference_queue.get()
+            if request is STOP_SIGNAL:
                 return
+            if not isinstance(request, WindowRequest):
+                raise ValueError(
+                    "inference queue item must be a WindowRequest"
+                )
 
             # 3️⃣ 统计模型推理时间
             t_start = time.perf_counter()
 
-            # 4️⃣ 自动混合精度推理
-            device_type = torch.device(self.inference_device).type
-            autocast_context = (
-                torch.autocast(device_type, dtype=self.dtype)
-                if self.dtype in (torch.float16, torch.bfloat16)
-                else nullcontext()
+            # 4️⃣ provider 在 cache miss 时负责模型 autocast/forward
+            prediction_window = self.delegate.get(
+                request.spec,
+                request.images,
             )
-            with autocast_context:
-                prediction_window = self.delegate(sample_window)
 
             # 5️⃣ 记录推理耗时
             inference_duration = time.perf_counter() - t_start
@@ -227,14 +244,19 @@ class StreamingWindowEngine(VanillaEngine):
             # 6️⃣ 把结果移到后处理设备
             processed_window = dict_to_device(prediction_window, self.process_device)
             # 7️⃣ 发送给配准线程
-            self.registration_queue.put((processed_window, inference_duration))
+            self.registration_queue.put(
+                (
+                    request.spec,
+                    processed_window,
+                    inference_duration,
+                )
+            )
             # 8️⃣ 清理 CUDA 缓存
             if self.inference_device == 'cuda':
                 torch.cuda.empty_cache()
 
     # 配准线程
     def _registration_worker(self):
-        ref_intrinsic = None        # 第一窗口估计出的参考相机内参
         tgt_sp_graph = None         # 当前窗口的深度分割图
 
         # 1️⃣ 从配准队列取结果
@@ -243,7 +265,7 @@ class StreamingWindowEngine(VanillaEngine):
             if item is STOP_SIGNAL:
                 return
 
-            working_window, inference_duration = item
+            _, working_window, inference_duration = item
             t_start = time.perf_counter()
 
             # 2️⃣ 去掉 batch 维度
@@ -260,12 +282,6 @@ class StreamingWindowEngine(VanillaEngine):
 
             # ⚠️ 非首窗口处理
             if self.prev_window_cache is not None:
-                # 1️⃣ 强制使用固定内参
-                # fixed intrinsic enforce
-                working_window['local_points'] = unproject_depth_to_local_points(
-                    working_window.pop('local_points')[..., -1],
-                    ref_intrinsic
-                )
                 # 2️⃣ 构造双向高置信度掩码
                 # mutual conf mask
                 prev_mask = select_top_confidence_mask(
@@ -322,15 +338,6 @@ class StreamingWindowEngine(VanillaEngine):
                     )
             # ⚠️ 首窗口处理
             else:
-                # 1️⃣ 估计参考内参
-                _, intrinsic_ = estimate_pseudo_depth_and_intrinsics(working_window['local_points'])
-                ref_intrinsic = intrinsic_[0]
-                # 2️⃣ 使用参考内参重新生成点云
-                working_window['local_points'] = unproject_depth_to_local_points(
-                    working_window.pop('local_points')[..., -1],
-                    ref_intrinsic
-                )
-
                 # 3️⃣ 创建首窗口分割图
                 if self.anchor_enabled:
                     tgt_sp_graph = self._build_segment_graph(
@@ -374,8 +381,25 @@ class StreamingWindowEngine(VanillaEngine):
         self.running = True
 
     # 提交窗口
-    def forward(self, sample, **kwargs):
-        self.inference_queue.put(sample)
+    def forward(self, sample, *, window_spec: WindowSpec):
+        if not isinstance(window_spec, WindowSpec):
+            raise ValueError("window_spec must be a WindowSpec")
+        if window_spec.index != self._submitted_window_count:
+            raise ValueError(
+                "window specs must be submitted once in canonical order"
+            )
+        if (
+            not isinstance(sample, torch.Tensor)
+            or sample.ndim != 4
+            or sample.shape[0] != window_spec.frame_count
+        ):
+            raise ValueError(
+                "window tensor does not match its WindowSpec"
+            )
+        self._submitted_window_count += 1
+        self.inference_queue.put(
+            WindowRequest(spec=window_spec, images=sample)
+        )
 
     # 结束引擎
     def end(self):

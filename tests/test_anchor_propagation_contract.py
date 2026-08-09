@@ -7,6 +7,7 @@ from inference_engine.streaming_window_engine import (
     STOP_SIGNAL,
     StreamingWindowEngine,
 )
+from inference_engine.prediction_cache.types import WindowSpec
 from inference_engine.utils.depth import match_segmentation_seq
 from pipeline.config import SegmentationMethod
 
@@ -126,14 +127,15 @@ def test_each_window_transition_invokes_one_anchor_propagator_once(
     monkeypatch.setattr(
         engine_module,
         "estimate_pseudo_depth_and_intrinsics",
-        lambda points: (points[..., 2], torch.eye(3)[None]),
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("provider already normalized the intrinsic")
+        ),
     )
     monkeypatch.setattr(
         engine_module,
         "unproject_depth_to_local_points",
-        lambda depth, intrinsic: torch.stack(
-            (torch.zeros_like(depth), torch.zeros_like(depth), depth),
-            dim=-1,
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("provider already unprojected local points")
         ),
     )
     monkeypatch.setattr(
@@ -148,8 +150,12 @@ def test_each_window_transition_invokes_one_anchor_propagator_once(
     )
     engine._save_cache = lambda: None
 
-    engine.registration_queue.put((_window(), 0.0))
-    engine.registration_queue.put((_window(), 0.0))
+    engine.registration_queue.put(
+        (WindowSpec(0, 0, 2), _window(), 0.0)
+    )
+    engine.registration_queue.put(
+        (WindowSpec(1, 1, 3), _window(), 0.0)
+    )
     engine.registration_queue.put(STOP_SIGNAL)
     engine._registration_worker()
 

@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from inference_engine.segmentation import SegmentationResult
+from inference_engine.prediction_cache.types import WindowSpec
 from inference_engine.streaming_window_engine import STOP_SIGNAL
 from inference_engine.utils.geometry import (
     accumulate_sim3,
@@ -24,7 +25,16 @@ from loop_closure.methods.registry import (
     LOOP_STRATEGIES,
     build_loop_strategy,
 )
-from pipeline.config import LoopMethod, SegmentationMethod, load_pipeline_config
+from pipeline.config import (
+    LoopMethod,
+    ModelName,
+    SegmentationMethod,
+    load_pipeline_config,
+)
+
+
+PREDICTION_KEY = "prediction-key"
+CHECKPOINT_DIGEST = "a" * 64
 
 
 def sim3(scale=1.0, translation=None):
@@ -89,16 +99,23 @@ def run_corrected_windows(monkeypatch, tmp_path, count=3):
         intermediate_device="cpu",
         process_device="cpu",
         benchmark_latency=False,
+        prediction_key=PREDICTION_KEY,
+        model_name=ModelName.PI3,
+        checkpoint_digest=CHECKPOINT_DIGEST,
     )
     monkeypatch.setattr(
         corrected_module,
         "estimate_pseudo_depth_and_intrinsics",
-        lambda points: (points[..., 2], torch.eye(3)[None]),
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("provider already normalized the intrinsic")
+        ),
     )
     monkeypatch.setattr(
         corrected_module,
         "unproject_depth_to_local_points",
-        lambda depth, intrinsic: depth[..., None].repeat(1, 1, 1, 3),
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("provider already unprojected local points")
+        ),
     )
     registration_sources = []
     registration_scales = iter((2.0, 4.0))
@@ -117,8 +134,14 @@ def run_corrected_windows(monkeypatch, tmp_path, count=3):
         caches.append(engine.prev_window_cache),
         setattr(engine, "cache_id", engine.cache_id + 1),
     )
-    for _ in range(count):
-        engine.registration_queue.put((make_window(), 0.0))
+    for index in range(count):
+        engine.registration_queue.put(
+            (
+                WindowSpec(index, index, index + 2),
+                make_window(),
+                0.0,
+            )
+        )
     engine.registration_queue.put(STOP_SIGNAL)
     engine._registration_worker()
     return engine, caches, registration_sources
@@ -187,6 +210,9 @@ def corrected_caches():
     first = WindowCache(
         schema_version=WINDOW_CACHE_SCHEMA_VERSION,
         loop_method=LoopMethod.CORRECTED,
+        prediction_key=PREDICTION_KEY,
+        model_name=ModelName.PI3,
+        checkpoint_digest=CHECKPOINT_DIGEST,
         window_index=0,
         frame_start=0,
         frame_end=2,
@@ -207,6 +233,9 @@ def corrected_caches():
     second = WindowCache(
         schema_version=WINDOW_CACHE_SCHEMA_VERSION,
         loop_method=LoopMethod.CORRECTED,
+        prediction_key=PREDICTION_KEY,
+        model_name=ModelName.PI3,
+        checkpoint_digest=CHECKPOINT_DIGEST,
         window_index=1,
         frame_start=1,
         frame_end=3,

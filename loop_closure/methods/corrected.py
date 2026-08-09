@@ -98,14 +98,18 @@ class CorrectedWindowEngine(StreamingWindowEngine):
         self.cache_id += 1
 
     def _registration_worker(self):
-        ref_intrinsic = None
         target_graph = None
 
         while True:
             item = self.registration_queue.get()
             if item is STOP_SIGNAL:
                 return
-            working_window, inference_duration = item
+            spec, working_window, inference_duration = item
+            if spec.index != self.cache_id:
+                raise ValueError(
+                    "corrected windows must be registered in "
+                    "WindowSpec order"
+                )
             started = time.perf_counter()
             for key in tuple(working_window):
                 if isinstance(working_window[key], torch.Tensor):
@@ -118,16 +122,6 @@ class CorrectedWindowEngine(StreamingWindowEngine):
             anchor_scale_mask = None
 
             if self.prev_window_cache is None:
-                _, intrinsic = estimate_pseudo_depth_and_intrinsics(
-                    working_window["local_points"]
-                )
-                ref_intrinsic = intrinsic[0]
-                working_window["local_points"] = (
-                    unproject_depth_to_local_points(
-                        working_window["local_points"][..., -1],
-                        ref_intrinsic,
-                    )
-                )
                 sim3_abs = _identity_sim3_like()
                 loop_state = {
                     "tag": LoopMethod.CORRECTED.value,
@@ -141,12 +135,6 @@ class CorrectedWindowEngine(StreamingWindowEngine):
                         working_window.get("images"),
                     )
             else:
-                working_window["local_points"] = (
-                    unproject_depth_to_local_points(
-                        working_window["local_points"][..., -1],
-                        ref_intrinsic,
-                    )
-                )
                 previous_mask = shared.select_top_confidence_mask(
                     self.prev_window_cache.confidence[-self.overlap :],
                     self.registration_confidence_keep_ratio,
@@ -227,7 +215,11 @@ class CorrectedWindowEngine(StreamingWindowEngine):
                 }
 
             frame_count = int(working_window["local_points"].shape[0])
-            frame_start = self.cache_id * (self.window_size - self.overlap)
+            if frame_count != spec.frame_count:
+                raise ValueError(
+                    "corrected prediction frame count does not match "
+                    "WindowSpec"
+                )
             labels = (
                 ()
                 if self.last_segmentation_results is None
@@ -247,9 +239,12 @@ class CorrectedWindowEngine(StreamingWindowEngine):
             cache = WindowCache(
                 schema_version=WINDOW_CACHE_SCHEMA_VERSION,
                 loop_method=LoopMethod.CORRECTED,
-                window_index=self.cache_id,
-                frame_start=frame_start,
-                frame_end=frame_start + frame_count,
+                prediction_key=self.prediction_key,
+                model_name=self.model_name,
+                checkpoint_digest=self.checkpoint_digest,
+                window_index=spec.index,
+                frame_start=spec.frame_start,
+                frame_end=spec.frame_end,
                 local_points=working_window["local_points"],
                 camera_poses=working_window["camera_poses"],
                 confidence=working_window["conf"],
