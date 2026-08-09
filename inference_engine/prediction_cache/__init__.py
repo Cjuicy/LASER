@@ -2,6 +2,7 @@ from .fingerprint import (
     PredictionFingerprint,
     build_prediction_fingerprint,
 )
+from .provider import OrdinaryPredictionProvider
 from .store import (
     OrdinaryPredictionStore,
     PredictionCacheCorruptError,
@@ -20,6 +21,7 @@ from .types import (
 __all__ = [
     "PredictionFingerprint",
     "build_prediction_fingerprint",
+    "OrdinaryPredictionProvider",
     "OrdinaryPredictionStore",
     "PredictionCacheCorruptError",
     "PredictionCacheMissError",
