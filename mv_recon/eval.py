@@ -11,7 +11,10 @@ from dataclasses import replace
 from omegaconf import DictConfig
 from pi3.models.pi3 import Pi3
 from pipeline.config import LoopMethod, load_pipeline_config
-from pipeline.runner import build_default_window_engine
+from pipeline.runner import (
+    StreamingPipelineModel,
+    require_local_model_checkpoint,
+)
 from utils.interfaces import infer_mv_pointclouds, infer_streaming_mv_pointclouds
 from mv_recon.eval_utils import umeyama, accuracy, completion
 from utils.messages import set_default_arg, write_csv
@@ -34,12 +37,15 @@ def create_pi3(cfg):
 
 def create_streaming_pi3(cfg):
     pretrained_model_name_or_path: str = cfg.pi3.pretrained_model_name_or_path
-    pi3 = Pi3.from_pretrained(pretrained_model_name_or_path)
     config = load_pipeline_config("configs/pipeline/default.yaml").config
+    local_checkpoint = require_local_model_checkpoint(
+        pretrained_model_name_or_path
+    )
     config = replace(
         config,
         model=replace(
             config.model,
+            checkpoint=local_checkpoint,
             inference_device=str(cfg.device),
             process_device="cpu",
             dtype=(
@@ -64,7 +70,7 @@ def create_streaming_pi3(cfg):
         ),
         output=replace(config.output, cache_dir="cache/"),
     )
-    return build_default_window_engine(config, pi3).eval()
+    return StreamingPipelineModel(config).eval()
 
 
 @hydra.main(version_base="1.2", config_path="../configs", config_name="eval_mv_recon_dense")

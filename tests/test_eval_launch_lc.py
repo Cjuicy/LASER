@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import sys
 import types
@@ -49,14 +50,52 @@ class RecordingLoopStrategy:
 
 
 class FakeEngine:
-    def __init__(self, delegate, config, loop_strategy):
-        self.delegate = delegate
+    def __init__(self, model_handle, config, loop_strategy):
+        self.model_handle = model_handle
         self.pipeline_config = config
         self.loop_strategy = loop_strategy
 
 
+def test_eval_launch_does_not_import_pi3_directly():
+    source = Path(eval_launch.__file__).read_text(encoding="utf-8")
+    assert "from pi3.models.pi3 import Pi3" not in source
+
+
+def test_legacy_streaming_entrypoints_do_not_use_obsolete_signatures():
+    repository_root = Path(__file__).resolve().parents[1]
+    sources = {
+        relative_path: (
+            repository_root / relative_path
+        ).read_text(encoding="utf-8")
+        for relative_path in (
+            "mv_recon/eval.py",
+            "mv_recon/eval_outdoor.py",
+            "utils/interfaces.py",
+        )
+    }
+    assert "build_default_window_engine(config, pi3)" not in (
+        sources["mv_recon/eval.py"]
+    )
+    assert "build_default_window_engine(config, pi3)" not in (
+        sources["mv_recon/eval_outdoor.py"]
+    )
+    assert (
+        "run_windows(inference_engine, manifest, imgs, config)"
+        not in sources["utils/interfaces.py"]
+    )
+
+
+def test_baseline_evaluation_uses_model_directly():
+    model = object()
+    assert eval_launch._select_inference_function("pi3", model) is model
+
+
 def test_legacy_evaluation_builds_estimator_only_for_candidates(monkeypatch):
     config = load_pipeline_config("configs/pipeline/test.yaml").config
+    config = replace(
+        config,
+        window=replace(config.window, size=2, overlap=1),
+    )
     manifest = ImageManifest(
         paths=(Path("frame_00000000.png"), Path("frame_00000001.png"))
     )
@@ -71,7 +110,7 @@ def test_legacy_evaluation_builds_estimator_only_for_candidates(monkeypatch):
     monkeypatch.setattr(
         eval_launch,
         "run_windows",
-        lambda model, manifest, images, config: (object(),),
+        lambda model, manifest, images, specs, config: (object(),),
     )
     monkeypatch.setattr(
         eval_launch,
@@ -82,7 +121,7 @@ def test_legacy_evaluation_builds_estimator_only_for_candidates(monkeypatch):
     )
     monkeypatch.setattr(
         eval_launch,
-        "JointPi3AlignmentEstimator",
+        "JointAlignmentEstimator",
         build_estimator,
     )
 

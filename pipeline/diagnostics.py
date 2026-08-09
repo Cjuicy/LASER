@@ -17,7 +17,7 @@ from loop_closure.methods.base import (
     ReconstructionResult,
     WindowCache,
 )
-from pipeline.config import LoadedPipelineConfig
+from pipeline.config import LoadedPipelineConfig, PipelineConfig
 from pipeline.manifest import ImageManifest
 
 
@@ -127,6 +127,35 @@ def summarize_split_diagnostics(
     return totals
 
 
+def collect_prediction_diagnostics(
+    *,
+    config: PipelineConfig,
+    fingerprint,
+    model,
+    store,
+) -> dict[str, object]:
+    model_stats = model.stats
+    store_stats = store.stats
+    return {
+        "model_name": config.model.name.value,
+        "checkpoint_digest": fingerprint.checkpoint_sha256,
+        "ordinary_prediction_key": fingerprint.key,
+        "prediction_cache_mode": config.prediction_cache.mode.value,
+        "model_constructed": bool(model_stats.model_constructed),
+        "ordinary_hits": int(store_stats.ordinary_hits),
+        "ordinary_misses": int(store_stats.ordinary_misses),
+        "ordinary_forward_count": int(
+            model_stats.ordinary_forward_count
+        ),
+        "joint_forward_count": int(model_stats.joint_forward_count),
+        "corrupt_count": int(store_stats.corrupt_count),
+        "prediction_cache_read_ms": float(store_stats.read_ms),
+        "prediction_cache_write_ms": float(store_stats.write_ms),
+        "saved_window_count": int(store_stats.saved_window_count),
+        "stored_bytes": int(store_stats.stored_bytes),
+    }
+
+
 def write_diagnostics(
     output_root: str | Path,
     loaded: LoadedPipelineConfig,
@@ -139,6 +168,7 @@ def write_diagnostics(
     *,
     git_commit: str,
     stage_timings_ms: Mapping[str, float],
+    prediction_diagnostics: Mapping[str, object],
 ) -> dict[str, object]:
     output_path = Path(output_root)
     segmentation = collect_segmentation_diagnostics(caches)
@@ -160,6 +190,7 @@ def write_diagnostics(
         "used_no_loop_path": solution.used_no_loop_path,
         "split_totals": split_totals,
         "stage_timings_ms": dict(stage_timings_ms),
+        **dict(prediction_diagnostics),
     }
     _atomic_write_json(output_path / "run_summary.json", summary)
     _atomic_write_json(

@@ -1,20 +1,21 @@
 from eval.pose_eval import eval_pose_estimation
 from eval.depth_eval import eval_mono_depth_estimation
-from pi3.models.pi3 import Pi3
 from inference_engine import VanillaEngine
 from loop_closure.methods import detect_loop_candidates
-from loop_closure.constraint_estimation import JointPi3AlignmentEstimator
+from loop_closure.constraint_estimation import JointAlignmentEstimator
 from pipeline.config import (
     LoopMethod,
     load_pipeline_config,
 )
 from pipeline.manifest import ImageManifest
 from pipeline.runner import (
-    build_default_window_engine,
+    build_model_handle,
     complete_reconstruction_payload,
-    resolve_model_dtype,
     run_windows,
+    StreamingPipelineModel,
 )
+from inference_engine.prediction_cache.types import build_window_specs
+from contextlib import nullcontext
 from functools import partial
 from dataclasses import replace
 import eval.misc as misc  # noqa
@@ -113,13 +114,26 @@ dtype = (
 )
 
 
-def build_streaming_eval_engine(delegate, config):
-    return build_default_window_engine(config, delegate)
-
-
 def _run_modular_evaluation(model, imgs, manifest, detect_loops):
-    config = model.pipeline_config
-    caches = run_windows(model, manifest, imgs, config)
+    engine = (
+        model.prepare(imgs, manifest)
+        if isinstance(model, StreamingPipelineModel)
+        else model
+    )
+    config = engine.pipeline_config
+    specs = getattr(
+        engine,
+        "window_specs",
+        build_window_specs(
+            len(manifest),
+            config.window.size,
+            config.window.overlap,
+        ),
+    )
+    store = getattr(engine, "prediction_store", None)
+    lock = store.entry_lock() if store is not None else nullcontext()
+    with lock:
+        caches = run_windows(engine, manifest, imgs, specs, config)
     candidates = (
         detect_loop_candidates(
             config.loop.detection,
@@ -130,27 +144,25 @@ def _run_modular_evaluation(model, imgs, manifest, detect_loops):
         else ()
     )
     constraint_estimator = (
-        JointPi3AlignmentEstimator(
-            model=model.delegate,
+        JointAlignmentEstimator(
+            model=engine.model_handle,
             images=imgs,
             manifest=manifest,
             chunk_size=config.loop.constraint.chunk_size,
             confidence_keep_ratio=(
                 config.loop.registration.confidence_keep_ratio
             ),
-            inference_device=config.model.inference_device,
-            dtype=resolve_model_dtype(config.model.dtype),
         )
         if candidates
         else None
     )
-    constraints = model.loop_strategy.build_constraints(
+    constraints = engine.loop_strategy.build_constraints(
         caches,
         candidates,
         constraint_estimator=constraint_estimator,
     )
-    solution = model.loop_strategy.optimize(caches, constraints)
-    result = model.loop_strategy.aggregate(caches, solution)
+    solution = engine.loop_strategy.optimize(caches, constraints)
+    result = engine.loop_strategy.aggregate(caches, solution)
     result = complete_reconstruction_payload(result, imgs)
     return {
         key: value.detach().cpu()
@@ -160,9 +172,26 @@ def _run_modular_evaluation(model, imgs, manifest, detect_loops):
     }
 
 
-def inference_streaming_model(model, imgs, *args, **kwargs):
+def inference_streaming_model(
+    model,
+    imgs,
+    img_dir=None,
+    image_paths=None,
+    *args,
+    **kwargs,
+):
+    if image_paths is None:
+        raise ValueError(
+            "streaming evaluation requires the exact image_paths "
+            "used to build imgs"
+        )
+    if len(image_paths) != len(imgs):
+        raise ValueError(
+            "image manifest length does not match evaluation tensor: "
+            f"{len(image_paths)} != {len(imgs)}"
+        )
     manifest = ImageManifest(
-        paths=tuple(Path(f"frame_{index:08d}") for index in range(len(imgs)))
+        paths=tuple(Path(path).resolve() for path in image_paths)
     )
     return _run_modular_evaluation(
         model,
@@ -202,6 +231,16 @@ def inference_streaming_model_lc(
     )
 
 
+def _select_inference_function(model_kind, model):
+    if model_kind == "pi3":
+        return model
+    if model_kind == "streaming_pi3":
+        return partial(inference_streaming_model, model)
+    if model_kind == "streaming_pi3_lc":
+        return partial(inference_streaming_model_lc, model)
+    raise ValueError(f"unsupported evaluation model kind: {model_kind!r}")
+
+
 def pi3_main(args):
     print('Launching Pi3 eval')
     misc.init_distributed_mode(args)
@@ -212,21 +251,23 @@ def pi3_main(args):
     np.random.seed(seed)
     cudnn.benchmark = args.cudnn_benchmark
 
-    delegate = Pi3.from_pretrained("yyfz233/Pi3").to(device)
+    config = load_pipeline_config(args.pipeline_config).config
+    runtime_model = replace(
+        config.model,
+        checkpoint=args.ckpt_path or config.model.checkpoint,
+        inference_device=device,
+        process_device="cpu",
+        dtype=(
+            "bfloat16"
+            if dtype is torch.bfloat16
+            else "float16"
+        ),
+    )
     if args.model == 'pi3':
-        model = VanillaEngine(delegate)
-    else:
-        config = load_pipeline_config(args.pipeline_config).config
-        runtime_model = replace(
-            config.model,
-            inference_device=device,
-            process_device="cpu",
-            dtype=(
-                "bfloat16"
-                if dtype is torch.bfloat16
-                else "float16"
-            ),
+        model = VanillaEngine(
+            build_model_handle(runtime_model).get()
         )
+    else:
         runtime_loop = config.loop
         if args.model == 'streaming_pi3':
             runtime_loop = replace(
@@ -243,15 +284,12 @@ def pi3_main(args):
                 cache_dir=str(Path(args.output_dir) / "inference_cache"),
             ),
         )
-        model = build_streaming_eval_engine(delegate, runtime_config)
+        model = StreamingPipelineModel(runtime_config)
     model.eval()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.model == 'streaming_pi3':
-        infer_func = partial(inference_streaming_model, model)
-    else:
-        infer_func = partial(inference_streaming_model_lc, model)
+    infer_func = _select_inference_function(args.model, model)
     if args.mode == 'eval_pose':
         ate_mean, rpe_trans_mean, rpe_rot_mean, seq_attr, outfile_list, bug = eval_pose_estimation(
             args,

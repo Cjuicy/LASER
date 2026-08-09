@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
 from inference_engine.streaming_window_engine import StreamingWindowEngine
+from inference_engine.prediction_cache.types import WindowSpec
+from inference_engine.models.lazy import ModelExecutionStats
+from inference_engine.prediction_cache.fingerprint import (
+    PredictionFingerprint,
+)
+from inference_engine.prediction_cache.store import PredictionStoreStats
 from loop_closure.methods.base import (
     WINDOW_CACHE_SCHEMA_VERSION,
     LoopCandidate,
@@ -16,12 +24,15 @@ from loop_closure.methods.base import (
     ReconstructionResult,
     WindowCache,
 )
-from pipeline.config import LoopMethod, load_pipeline_config
+from pipeline.config import LoopMethod, ModelName, load_pipeline_config
 from pipeline.runner import (
     PipelineDependencies,
     PipelineRunner,
+    require_local_model_checkpoint,
+    run_windows,
     run_from_config,
 )
+from pipeline.manifest import ImageManifest
 from run_laser import build_parser
 
 
@@ -43,6 +54,12 @@ class RecordingState:
     )
     loaded_models: list[object] = field(default_factory=list)
     loaded_images: list[torch.Tensor] = field(default_factory=list)
+    window_specs: list[tuple[WindowSpec, ...]] = field(
+        default_factory=list
+    )
+    engine_dependencies: list[dict[str, object]] = field(
+        default_factory=list
+    )
 
 
 class RecordingLoopStrategy:
@@ -52,7 +69,12 @@ class RecordingLoopStrategy:
 
     def create_window_engine(self, **dependencies):
         self.state.calls.append("create_window_engine")
-        return object()
+        self.state.engine_dependencies.append(dependencies)
+        return SimpleNamespace(
+            prediction_key="prediction-key",
+            model_name=ModelName.PI3,
+            checkpoint_digest="a" * 64,
+        )
 
     def build_constraints(
         self,
@@ -116,6 +138,9 @@ def _cache(method, frame_count=3):
     return WindowCache(
         schema_version=WINDOW_CACHE_SCHEMA_VERSION,
         loop_method=method,
+        prediction_key="prediction-key",
+        model_name=ModelName.PI3,
+        checkpoint_digest="a" * 64,
         window_index=0,
         frame_start=0,
         frame_end=frame_count,
@@ -138,11 +163,43 @@ def recording_dependencies(state, *, candidates=()):
     def preflight(config, manifest, cuda_available):
         state.calls.append("preflight")
 
-    def load_pi3(config):
-        state.calls.append("load_pi3")
-        model = object()
-        state.loaded_models.append(model)
-        return model
+    def build_model_handle(config):
+        state.calls.append("build_model_handle")
+        handle = SimpleNamespace(stats=ModelExecutionStats())
+        state.loaded_models.append(handle)
+        return handle
+
+    def build_fingerprint(**kwargs):
+        state.calls.append("build_fingerprint")
+        return PredictionFingerprint(
+            key="prediction-key",
+            checkpoint_sha256="a" * 64,
+            image_manifest_sha256="b" * 64,
+            runtime_source_sha256="c" * 64,
+            canonical_payload={"model_name": "pi3"},
+        )
+
+    def build_store(**kwargs):
+        state.calls.append("build_prediction_store")
+
+        @contextmanager
+        def entry_lock():
+            state.calls.append("prediction_entry_lock_enter")
+            try:
+                yield
+            finally:
+                state.calls.append("prediction_entry_lock_exit")
+
+        return SimpleNamespace(
+            stats=PredictionStoreStats(),
+            mode=kwargs["mode"],
+            entry_path=Path(kwargs["root"]) / "v2" / "prediction-key",
+            entry_lock=entry_lock,
+        )
+
+    def build_provider(**kwargs):
+        state.calls.append("build_prediction_provider")
+        return SimpleNamespace(**kwargs)
 
     def build_segmenter(config):
         state.segmentation_calls.append(config.method.value)
@@ -157,8 +214,9 @@ def recording_dependencies(state, *, candidates=()):
         state.loop_calls.append(method.value)
         return RecordingLoopStrategy(method, state)
 
-    def run_windows(engine, manifest, images, config):
+    def run_windows(engine, manifest, images, specs, config):
         state.inference_manifests.append(manifest)
+        state.window_specs.append(tuple(specs))
         assert images.shape[0] == len(manifest)
         return (_cache(config.loop.method, len(manifest)),)
 
@@ -176,7 +234,10 @@ def recording_dependencies(state, *, candidates=()):
 
     return PipelineDependencies(
         validate_preflight=preflight,
-        load_pi3=load_pi3,
+        build_model_handle=build_model_handle,
+        build_prediction_fingerprint=build_fingerprint,
+        build_prediction_store=build_store,
+        build_prediction_provider=build_provider,
         load_images=load_images,
         build_segmentation_strategy=build_segmenter,
         build_loop_strategy=build_loop,
@@ -244,7 +305,9 @@ def test_runner_selects_requested_strategies(
     assert result.summary["loop_method"] == loop_method
 
 
-def test_preflight_runs_before_model_loader(tmp_path):
+def test_preflight_runs_before_prediction_fingerprint_and_model_handle(
+    tmp_path,
+):
     state = RecordingState()
     config_path, overrides, _ = _pipeline_args(tmp_path)
     run_from_config(
@@ -252,7 +315,12 @@ def test_preflight_runs_before_model_loader(tmp_path):
         overrides,
         dependencies=recording_dependencies(state),
     )
-    assert state.calls.index("preflight") < state.calls.index("load_pi3")
+    assert state.calls.index("preflight") < state.calls.index(
+        "build_fingerprint"
+    )
+    assert state.calls.index("preflight") < state.calls.index(
+        "build_model_handle"
+    )
 
 
 def test_preflight_failure_prevents_model_loading(tmp_path):
@@ -276,21 +344,8 @@ def test_preflight_failure_prevents_model_loading(tmp_path):
             overrides,
             dependencies=dependencies,
         )
-    assert "load_pi3" not in state.calls
-
-
-def test_invalid_model_name_prevents_model_loading(tmp_path):
-    state = RecordingState()
-    config_path, overrides, _ = _pipeline_args(tmp_path)
-
-    with pytest.raises(ValueError, match="model.name"):
-        run_from_config(
-            config_path,
-            (*overrides, "model.name=pi3x"),
-            dependencies=recording_dependencies(state),
-        )
-
-    assert state.loaded_models == []
+    assert "build_model_handle" not in state.calls
+    assert "build_fingerprint" not in state.calls
 
 
 def test_same_manifest_instance_reaches_inference_and_salad(tmp_path):
@@ -302,6 +357,7 @@ def test_same_manifest_instance_reaches_inference_and_salad(tmp_path):
         dependencies=recording_dependencies(state),
     )
     assert state.inference_manifests[0] is state.salad_manifests[0]
+    assert state.window_specs[0] == (WindowSpec(0, 0, 3),)
 
 
 def test_no_loop_candidates_skip_constraint_model_and_optimizer(tmp_path):
@@ -316,6 +372,7 @@ def test_no_loop_candidates_skip_constraint_model_and_optimizer(tmp_path):
     assert state.constraint_model_calls == 0
     assert state.optimizer_calls == 0
     assert result.summary["used_no_loop_path"] is True
+    assert state.loaded_models[0].stats.model_constructed is False
 
 
 def test_runner_builds_estimator_with_active_pipeline_inputs(tmp_path):
@@ -346,9 +403,65 @@ def test_runner_builds_estimator_with_active_pipeline_inputs(tmp_path):
     assert kwargs["manifest"] is state.inference_manifests[0]
     assert kwargs["chunk_size"] == 20
     assert kwargs["confidence_keep_ratio"] == pytest.approx(0.30)
-    assert kwargs["inference_device"] == "cpu"
-    assert kwargs["dtype"] is torch.float32
     assert state.constraint_estimators == [sentinel_estimator]
+
+
+def test_runner_builds_provider_before_selected_window_engine(tmp_path):
+    state = RecordingState()
+    config_path, overrides, _ = _pipeline_args(tmp_path)
+
+    run_from_config(
+        config_path,
+        overrides,
+        dependencies=recording_dependencies(state),
+    )
+
+    assert state.calls.index("build_prediction_provider") < state.calls.index(
+        "create_window_engine"
+    )
+    dependencies = state.engine_dependencies[0]
+    assert dependencies["delegate"].model is state.loaded_models[0]
+    assert dependencies["prediction_key"] == "prediction-key"
+    assert dependencies["model_name"] is ModelName.PI3
+    assert dependencies["checkpoint_digest"] == "a" * 64
+
+
+def test_runner_holds_prediction_entry_lock_while_running_windows(tmp_path):
+    state = RecordingState()
+    dependencies = recording_dependencies(state)
+    original_run_windows = dependencies.run_windows
+
+    def assert_locked(engine, manifest, images, specs, config):
+        assert state.calls[-1] == "prediction_entry_lock_enter"
+        state.calls.append("run_windows")
+        return original_run_windows(
+            engine,
+            manifest,
+            images,
+            specs,
+            config,
+        )
+
+    dependencies = PipelineDependencies(
+        **{
+            **dependencies.__dict__,
+            "run_windows": assert_locked,
+        }
+    )
+    config_path, overrides, _ = _pipeline_args(tmp_path)
+
+    run_from_config(
+        config_path,
+        overrides,
+        dependencies=dependencies,
+    )
+
+    assert state.calls.index("prediction_entry_lock_enter") < (
+        state.calls.index("run_windows")
+    )
+    assert state.calls.index("run_windows") < state.calls.index(
+        "prediction_entry_lock_exit"
+    )
 
 
 def test_diagnostics_contain_resolved_config_hash(tmp_path):
@@ -369,6 +482,12 @@ def test_diagnostics_contain_resolved_config_hash(tmp_path):
         (output_root / "run_summary.json").read_text(encoding="utf-8")
     )
     assert summary["config_hash"] == loaded.sha256
+    assert summary["model_name"] == "pi3"
+    assert summary["ordinary_prediction_key"] == "prediction-key"
+    assert summary["prediction_cache_mode"] == "auto"
+    assert summary["model_constructed"] is False
+    assert summary["ordinary_forward_count"] == 0
+    assert summary["joint_forward_count"] == 0
     assert {
         "loop_candidates.json",
         "loop_constraints.json",
@@ -389,8 +508,37 @@ def test_cli_parser_rejects_legacy_method_flags():
         )
 
 
+def test_streaming_checkpoint_rejects_hugging_face_repository_id():
+    with pytest.raises(FileNotFoundError, match="local checkpoint"):
+        require_local_model_checkpoint("yyfz233/Pi3")
+
+
+def test_run_windows_rejects_image_manifest_mismatch_before_begin(tmp_path):
+    class MustNotBegin:
+        def begin(self):
+            raise AssertionError("engine must not begin")
+
+    manifest = ImageManifest(
+        paths=tuple(tmp_path / f"{index}.png" for index in range(3))
+    )
+    config_path, overrides, _ = _pipeline_args(tmp_path)
+    config = load_pipeline_config(config_path, overrides).config
+
+    with pytest.raises(
+        ValueError,
+        match="images must have shape",
+    ):
+        run_windows(
+            MustNotBegin(),
+            manifest,
+            torch.zeros((2, 3, 2, 2)),
+            (WindowSpec(0, 0, 3),),
+            config,
+        )
+
+
 class RaisingDelegate(torch.nn.Module):
-    def forward(self, sample):
+    def get(self, spec, sample):
         raise ValueError("delegate exploded")
 
 
@@ -417,7 +565,10 @@ def test_background_worker_exception_propagates_to_main_thread(tmp_path):
         benchmark_latency=False,
     )
     engine.begin()
-    engine(torch.zeros((2, 3, 2, 2)))
+    engine(
+        torch.zeros((2, 3, 2, 2)),
+        window_spec=WindowSpec(0, 0, 2),
+    )
     with pytest.raises(RuntimeError, match="model inference worker"):
         engine.end()
     assert engine.running is False

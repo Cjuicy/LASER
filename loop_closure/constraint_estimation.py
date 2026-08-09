@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from contextlib import nullcontext
 
 import torch
 
 from inference_engine.inference_utils import register_adjacent_windows
+from inference_engine.models.lazy import (
+    LazyModelHandle,
+    ModelForwardKind,
+)
 from inference_engine.utils.registration_confidence import (
     intersect_confidence_masks,
     select_top_confidence_mask,
@@ -37,37 +40,39 @@ def centered_frame_range(
     return start, start + size
 
 
-class JointPi3AlignmentEstimator:
+class JointAlignmentEstimator:
     def __init__(
         self,
-        model: torch.nn.Module,
+        model: LazyModelHandle,
         images: torch.Tensor,
         manifest: ImageManifest,
-        inference_device: str | torch.device,
-        dtype: torch.dtype,
         chunk_size: int,
         confidence_keep_ratio: float,
     ) -> None:
-        if not isinstance(model, torch.nn.Module):
-            raise ValueError("joint Pi3 model must be a torch.nn.Module")
+        if not isinstance(model, LazyModelHandle):
+            raise ValueError(
+                "joint alignment model must be a LazyModelHandle"
+            )
         if not isinstance(images, torch.Tensor) or images.ndim != 4:
-            raise ValueError("joint Pi3 images must have shape (frames, C, H, W)")
+            raise ValueError(
+                "joint alignment images must have shape (frames, C, H, W)"
+            )
         if not isinstance(manifest, ImageManifest):
-            raise ValueError("joint Pi3 manifest must be an ImageManifest")
+            raise ValueError(
+                "joint alignment manifest must be an ImageManifest"
+            )
         if images.shape[0] != len(manifest):
-            raise ValueError("joint Pi3 image and manifest lengths must match")
+            raise ValueError(
+                "joint alignment image and manifest lengths must match"
+            )
         if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
             raise ValueError("loop constraint chunk_size must be an integer")
         if chunk_size < 1:
             raise ValueError("loop constraint chunk_size must be at least 1")
-        if not isinstance(dtype, torch.dtype):
-            raise ValueError("joint Pi3 dtype must be a torch.dtype")
 
         self.model = model
         self.images = images
         self.manifest = manifest
-        self.inference_device = torch.device(inference_device)
-        self.dtype = dtype
         self.chunk_size = chunk_size
         self.confidence_keep_ratio = validate_confidence_keep_ratio(
             confidence_keep_ratio
@@ -104,9 +109,7 @@ class JointPi3AlignmentEstimator:
         )
         images_a = self.images[slice(*range_a)]
         images_b = self.images[slice(*range_b)]
-        joint_images = torch.cat((images_a, images_b), dim=0).to(
-            self.inference_device
-        )
+        joint_images = torch.cat((images_a, images_b), dim=0)
         prediction = self._predict(joint_images)
         side_a_count = range_a[1] - range_a[0]
         joint_a = self._prediction_side(prediction, 0, side_a_count)
@@ -120,25 +123,26 @@ class JointPi3AlignmentEstimator:
         return alignment_a, alignment_b
 
     def _predict(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        autocast_context = (
-            torch.autocast(self.inference_device.type, dtype=self.dtype)
-            if self.dtype in (torch.float16, torch.bfloat16)
-            else nullcontext()
+        prediction = self.model.predict(
+            images,
+            kind=ModelForwardKind.JOINT,
         )
-        with torch.no_grad(), autocast_context:
-            prediction = self.model(images)
         if not isinstance(prediction, Mapping):
-            raise ValueError("joint Pi3 prediction must be a mapping")
+            raise ValueError("joint alignment prediction must be a mapping")
 
         required = ("local_points", "camera_poses", "conf")
         result = {}
         for key in required:
             value = prediction.get(key)
             if not isinstance(value, torch.Tensor):
-                raise ValueError(f"joint Pi3 prediction is missing tensor {key!r}")
+                raise ValueError(
+                    "joint alignment prediction is missing tensor "
+                    f"{key!r}"
+                )
             if value.ndim < 1 or value.shape[0] != 1:
                 raise ValueError(
-                    f"joint Pi3 prediction {key!r} must have one model batch"
+                    f"joint alignment prediction {key!r} must have "
+                    "one model batch"
                 )
             result[key] = value.squeeze(0).detach().cpu()
         return result
@@ -151,7 +155,7 @@ class JointPi3AlignmentEstimator:
     ) -> dict[str, torch.Tensor]:
         side = {key: value[start:end] for key, value in prediction.items()}
         if any(value.shape[0] != end - start for value in side.values()):
-            raise ValueError("joint Pi3 prediction has too few frames")
+            raise ValueError("joint alignment prediction has too few frames")
         return side
 
     def _align_side(
@@ -177,7 +181,7 @@ class JointPi3AlignmentEstimator:
         mask = intersect_confidence_masks(
             cached_mask,
             joint_mask,
-            context=f"joint Pi3 {side_name} alignment",
+            context=f"joint {side_name} alignment",
         )
         alignment = register_adjacent_windows(
             cached_points,
@@ -186,5 +190,5 @@ class JointPi3AlignmentEstimator:
             joint["camera_poses"],
             mask,
         )
-        validate_sim3(alignment, context=f"joint Pi3 {side_name} alignment")
+        validate_sim3(alignment, context=f"joint {side_name} alignment")
         return alignment

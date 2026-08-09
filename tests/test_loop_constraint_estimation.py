@@ -8,15 +8,16 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from loop_closure.constraint_estimation import (
-    JointPi3AlignmentEstimator,
+    JointAlignmentEstimator,
     centered_frame_range,
 )
+from inference_engine.models.lazy import LazyModelHandle
 from loop_closure.methods.base import (
     WINDOW_CACHE_SCHEMA_VERSION,
     LoopCandidate,
     WindowCache,
 )
-from pipeline.config import LoopMethod
+from pipeline.config import LoopMethod, ModelName
 from pipeline.manifest import ImageManifest
 
 
@@ -71,6 +72,9 @@ def _cache(frame_start, frame_end, window_index):
     return WindowCache(
         schema_version=WINDOW_CACHE_SCHEMA_VERSION,
         loop_method=LoopMethod.TRADITIONAL,
+        prediction_key="prediction-key",
+        model_name=ModelName.PI3,
+        checkpoint_digest="a" * 64,
         window_index=window_index,
         frame_start=frame_start,
         frame_end=frame_end,
@@ -98,12 +102,15 @@ def _manifest(frame_count=10):
 
 
 def _estimator(model, images=None, manifest=None):
-    return JointPi3AlignmentEstimator(
-        model=model,
-        images=_images() if images is None else images,
-        manifest=_manifest() if manifest is None else manifest,
+    handle = LazyModelHandle(
+        lambda: model,
         inference_device="cpu",
         dtype=torch.float32,
+    )
+    return JointAlignmentEstimator(
+        model=handle,
+        images=_images() if images is None else images,
+        manifest=_manifest() if manifest is None else manifest,
         chunk_size=4,
         confidence_keep_ratio=0.5,
     )
@@ -143,6 +150,8 @@ def test_joint_estimator_infers_once_and_registers_each_cached_side(
         3.0,
     ]
     assert len(model.inputs) == 1
+    assert estimator.model.stats.ordinary_forward_count == 0
+    assert estimator.model.stats.joint_forward_count == 1
     assert len(registration_calls) == 2
     assert registration_calls[0].source_frame_count == 4
     assert registration_calls[0].target_frame_ids == [6.0, 7.0, 8.0, 9.0]
@@ -159,12 +168,14 @@ def test_joint_estimator_rejects_image_and_manifest_length_mismatch():
 
 def test_joint_estimator_rejects_legacy_image_manifest_keyword():
     with pytest.raises(TypeError, match="image_manifest"):
-        JointPi3AlignmentEstimator(
-            model=RecordingPi3(),
+        JointAlignmentEstimator(
+            model=LazyModelHandle(
+                lambda: RecordingPi3(),
+                inference_device="cpu",
+                dtype=torch.float32,
+            ),
             images=_images(),
             image_manifest=_manifest(),
-            inference_device="cpu",
-            dtype=torch.float32,
             chunk_size=4,
             confidence_keep_ratio=0.5,
         )
