@@ -28,6 +28,17 @@ class LoopMethod(str, Enum):
     CORRECTED = "corrected"
 
 
+class ModelName(str, Enum):
+    PI3 = "pi3"
+
+
+class PredictionCacheMode(str, Enum):
+    AUTO = "auto"
+    REFRESH = "refresh"
+    READONLY = "readonly"
+    OFF = "off"
+
+
 @dataclass(frozen=True)
 class InputConfig:
     image_dir: str = MISSING
@@ -44,10 +55,17 @@ class OutputConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    name: ModelName = MISSING
     checkpoint: str = MISSING
     inference_device: str = MISSING
     process_device: str = MISSING
     dtype: str = MISSING
+
+
+@dataclass(frozen=True)
+class PredictionCacheConfig:
+    root: str = MISSING
+    mode: PredictionCacheMode = MISSING
 
 
 @dataclass(frozen=True)
@@ -139,6 +157,9 @@ class PipelineConfig:
     input: InputConfig = field(default_factory=InputConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    prediction_cache: PredictionCacheConfig = field(
+        default_factory=PredictionCacheConfig
+    )
     window: WindowConfig = field(default_factory=WindowConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     anchor_propagation: AnchorPropagationConfig = field(
@@ -167,6 +188,8 @@ def _make_schema_mutable(node: object) -> None:
 
 def _normalize_enum_values(config: DictConfig) -> None:
     for path, enum_type in (
+        ("model.name", ModelName),
+        ("prediction_cache.mode", PredictionCacheMode),
         ("segmentation.method", SegmentationMethod),
         ("segmentation.atomic.split_mode", AtomicSplitMode),
         ("loop.method", LoopMethod),
@@ -174,6 +197,8 @@ def _normalize_enum_values(config: DictConfig) -> None:
         value = OmegaConf.select(config, path, default=None)
         if value is None or isinstance(value, enum_type):
             continue
+        if enum_type is PredictionCacheMode and value is False:
+            value = PredictionCacheMode.OFF.value
         try:
             normalized = enum_type(value)
         except (TypeError, ValueError) as exc:

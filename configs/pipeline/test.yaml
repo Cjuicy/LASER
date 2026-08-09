@@ -11,10 +11,15 @@ output:
   save_diagnostics: true
 
 model:
+  name: pi3
   checkpoint: weights/model.safetensors
   inference_device: cuda
   process_device: cpu
   dtype: bfloat16
+
+prediction_cache:
+  root: inference_cache/predictions
+  mode: auto
 
 window:
   size: 10

@@ -5,6 +5,8 @@ import pytest
 from pipeline.config import (
     AtomicSplitMode,
     LoopMethod,
+    ModelName,
+    PredictionCacheMode,
     SegmentationMethod,
     load_pipeline_config,
 )
@@ -15,6 +17,15 @@ DEFAULT = Path("configs/pipeline/default.yaml")
 
 def test_default_config_has_approved_methods_and_defaults():
     loaded = load_pipeline_config(DEFAULT)
+    assert loaded.config.model.name is ModelName.PI3
+    assert (
+        loaded.config.prediction_cache.mode
+        is PredictionCacheMode.AUTO
+    )
+    assert (
+        loaded.config.prediction_cache.root
+        == "inference_cache/predictions"
+    )
     assert loaded.config.segmentation.method is SegmentationMethod.ATOMIC
     assert (
         loaded.config.segmentation.atomic.split_mode
@@ -25,6 +36,39 @@ def test_default_config_has_approved_methods_and_defaults():
     assert loaded.config.segmentation.felzenszwalb.sigma == pytest.approx(1.1)
     assert loaded.config.segmentation.felzenszwalb.min_size == 500
     assert len(loaded.sha256) == 64
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    (
+        ("auto", PredictionCacheMode.AUTO),
+        ("refresh", PredictionCacheMode.REFRESH),
+        ("readonly", PredictionCacheMode.READONLY),
+        ("off", PredictionCacheMode.OFF),
+    ),
+)
+def test_prediction_cache_mode_override_selects_exact_behavior(
+    text,
+    expected,
+):
+    loaded = load_pipeline_config(
+        DEFAULT,
+        (f"prediction_cache.mode={text}",),
+    )
+    assert loaded.config.prediction_cache.mode is expected
+
+
+def test_non_pi3_model_name_is_rejected():
+    with pytest.raises(ValueError, match="model.name"):
+        load_pipeline_config(DEFAULT, ("model.name=pi3x",))
+
+
+def test_unknown_prediction_cache_mode_is_rejected():
+    with pytest.raises(ValueError, match="prediction_cache.mode"):
+        load_pipeline_config(
+            DEFAULT,
+            ("prediction_cache.mode=warm",),
+        )
 
 
 def test_dotlist_overrides_use_new_field_paths_only():

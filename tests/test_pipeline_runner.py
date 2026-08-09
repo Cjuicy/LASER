@@ -279,6 +279,20 @@ def test_preflight_failure_prevents_model_loading(tmp_path):
     assert "load_pi3" not in state.calls
 
 
+def test_invalid_model_name_prevents_model_loading(tmp_path):
+    state = RecordingState()
+    config_path, overrides, _ = _pipeline_args(tmp_path)
+
+    with pytest.raises(ValueError, match="model.name"):
+        run_from_config(
+            config_path,
+            (*overrides, "model.name=pi3x"),
+            dependencies=recording_dependencies(state),
+        )
+
+    assert state.loaded_models == []
+
+
 def test_same_manifest_instance_reaches_inference_and_salad(tmp_path):
     state = RecordingState()
     config_path, overrides, _ = _pipeline_args(tmp_path)
