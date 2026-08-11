@@ -275,10 +275,11 @@ Preflight verifies that:
 - the dataset returns the requested number of images, GT point maps, and masks;
 - predicted and GT spatial dimensions can support a 224 by 224 center crop.
 
-`max_sequences` deterministically selects the first entries in each selected
-dataset's sequence-map insertion order. The selected sequence names are
-written to the manifest before model construction. Any limited run receives
-`subset` status and cannot be reported as a Table 4 reproduction.
+`max_sequences` is a per-dataset limit. It deterministically selects the first
+entries in each selected dataset's sequence-map insertion order. The selected
+sequence names are written to the manifest before model construction. Any
+limited run receives `subset` status and cannot be reported as a Table 4
+reproduction.
 
 ## Paper-Compatible Geometry Alignment
 
@@ -397,7 +398,8 @@ paper-table preparation.
 `protocol_manifest.json` records:
 
 - Git commit;
-- resolved protocol and pipeline SHA256 values;
+- the full resolved-protocol SHA256, resume-compatible protocol-identity
+  SHA256, and resolved-pipeline SHA256;
 - checkpoint SHA256;
 - sequence-map SHA256 values;
 - PyTorch, CUDA, Open3D, NumPy, and SciPy versions;
@@ -422,11 +424,23 @@ are reusable only when all of these identities match:
 - per-sequence input image manifest hash;
 - metric implementation/schema version.
 
+The full resolved-protocol hash covers every serialized field. Resume compares
+a second canonical protocol-identity hash that excludes only the
+`protocol.resume` and `protocol.preflight_only` control switches; otherwise
+turning resume on would invalidate the run it is meant to resume. The identity
+still includes `max_sequences`, all algorithmic settings, reference values,
+dataset selection, and operational pipeline inputs.
+
 Any mismatch rejects resume. A resumed sequence skips reconstruction and
 metrics only when its stored result is complete under the exact identity. The
 ordinary prediction cache remains independent: a metric implementation change
 may invalidate sequence results while still allowing the validated Pi3
 ordinary predictions to be reused.
+
+The paper profile places Hydra's own job log directory outside the canonical
+result directory, so Hydra bootstrap files cannot accidentally trip or bypass
+the non-empty-directory guard. Preflight and numerical runs use distinct
+output directories unless resume is explicitly requested.
 
 Interrupted or failed jobs preserve atomically written sequence results and
 set the run state to `incomplete` or `failed`. They do not emit a valid complete
@@ -479,13 +493,14 @@ code cannot silently return stale metrics.
 ```bash
 python mv_recon/eval.py \
   evaluation=mv_recon_laser_paper \
-  protocol.preflight_only=true
+  protocol.preflight_only=true \
+  output_dir=outputs/mv_recon_laser_paper_preflight
 ```
 
 This prints and writes the resolved protocol and dataset summary without
 constructing Pi3.
 
-### One-sequence smoke run
+### One-sequence-per-dataset smoke run
 
 ```bash
 python mv_recon/eval.py \
