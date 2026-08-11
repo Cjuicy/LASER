@@ -25,6 +25,8 @@ from pipeline.manifest import ImageManifest
 
 
 PAPER_PROTOCOL_NAME = "laser_cvpr2026_table4_pi3"
+COMPARISON_PROTOCOL_NAME = "laser_neuralrgbd_pointmap_comparison"
+PROTOCOL_MODES = frozenset({"paper", "comparison"})
 PAPER_DATASETS = ("7scenes-dense", "NRGBD-dense")
 EXPECTED_DATASET_SEQUENCE_COUNTS = {
     "7scenes-dense": 18,
@@ -68,6 +70,7 @@ PAPER_REFERENCE_VALUES = {
 _PROTOCOL_KEYS = frozenset(
     {
         "name",
+        "mode",
         "version",
         "strict",
         "preflight_only",
@@ -129,6 +132,7 @@ class DatasetReference:
 @dataclass(frozen=True)
 class LaserPaperProtocol:
     name: str
+    mode: str
     version: int
     strict: bool
     preflight_only: bool
@@ -294,8 +298,15 @@ def _parse_protocol(
         values["version"], int
     ):
         raise ValueError("protocol.version must be an integer")
+    mode = values["mode"]
+    if not isinstance(mode, str) or mode not in PROTOCOL_MODES:
+        allowed = ", ".join(sorted(PROTOCOL_MODES))
+        raise ValueError(
+            f"protocol.mode must be one of {allowed}; got {mode!r}"
+        )
     return LaserPaperProtocol(
         name=str(values["name"]),
+        mode=mode,
         version=values["version"],
         strict=values["strict"],
         preflight_only=values["preflight_only"],
@@ -343,20 +354,15 @@ def _resolve_dtype(
     return "float16"
 
 
-def _validate_paper_locks(
+def _validate_protocol_locks(
     protocol: LaserPaperProtocol,
     config: PipelineConfig,
 ) -> None:
     expected = {
-        "protocol.name": (protocol.name, PAPER_PROTOCOL_NAME),
         "protocol.version": (protocol.version, 1),
         "protocol.strict": (protocol.strict, True),
         "window.size": (config.window.size, 20),
         "window.overlap": (config.window.overlap, 5),
-        "segmentation.method": (
-            config.segmentation.method,
-            SegmentationMethod.DEPTH,
-        ),
         "segmentation.confidence_keep_ratio": (
             config.segmentation.confidence_keep_ratio,
             0.5,
@@ -380,6 +386,22 @@ def _validate_paper_locks(
         "segmentation.felzenszwalb.min_size": (
             config.segmentation.felzenszwalb.min_size,
             500,
+        ),
+        "segmentation.geometry.normal_method": (
+            config.segmentation.geometry.normal_method,
+            "cross",
+        ),
+        "segmentation.geometry.normal_threshold_degrees": (
+            config.segmentation.geometry.normal_threshold_degrees,
+            20.0,
+        ),
+        "segmentation.atomic.split_mode": (
+            config.segmentation.atomic.split_mode.value,
+            "conservative",
+        ),
+        "segmentation.atomic.split_score_threshold": (
+            config.segmentation.atomic.split_score_threshold,
+            0.10,
         ),
         "anchor_propagation.enabled": (
             config.anchor_propagation.enabled,
@@ -420,6 +442,38 @@ def _validate_paper_locks(
             (0.01, 0.02, 0.05),
         ),
     }
+    if protocol.mode == "paper":
+        expected.update(
+            {
+                "protocol.name": (protocol.name, PAPER_PROTOCOL_NAME),
+                "segmentation.method": (
+                    config.segmentation.method,
+                    SegmentationMethod.DEPTH,
+                ),
+                "prediction_cache.mode": (
+                    config.prediction_cache.mode.value,
+                    "auto",
+                ),
+            }
+        )
+    else:
+        expected["protocol.name"] = (
+            protocol.name,
+            COMPARISON_PROTOCOL_NAME,
+        )
+        method = config.segmentation.method
+        if method not in {
+            SegmentationMethod.DEPTH,
+            SegmentationMethod.GEOMETRY,
+            SegmentationMethod.ATOMIC,
+        }:
+            raise ValueError(
+                f"unsupported comparison segmentation: {method}"
+            )
+        expected["prediction_cache.mode"] = (
+            config.prediction_cache.mode.value,
+            "auto" if method is SegmentationMethod.DEPTH else "readonly",
+        )
     for dataset, reference_values in PAPER_REFERENCE_VALUES.items():
         reference = protocol.paper_reference[dataset]
         for field_name, wanted in reference_values.items():
@@ -432,7 +486,39 @@ def _validate_paper_locks(
         if actual != wanted
     ]
     if drift:
-        raise ValueError("laser paper protocol drift: " + "; ".join(drift))
+        label = "paper" if protocol.mode == "paper" else "comparison"
+        raise ValueError(
+            f"laser {label} protocol drift: " + "; ".join(drift)
+        )
+
+
+def _validate_datasets(
+    protocol: LaserPaperProtocol,
+    datasets: tuple[str, ...],
+) -> None:
+    if protocol.mode == "paper":
+        if datasets != PAPER_DATASETS:
+            raise ValueError(
+                "laser paper protocol drift: expected datasets "
+                f"{PAPER_DATASETS}, got {datasets}"
+            )
+        return
+    positions = [
+        PAPER_DATASETS.index(dataset)
+        for dataset in datasets
+        if dataset in PAPER_DATASETS
+    ]
+    valid = (
+        bool(datasets)
+        and len(set(datasets)) == len(datasets)
+        and len(positions) == len(datasets)
+        and positions == sorted(positions)
+    )
+    if not valid:
+        raise ValueError(
+            "laser comparison protocol drift: datasets must be a non-empty "
+            f"ordered subset of {PAPER_DATASETS}; got {datasets}"
+        )
 
 
 def _jsonable(value: object) -> object:
@@ -475,14 +561,10 @@ def resolve_evaluation_protocol(
         protocol.pipeline_config,
         (*protocol.pipeline_overrides, *operational),
     )
-    _validate_paper_locks(protocol, loaded.config)
+    _validate_protocol_locks(protocol, loaded.config)
 
     datasets = tuple(str(name) for name in hydra_cfg.eval_datasets)
-    if datasets != PAPER_DATASETS:
-        raise ValueError(
-            f"laser paper protocol drift: expected datasets {PAPER_DATASETS}, "
-            f"got {datasets}"
-        )
+    _validate_datasets(protocol, datasets)
     resolved_payload = {
         **_jsonable(asdict(protocol)),
         "eval_datasets": list(datasets),

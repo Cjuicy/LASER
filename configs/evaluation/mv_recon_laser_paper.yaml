@@ -25,6 +25,7 @@ eval_datasets:
 
 protocol:
   name: laser_cvpr2026_table4_pi3
+  mode: paper
   version: 1
   strict: true
   preflight_only: false

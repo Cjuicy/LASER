@@ -33,6 +33,122 @@ def _root_config(tmp_path: Path):
         )
 
 
+def _comparison_config(tmp_path: Path, *, method: str = "depth"):
+    config = _root_config(tmp_path)
+    OmegaConf.set_struct(config.protocol, False)
+    config.protocol.mode = "comparison"
+    config.protocol.name = "laser_neuralrgbd_pointmap_comparison"
+    config.eval_datasets = ["NRGBD-dense"]
+    config.protocol.prediction_cache_mode = (
+        "auto" if method == "depth" else "readonly"
+    )
+    config.protocol.pipeline_overrides = [
+        (
+            f"segmentation.method={method}"
+            if item == "segmentation.method=depth"
+            else item
+        )
+        for item in config.protocol.pipeline_overrides
+    ]
+    return config
+
+
+def test_paper_profile_declares_paper_mode(tmp_path):
+    resolved = resolve_evaluation_protocol(_root_config(tmp_path), ROOT)
+
+    assert resolved.protocol.mode == "paper"
+    assert resolved.datasets == ("7scenes-dense", "NRGBD-dense")
+
+
+def test_paper_mode_still_rejects_nrgbd_only(tmp_path):
+    config = _root_config(tmp_path)
+    config.eval_datasets = ["NRGBD-dense"]
+
+    with pytest.raises(ValueError, match="paper protocol.*datasets"):
+        resolve_evaluation_protocol(config, ROOT)
+
+
+def test_comparison_mode_accepts_nrgbd_only_depth(tmp_path):
+    resolved = resolve_evaluation_protocol(
+        _comparison_config(tmp_path, method="depth"), ROOT
+    )
+
+    assert resolved.protocol.mode == "comparison"
+    assert resolved.datasets == ("NRGBD-dense",)
+    assert resolved.pipeline.config.segmentation.method.value == "depth"
+
+
+def test_protocol_rejects_unknown_mode(tmp_path):
+    config = _root_config(tmp_path)
+    OmegaConf.set_struct(config.protocol, False)
+    config.protocol.mode = "benchmark"
+
+    with pytest.raises(ValueError, match="protocol.mode"):
+        resolve_evaluation_protocol(config, ROOT)
+
+
+@pytest.mark.parametrize(
+    "datasets",
+    (
+        [],
+        ["NRGBD-dense", "NRGBD-dense"],
+        ["NRGBD-dense", "7scenes-dense"],
+        ["TUM-dense"],
+    ),
+)
+def test_comparison_mode_rejects_invalid_dataset_selection(
+    tmp_path, datasets
+):
+    config = _comparison_config(tmp_path)
+    config.eval_datasets = datasets
+
+    with pytest.raises(ValueError, match="comparison protocol.*datasets"):
+        resolve_evaluation_protocol(config, ROOT)
+
+
+def test_comparison_mode_rejects_wrong_prediction_cache_mode(tmp_path):
+    config = _comparison_config(tmp_path, method="geometry")
+    config.protocol.prediction_cache_mode = "auto"
+
+    with pytest.raises(ValueError, match="prediction_cache.mode"):
+        resolve_evaluation_protocol(config, ROOT)
+
+
+@pytest.mark.parametrize(
+    ("method", "override", "field"),
+    (
+        (
+            "geometry",
+            "segmentation.geometry.normal_method=sobel",
+            "normal_method",
+        ),
+        (
+            "geometry",
+            "segmentation.geometry.normal_threshold_degrees=25.0",
+            "normal_threshold_degrees",
+        ),
+        (
+            "atomic",
+            "segmentation.atomic.split_mode=normal_only",
+            "split_mode",
+        ),
+        (
+            "atomic",
+            "segmentation.atomic.split_score_threshold=0.2",
+            "split_score_threshold",
+        ),
+    ),
+)
+def test_comparison_mode_rejects_method_parameter_drift(
+    tmp_path, method, override, field
+):
+    config = _comparison_config(tmp_path, method=method)
+    config.protocol.pipeline_overrides.append(override)
+
+    with pytest.raises(ValueError, match=field):
+        resolve_evaluation_protocol(config, ROOT)
+
+
 def test_paper_profile_resolves_all_locked_pipeline_values(tmp_path):
     resolved = resolve_evaluation_protocol(_root_config(tmp_path), ROOT)
     config = resolved.pipeline.config
