@@ -4,6 +4,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 import pytest
 
+from mv_recon import protocol as protocol_module
 from mv_recon.protocol import (
     EXPECTED_DATASET_SEQUENCE_COUNTS,
     resolve_evaluation_protocol,
@@ -129,3 +130,82 @@ def test_reference_values_are_explicitly_named(tmp_path):
     assert references["NRGBD-dense"].normal_consistency_median == pytest.approx(
         0.856
     )
+
+
+def test_shipped_maps_have_exact_counts_order_and_kf10(tmp_path):
+    config = _root_config(tmp_path)
+    resolved = resolve_evaluation_protocol(config, ROOT)
+
+    plans = protocol_module.build_dataset_plans(resolved, config.data, ROOT)
+
+    assert [plan.expected_sequence_count for plan in plans] == [18, 9]
+    assert [len(plan.sequences) for plan in plans] == [18, 9]
+    assert plans[0].sequences[0].name == "chess/seq-03"
+    assert plans[1].sequences[0].name == "breakfast_room"
+    assert all(
+        right - left == 10
+        for plan in plans
+        for sequence in plan.sequences
+        for left, right in zip(sequence.frame_ids, sequence.frame_ids[1:])
+    )
+    assert all(len(plan.sequence_map_sha256) == 64 for plan in plans)
+
+
+def test_max_sequences_limits_each_dataset_after_full_map_validation(tmp_path):
+    config = _root_config(tmp_path)
+    config.protocol.max_sequences = 1
+    resolved = resolve_evaluation_protocol(config, ROOT)
+
+    plans = protocol_module.build_dataset_plans(resolved, config.data, ROOT)
+
+    assert [len(plan.sequences) for plan in plans] == [1, 1]
+    assert [plan.expected_sequence_count for plan in plans] == [18, 9]
+    assert [plan.sequences[0].name for plan in plans] == [
+        "chess/seq-03",
+        "breakfast_room",
+    ]
+
+
+def test_sequence_map_rejects_non_kf10_interval(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text('{"scene": [0, 10, 21]}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="interval 10"):
+        protocol_module.load_sequence_map(path, expected_count=1)
+
+
+def test_dataset_plan_rejects_requested_frame_outside_sequence(tmp_path):
+    path = tmp_path / "map.json"
+    path.write_text('{"scene": [0, 10, 20]}', encoding="utf-8")
+    sequences = protocol_module.load_sequence_map(path, expected_count=1)
+    plan = protocol_module.DatasetPlan(
+        name="test",
+        sequence_map_path=path,
+        sequence_map_sha256="a" * 64,
+        expected_sequence_count=1,
+        sequences=sequences,
+    )
+
+    class Dataset:
+        sequence_list = ["scene"]
+
+        def get_seq_framenum(self, sequence_name):
+            assert sequence_name == "scene"
+            return 20
+
+    with pytest.raises(ValueError, match="requests frame 20.*contains 20"):
+        protocol_module.validate_dataset_plan(Dataset(), plan)
+
+
+def test_manifest_digest_uses_image_contents(tmp_path):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    initial = protocol_module.manifest_digest_for_paths([first, second])
+    second.write_bytes(b"changed")
+    changed = protocol_module.manifest_digest_for_paths([first, second])
+
+    assert len(initial) == 64
+    assert initial != changed

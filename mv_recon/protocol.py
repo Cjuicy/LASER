@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -15,6 +16,11 @@ from pipeline.config import (
     SegmentationMethod,
     load_pipeline_config,
 )
+from inference_engine.prediction_cache.fingerprint import (
+    digest_image_manifest,
+    sha256_file,
+)
+from pipeline.manifest import ImageManifest
 
 
 PAPER_PROTOCOL_NAME = "laser_cvpr2026_table4_pi3"
@@ -113,6 +119,21 @@ class ResolvedEvaluationProtocol:
     resolved_yaml: str
     sha256: str
     identity_sha256: str
+
+
+@dataclass(frozen=True)
+class SequenceSpec:
+    name: str
+    frame_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DatasetPlan:
+    name: str
+    sequence_map_path: Path
+    sequence_map_sha256: str
+    expected_sequence_count: int
+    sequences: tuple[SequenceSpec, ...]
 
 
 def _require_exact_keys(
@@ -447,3 +468,136 @@ def resolve_evaluation_protocol(
             identity_yaml.encode("utf-8")
         ).hexdigest(),
     )
+
+
+def _unique_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate sequence name in sequence map: {key}")
+        result[key] = value
+    return result
+
+
+def load_sequence_map(
+    path: str | Path,
+    expected_count: int,
+) -> tuple[SequenceSpec, ...]:
+    map_path = Path(path)
+    if not map_path.is_file():
+        raise FileNotFoundError(f"sequence map does not exist: {map_path}")
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count < 1
+    ):
+        raise ValueError("expected sequence count must be a positive integer")
+    try:
+        raw = json.loads(
+            map_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_object_pairs,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid sequence map JSON: {map_path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("sequence map root must be a JSON object")
+    if len(raw) != expected_count:
+        raise ValueError(
+            f"sequence map must contain exactly {expected_count} entries; "
+            f"received {len(raw)}"
+        )
+
+    sequences: list[SequenceSpec] = []
+    for name, frame_ids in raw.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("sequence names must be non-empty strings")
+        if not isinstance(frame_ids, list) or not frame_ids:
+            raise ValueError(f"sequence {name} must contain frame IDs")
+        if any(
+            isinstance(frame_id, bool)
+            or not isinstance(frame_id, int)
+            or frame_id < 0
+            for frame_id in frame_ids
+        ):
+            raise ValueError(
+                f"sequence {name} frame IDs must be non-negative integers"
+            )
+        if any(
+            right - left != 10
+            for left, right in zip(frame_ids, frame_ids[1:])
+        ):
+            raise ValueError(f"sequence {name} must use interval 10")
+        sequences.append(SequenceSpec(name=name, frame_ids=tuple(frame_ids)))
+    return tuple(sequences)
+
+
+def build_dataset_plans(
+    resolved: ResolvedEvaluationProtocol,
+    data_config: DictConfig,
+    repository_root: str | Path,
+) -> tuple[DatasetPlan, ...]:
+    root = Path(repository_root).resolve()
+    plans: list[DatasetPlan] = []
+    for dataset_name in resolved.datasets:
+        if dataset_name not in EXPECTED_DATASET_SEQUENCE_COUNTS:
+            raise ValueError(f"unsupported paper dataset: {dataset_name}")
+        if dataset_name not in data_config:
+            raise ValueError(f"missing data configuration: {dataset_name}")
+        configured_path = Path(str(data_config[dataset_name].seq_id_map))
+        if not configured_path.is_absolute():
+            configured_path = root / configured_path
+        configured_path = configured_path.resolve()
+        expected_count = EXPECTED_DATASET_SEQUENCE_COUNTS[dataset_name]
+        complete_sequences = load_sequence_map(
+            configured_path,
+            expected_count=expected_count,
+        )
+        limit = resolved.protocol.max_sequences
+        selected = (
+            complete_sequences
+            if limit is None
+            else complete_sequences[:limit]
+        )
+        plans.append(
+            DatasetPlan(
+                name=dataset_name,
+                sequence_map_path=configured_path,
+                sequence_map_sha256=sha256_file(configured_path),
+                expected_sequence_count=expected_count,
+                sequences=selected,
+            )
+        )
+    return tuple(plans)
+
+
+def validate_dataset_plan(dataset: object, plan: DatasetPlan) -> None:
+    if not hasattr(dataset, "sequence_list") or not hasattr(
+        dataset, "get_seq_framenum"
+    ):
+        raise TypeError(
+            "point-map dataset must expose sequence_list and get_seq_framenum"
+        )
+    available = set(dataset.sequence_list)
+    for sequence in plan.sequences:
+        if sequence.name not in available:
+            raise ValueError(f"dataset is missing sequence {sequence.name}")
+        frame_count = int(
+            dataset.get_seq_framenum(sequence_name=sequence.name)
+        )
+        if frame_count < 1:
+            raise ValueError(
+                f"sequence {sequence.name} has invalid frame count {frame_count}"
+            )
+        last_frame = sequence.frame_ids[-1]
+        if last_frame >= frame_count:
+            raise ValueError(
+                f"sequence {sequence.name} requests frame {last_frame} "
+                f"but contains {frame_count} frames"
+            )
+
+
+def manifest_digest_for_paths(paths: Sequence[str | Path]) -> str:
+    normalized = tuple(Path(path).resolve() for path in paths)
+    if not normalized:
+        raise ValueError("image manifest must contain at least one path")
+    return digest_image_manifest(ImageManifest(paths=normalized))
