@@ -16,6 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _root_config(tmp_path: Path):
+    return _profile_config(tmp_path, "mv_recon_laser_paper")
+
+
+def _profile_config(tmp_path: Path, profile: str):
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"checkpoint")
     with initialize_config_dir(
@@ -25,7 +29,7 @@ def _root_config(tmp_path: Path):
         return compose(
             config_name="eval_mv_recon_dense",
             overrides=[
-                "evaluation=mv_recon_laser_paper",
+                f"evaluation={profile}",
                 "device=cpu",
                 f"output_dir={tmp_path / 'results'}",
                 f"pi3.checkpoint={checkpoint}",
@@ -51,6 +55,59 @@ def _comparison_config(tmp_path: Path, *, method: str = "depth"):
         for item in config.protocol.pipeline_overrides
     ]
     return config
+
+
+@pytest.mark.parametrize(
+    ("profile", "method", "cache_mode"),
+    (
+        ("mv_recon_laser_nrgbd_depth", "depth", "auto"),
+        ("mv_recon_laser_nrgbd_geometry", "geometry", "readonly"),
+        ("mv_recon_laser_nrgbd_atomic", "atomic", "readonly"),
+    ),
+)
+def test_nrgbd_profiles_are_locked(
+    tmp_path, profile, method, cache_mode
+):
+    config = _profile_config(tmp_path, profile)
+    resolved = resolve_evaluation_protocol(config, ROOT)
+    pipeline = resolved.pipeline.config
+
+    assert resolved.protocol.mode == "comparison"
+    assert resolved.protocol.max_sequences is None
+    assert resolved.datasets == ("NRGBD-dense",)
+    assert pipeline.segmentation.method.value == method
+    assert pipeline.prediction_cache.mode.value == cache_mode
+    assert (pipeline.window.size, pipeline.window.overlap) == (20, 5)
+    assert pipeline.segmentation.confidence_keep_ratio == pytest.approx(0.5)
+    assert pipeline.segmentation.felzenszwalb.scale == pytest.approx(300)
+    assert pipeline.segmentation.felzenszwalb.sigma == pytest.approx(1.1)
+    assert pipeline.segmentation.felzenszwalb.min_size == 500
+    assert pipeline.segmentation.geometry.normal_method == "cross"
+    assert (
+        pipeline.segmentation.geometry.normal_threshold_degrees
+        == pytest.approx(20.0)
+    )
+    assert pipeline.segmentation.atomic.split_mode.value == "conservative"
+    assert (
+        pipeline.segmentation.atomic.split_score_threshold
+        == pytest.approx(0.10)
+    )
+    assert pipeline.anchor_propagation.enabled is True
+    assert pipeline.loop.enabled is False
+
+
+def test_nrgbd_profile_uses_all_fixed_kf10_sequences(tmp_path):
+    config = _profile_config(tmp_path, "mv_recon_laser_nrgbd_depth")
+    resolved = resolve_evaluation_protocol(config, ROOT)
+
+    plans = protocol_module.build_dataset_plans(resolved, config.data, ROOT)
+
+    assert len(plans) == 1
+    assert plans[0].name == "NRGBD-dense"
+    assert len(plans[0].sequences) == 9
+    assert plans[0].sequence_map_sha256 == (
+        "f18f2143f8a373727aa4d7043b779b77639354fda80523cdc2a139164ddc33ba"
+    )
 
 
 def test_paper_profile_declares_paper_mode(tmp_path):
