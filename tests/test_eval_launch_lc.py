@@ -146,7 +146,12 @@ def test_pose_evaluation_keeps_streaming_images_on_cpu():
 
 @pytest.mark.parametrize(
     "config_name",
-    ("mv_recon_dense.yaml", "mv_recon_kf15.yaml", "mv_recon_outdoor.yaml"),
+    (
+        "mv_recon_dense.yaml",
+        "mv_recon_kf15.yaml",
+        "mv_recon_outdoor.yaml",
+        "mv_recon_laser_paper.yaml",
+    ),
 )
 def test_shipped_mv_streaming_configs_define_local_checkpoint(config_name):
     repository_root = Path(__file__).resolve().parents[1]
@@ -155,11 +160,10 @@ def test_shipped_mv_streaming_configs_define_local_checkpoint(config_name):
     )
     assert config.pi3.checkpoint == "weights/model.safetensors"
 
-    for relative_path in ("mv_recon/eval.py", "mv_recon/eval_outdoor.py"):
-        source = (repository_root / relative_path).read_text(
-            encoding="utf-8"
-        )
-        assert "cfg.pi3.checkpoint" in source
+    outdoor_source = (repository_root / "mv_recon/eval_outdoor.py").read_text(
+        encoding="utf-8"
+    )
+    assert "cfg.pi3.checkpoint" in outdoor_source
 
 
 def test_eval_launch_does_not_import_pi3_directly():
