@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def _config(
     tmp_path: Path,
     *,
+    profile: str = "mv_recon_laser_paper",
+    max_sequences: int | None = 1,
     preflight_only: bool = False,
     resume: bool = False,
 ):
@@ -41,9 +43,10 @@ def _config(
         return compose(
             config_name="eval_mv_recon_dense",
             overrides=[
-                "evaluation=mv_recon_laser_paper",
+                f"evaluation={profile}",
                 "device=cpu",
-                "protocol.max_sequences=1",
+                "protocol.max_sequences="
+                + ("null" if max_sequences is None else str(max_sequences)),
                 f"protocol.preflight_only={str(preflight_only).lower()}",
                 f"protocol.resume={str(resume).lower()}",
                 f"output_dir={tmp_path / 'results'}",
@@ -71,7 +74,17 @@ class FakeDataset:
         self.sequence_list = (
             ["chess/seq-03"]
             if dataset_name == "7scenes-dense"
-            else ["breakfast_room"]
+            else [
+                "breakfast_room",
+                "complete_kitchen",
+                "green_room",
+                "grey_white_room",
+                "kitchen",
+                "morning_apartment",
+                "staircase",
+                "thin_geometry",
+                "whiteroom",
+            ]
         )
 
     def get_seq_framenum(self, sequence_name):
@@ -284,6 +297,45 @@ def test_two_dataset_smoke_builds_one_model_and_returns_subset(tmp_path):
     )
     assert len(sequence_rows) == 2
     assert (output / "failures.jsonl").read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize(
+    ("profile", "method"),
+    (
+        ("mv_recon_laser_nrgbd_depth", "depth"),
+        ("mv_recon_laser_nrgbd_geometry", "geometry"),
+        ("mv_recon_laser_nrgbd_atomic", "atomic"),
+    ),
+)
+def test_full_nrgbd_comparison_is_subset_with_method_manifest(
+    tmp_path, profile, method
+):
+    result = run_evaluation(
+        _config(tmp_path, profile=profile, max_sequences=None),
+        dependencies=_dependencies(tmp_path, State()),
+        repository_root=ROOT,
+    )
+
+    assert result.state == "subset"
+    assert result.datasets[0].status == "subset"
+    assert [item.sequence for item in result.sequences] == [
+        "breakfast_room",
+        "complete_kitchen",
+        "green_room",
+        "grey_white_room",
+        "kitchen",
+        "morning_apartment",
+        "staircase",
+        "thin_geometry",
+        "whiteroom",
+    ]
+    manifest = json.loads(
+        (tmp_path / "results/protocol_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["evaluation_mode"] == "comparison"
+    assert manifest["segmentation_method"] == method
 
 
 def test_sequence_failure_preserves_prior_result_and_raises_nonzero_error(

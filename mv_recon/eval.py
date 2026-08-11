@@ -23,6 +23,7 @@ from mv_recon.geometry_metrics import (
     evaluate_point_maps,
 )
 from mv_recon.protocol import (
+    PAPER_DATASETS,
     DatasetPlan,
     GeometryProtocol,
     ResolvedEvaluationProtocol,
@@ -368,6 +369,10 @@ def _build_protocol_manifest(
     return {
         "schema_version": 1,
         "git_commit": git_commit,
+        "evaluation_mode": resolved.protocol.mode,
+        "segmentation_method": (
+            resolved.pipeline.config.segmentation.method.value
+        ),
         "resolved_protocol_sha256": resolved.sha256,
         "protocol_identity_sha256": resolved.identity_sha256,
         "resolved_pipeline_sha256": resolved.pipeline.sha256,
@@ -451,13 +456,22 @@ def run_evaluation(
     full_sequence_counts = {
         plan.name: plan.expected_sequence_count for plan in plans
     }
-    subset = any(
-        len(plan.sequences) != plan.expected_sequence_count for plan in plans
+    subset = (
+        resolved.protocol.mode == "comparison"
+        or resolved.datasets != PAPER_DATASETS
+        or any(
+            len(plan.sequences) != plan.expected_sequence_count
+            for plan in plans
+        )
     )
+    selected_references = {
+        dataset: resolved.protocol.paper_reference[dataset]
+        for dataset in resolved.datasets
+    }
     initial_result = store.initialize(
         expected_sequences=expected_sequences,
         full_sequence_counts=full_sequence_counts,
-        paper_reference=resolved.protocol.paper_reference,
+        paper_reference=selected_references,
         subset=subset,
         preflight=resolved.protocol.preflight_only,
     )
