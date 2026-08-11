@@ -161,6 +161,172 @@ limited run. `incomplete` and `failed` preserve diagnostics and successful
 sequence artifacts but the command exits non-zero after a strict sequence
 failure.
 
+## NeuralRGBD segmentation comparison
+
+The comparison profiles evaluate the same nine fixed NeuralRGBD kf10
+sequences while changing only the segmentation strategy:
+
+| Profile | Method | Ordinary cache mode |
+|---|---|---|
+| `mv_recon_laser_nrgbd_depth` | Depth/Felzenszwalb `300 / 1.1 / 500` | `auto` |
+| `mv_recon_laser_nrgbd_geometry` | cross-product normals at 20 degrees | `readonly` |
+| `mv_recon_laser_nrgbd_atomic` | conservative split at score `0.10` | `readonly` |
+
+All three retain the paper window, confidence, anchor, loop, alignment, ICP,
+normal, crop, map, and metric settings. These runs intentionally have
+`subset` status because they omit 7-Scenes. A complete nine-sequence
+NeuralRGBD dataset row is still produced and may be compared with the paper's
+NeuralRGBD row.
+
+Depth is a hard reproduction gate. Geometry and Atomic must not run unless
+all six Depth values display as the published row at three decimal places:
+
+```text
+0.020  0.010  0.012  0.004  0.713  0.856
+```
+
+### Cloud preparation
+
+From the cloud checkout, expose the audited mixed-case data and checkpoint at
+the configured paths, then verify the Python 3.11 extensions:
+
+```bash
+cd /root/autodl-tmp/LASER-pointmap-eval
+ln -sfn NeuralRGBD data/nrgbd
+ln -sfn PI3/model.safetensors weights/model.safetensors
+test -d data/nrgbd/breakfast_room
+test -f weights/model.safetensors
+
+conda activate vggt
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+python -c 'from inference_engine.utils.fast_seg import fast_graph_segmentation; from inference_engine.utils._segmentation_cy import merge_regions; print("extensions OK")'
+python -c 'import torch, open3d; print(torch.__version__, torch.cuda.get_device_name(), open3d.__version__)'
+python -m pytest tests/mv_recon -q
+```
+
+The canonical output directories below must be absent before a new run. If a
+compatible partial directory already exists, inspect its manifest and repeat
+the same command with `protocol.resume=true`; do not mix unrelated outputs.
+
+### Depth reproduction gate
+
+Run preflight and a one-sequence smoke first:
+
+```bash
+python mv_recon/eval.py \
+  evaluation=mv_recon_laser_nrgbd_depth \
+  protocol.preflight_only=true \
+  output_dir=outputs/pointmap/nrgbd_depth_preflight
+
+python mv_recon/eval.py \
+  evaluation=mv_recon_laser_nrgbd_depth \
+  protocol.max_sequences=1 \
+  output_dir=outputs/pointmap/nrgbd_depth_smoke
+```
+
+Run all nine sequences in a persistent session:
+
+```bash
+mkdir -p outputs/pointmap/logs
+screen -dmS nrgbd_depth bash -lc '
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate vggt
+cd /root/autodl-tmp/LASER-pointmap-eval
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+python mv_recon/eval.py evaluation=mv_recon_laser_nrgbd_depth \
+  output_dir=outputs/pointmap/nrgbd_depth \
+  > outputs/pointmap/logs/nrgbd_depth.log 2>&1
+'
+```
+
+Monitor with `screen -ls`, `tail -n 80
+outputs/pointmap/logs/nrgbd_depth.log`, and `nvidia-smi`. After a recoverable
+interruption, use the same command and output directory with
+`protocol.resume=true`.
+
+Apply the gate before starting either later method:
+
+```bash
+python mv_recon/compare_results.py \
+  --depth-run outputs/pointmap/nrgbd_depth \
+  --depth-gate-only \
+  --output-dir outputs/pointmap/nrgbd_comparison
+python -m json.tool outputs/pointmap/nrgbd_comparison/depth_gate.json
+```
+
+A non-zero exit means the baseline has not reproduced the paper row; preserve
+the output and diagnose it before continuing.
+
+### Geometry and Atomic
+
+After the Depth gate passes, use a one-sequence readonly smoke for each method:
+
+```bash
+python mv_recon/eval.py \
+  evaluation=mv_recon_laser_nrgbd_geometry \
+  protocol.max_sequences=1 \
+  output_dir=outputs/pointmap/nrgbd_geometry_smoke
+
+python mv_recon/eval.py \
+  evaluation=mv_recon_laser_nrgbd_atomic \
+  protocol.max_sequences=1 \
+  output_dir=outputs/pointmap/nrgbd_atomic_smoke
+```
+
+Both smokes must report ordinary-cache hits, zero misses, and the same
+`ordinary_prediction_key` as Depth. Run the full methods sequentially. Wait
+for the Geometry screen session to finish successfully before starting Atomic:
+
+```bash
+screen -dmS nrgbd_geometry bash -lc '
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate vggt
+cd /root/autodl-tmp/LASER-pointmap-eval
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+python mv_recon/eval.py evaluation=mv_recon_laser_nrgbd_geometry \
+  output_dir=outputs/pointmap/nrgbd_geometry \
+  > outputs/pointmap/logs/nrgbd_geometry.log 2>&1
+'
+
+screen -dmS nrgbd_atomic bash -lc '
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate vggt
+cd /root/autodl-tmp/LASER-pointmap-eval
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+python mv_recon/eval.py evaluation=mv_recon_laser_nrgbd_atomic \
+  output_dir=outputs/pointmap/nrgbd_atomic \
+  > outputs/pointmap/logs/nrgbd_atomic.log 2>&1
+'
+```
+
+Generate the final auditable comparison:
+
+```bash
+python mv_recon/compare_results.py \
+  --depth-run outputs/pointmap/nrgbd_depth \
+  --geometry-run outputs/pointmap/nrgbd_geometry \
+  --atomic-run outputs/pointmap/nrgbd_atomic \
+  --output-dir outputs/pointmap/nrgbd_comparison
+cat outputs/pointmap/nrgbd_comparison/comparison.csv
+python -m json.tool outputs/pointmap/nrgbd_comparison/comparison.json
+```
+
+The reader rejects run failures, wrong coverage/order, non-finite values,
+results/manifest identity disagreement, changed checkpoint/map/input/GT
+hashes, changed ordinary keys or thresholds, and different Git/runtime
+provenance. It reports the six paper metrics, Chamfer-L1, sequence-macro
+precision/recall/F-score at 1, 2, and 5 cm, metric direction, and method minus
+Depth deltas without collapsing them into one score.
+
+The audited cloud 7-Scenes copy is not eligible for this comparison: extracted
+sequences lack registered `.depth.proj.png`, Office is empty, and redkitchen
+is absent. No complete two-dataset Table 4 claim should be made until those
+data are repaired independently.
+
 ## Custom sampling experiments
 
 A sequence map records a mapping from sequence name to selected frame IDs.
