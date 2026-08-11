@@ -112,9 +112,13 @@ def test_nrgbd_profile_uses_all_fixed_kf10_sequences(tmp_path):
 
 def test_paper_profile_declares_paper_mode(tmp_path):
     resolved = resolve_evaluation_protocol(_root_config(tmp_path), ROOT)
+    resolved_payload = OmegaConf.create(resolved.resolved_yaml)
 
     assert resolved.protocol.mode == "paper"
     assert resolved.datasets == ("7scenes-dense", "NRGBD-dense")
+    assert resolved_payload.pointmap_assembly == (
+        "laser-incremental-global-map-v1"
+    )
 
 
 def test_paper_mode_still_rejects_nrgbd_only(tmp_path):

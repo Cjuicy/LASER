@@ -26,6 +26,7 @@ from pipeline.manifest import ImageManifest
 
 PAPER_PROTOCOL_NAME = "laser_cvpr2026_table4_pi3"
 COMPARISON_PROTOCOL_NAME = "laser_neuralrgbd_pointmap_comparison"
+POINTMAP_ASSEMBLY = "laser-incremental-global-map-v1"
 PROTOCOL_MODES = frozenset({"paper", "comparison"})
 PAPER_DATASETS = ("7scenes-dense", "NRGBD-dense")
 EXPECTED_DATASET_SEQUENCE_COUNTS = {
@@ -568,6 +569,7 @@ def resolve_evaluation_protocol(
     resolved_payload = {
         **_jsonable(asdict(protocol)),
         "eval_datasets": list(datasets),
+        "pointmap_assembly": POINTMAP_ASSEMBLY,
     }
     resolved_yaml = OmegaConf.to_yaml(
         OmegaConf.create(resolved_payload),

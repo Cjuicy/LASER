@@ -16,6 +16,7 @@ from mv_recon.protocol import (
     EXPECTED_DATASET_SEQUENCE_COUNTS,
     PAPER_REFERENCE_VALUES,
     PAPER_SEQUENCE_MAP_PATHS,
+    POINTMAP_ASSEMBLY,
     load_sequence_map,
 )
 from mv_recon.results import METRIC_SCHEMA_VERSION
@@ -202,6 +203,8 @@ def _load_run(run_dir: Path, expected_method: str) -> dict[str, object]:
         raise ValueError("results and manifest run-state identity disagree")
     if manifest.get("evaluation_mode") != "comparison":
         raise ValueError("run is not a comparison profile")
+    if manifest.get("pointmap_assembly") != POINTMAP_ASSEMBLY:
+        raise ValueError("comparison run uses the wrong point-map assembly")
     if manifest.get("segmentation_method") != expected_method:
         raise ValueError(
             f"comparison method mismatch: expected {expected_method}"

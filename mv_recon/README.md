@@ -178,6 +178,18 @@ normal, crop, map, and metric settings. These runs intentionally have
 NeuralRGBD dataset row is still produced and may be compared with the paper's
 NeuralRGBD row.
 
+Point-map assembly is locked to `laser-incremental-global-map-v1`. It replays
+the released LASER Table 4 ordering inside the evaluation layer: the first
+window supplies one fixed estimated intrinsic used to reproject every window's
+predicted depth; each window is then registered against the already corrected
+predecessor, and its global Sim(3) scale and layer scale are applied before it
+becomes the next registration reference. Ordinary Pi3 predictions still come
+from the shared prediction cache. This compatibility path is deliberately
+local to `mv_recon`; the reusable inference, loop-closure, and segmentation
+modules are not changed. The resolved protocol and manifest record this
+assembly identity, and the comparison reader rejects results created with
+deferred aggregation.
+
 Depth is a hard reproduction gate. Geometry and Atomic must not run unless
 all six Depth values display as the published row at three decimal places:
 

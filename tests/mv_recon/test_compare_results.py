@@ -161,6 +161,7 @@ def _write_run(
         "protocol_identity_sha256": identity["protocol_identity_sha256"],
         "resolved_pipeline_sha256": identity["pipeline_sha256"],
         "evaluation_mode": "comparison",
+        "pointmap_assembly": "laser-incremental-global-map-v1",
         "segmentation_method": method,
         "checkpoint_sha256": "c" * 64,
         "sequence_map_sha256": {"NRGBD-dense": "d" * 64},
@@ -272,6 +273,17 @@ def test_depth_gate_rejects_wrong_method(tmp_path):
     )
 
     with pytest.raises(ValueError, match="method mismatch"):
+        validate_depth_gate(run, expected_sequences=EXPECTED_NAMES)
+
+
+def test_depth_gate_rejects_wrong_pointmap_assembly(tmp_path):
+    run = _write_run(tmp_path / "depth", "depth")
+    _rewrite_manifest(
+        run,
+        lambda payload: payload.update(pointmap_assembly="deferred-v0"),
+    )
+
+    with pytest.raises(ValueError, match="point-map assembly"):
         validate_depth_gate(run, expected_sequences=EXPECTED_NAMES)
 
 

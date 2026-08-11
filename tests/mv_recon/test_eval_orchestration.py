@@ -283,6 +283,9 @@ def test_two_dataset_smoke_builds_one_model_and_returns_subset(tmp_path):
     )
     assert manifest["run_state"] == "subset"
     assert manifest["metric_schema_version"] == METRIC_SCHEMA_VERSION
+    assert manifest["pointmap_assembly"] == (
+        "laser-incremental-global-map-v1"
+    )
     assert manifest["attempted_sequences"] == 2
     assert manifest["successful_sequences"] == 2
     assert len(manifest["sequence_cache"]) == 2

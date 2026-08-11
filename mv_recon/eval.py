@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
 
+from inference_engine.anchor_propagation import AnchorPropagator
 from inference_engine.prediction_cache.fingerprint import sha256_file
 from mv_recon.geometry_metrics import (
     GeometryBackend,
@@ -22,8 +23,13 @@ from mv_recon.geometry_metrics import (
     Open3DGeometryBackend,
     evaluate_point_maps,
 )
+from mv_recon.paper_streaming import (
+    build_paper_segmentation_strategy,
+    reconstruct_incremental_point_maps,
+)
 from mv_recon.protocol import (
     PAPER_DATASETS,
+    POINTMAP_ASSEMBLY,
     DatasetPlan,
     GeometryProtocol,
     ResolvedEvaluationProtocol,
@@ -48,7 +54,6 @@ from pipeline.manifest import ImageManifest
 from pipeline.runner import (
     StreamingPipelineModel,
     require_local_model_checkpoint,
-    run_windows,
 )
 from utils.load_fn import load_and_preprocess_images
 from utils.messages import set_default_arg
@@ -192,6 +197,7 @@ def run_streaming_inference(
     hydra_cfg: DictConfig,
     data_size: tuple[int, int],
 ) -> InferenceOutput:
+    del hydra_cfg
     images = load_and_preprocess_images(filelist)
     manifest = ImageManifest(
         paths=tuple(Path(path).resolve() for path in filelist)
@@ -199,20 +205,29 @@ def run_streaming_inference(
     engine = inference_model.prepare(images, manifest)
     config = engine.pipeline_config
     store = engine.prediction_store
+    segmenter = build_paper_segmentation_strategy(config.segmentation)
+    anchor = AnchorPropagator(
+        config.anchor_propagation.correspondence_iou_threshold
+    )
     with store.entry_lock():
-        caches = run_windows(
-            engine,
-            manifest,
-            images,
-            engine.window_specs,
-            config,
+        result = reconstruct_incremental_point_maps(
+            provider=engine.delegate,
+            specs=engine.window_specs,
+            images=images,
+            segmenter=segmenter,
+            anchor_propagator=anchor,
+            overlap=config.window.overlap,
+            confidence_keep_ratio=(
+                config.loop.registration.confidence_keep_ratio
+            ),
+            temporal_iou_threshold=(
+                config.segmentation.temporal_iou_threshold
+            ),
+            anchor_enabled=config.anchor_propagation.enabled,
+            process_device=config.model.process_device,
         )
-    constraints = engine.loop_strategy.build_constraints(caches, ())
-    solution = engine.loop_strategy.optimize(caches, constraints)
-    result = engine.loop_strategy.aggregate(caches, solution)
-    points = result.payload["points"]
     resized_points = F.interpolate(
-        points.permute(0, 3, 1, 2),
+        result.points.permute(0, 3, 1, 2),
         data_size,
         mode="bilinear",
         align_corners=False,
@@ -226,7 +241,7 @@ def run_streaming_inference(
     )
     return InferenceOutput(
         points=resized_points.detach().cpu().numpy(),
-        confidence=result.payload["confidence"].detach().cpu().numpy(),
+        confidence=result.confidence.detach().cpu().numpy(),
         ordinary_prediction_key=store.fingerprint.key,
         cache_diagnostics=prediction_diagnostics,
     )
@@ -372,6 +387,7 @@ def _build_protocol_manifest(
         "metric_schema_version": METRIC_SCHEMA_VERSION,
         "git_commit": git_commit,
         "evaluation_mode": resolved.protocol.mode,
+        "pointmap_assembly": POINTMAP_ASSEMBLY,
         "segmentation_method": (
             resolved.pipeline.config.segmentation.method.value
         ),
