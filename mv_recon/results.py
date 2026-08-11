@@ -22,7 +22,7 @@ from mv_recon.geometry_metrics import (
 from mv_recon.protocol import DatasetReference
 
 
-METRIC_SCHEMA_VERSION = "laser-pointmap-metrics-v1"
+METRIC_SCHEMA_VERSION = "laser-pointmap-metrics-v2"
 RUN_STATES = frozenset(
     {"preflight", "running", "complete", "subset", "incomplete", "failed"}
 )
@@ -43,6 +43,7 @@ class SequenceResult:
     sequence: str
     frame_count: int
     input_manifest_sha256: str
+    ground_truth_sha256: str
     ordinary_prediction_key: str
     primary: PrimaryMetrics
     diagnostics: GeometryDiagnostics
@@ -317,6 +318,7 @@ def _sequence_from_payload(payload: Mapping[str, object]) -> SequenceResult:
         sequence=str(payload["sequence"]),
         frame_count=int(payload["frame_count"]),
         input_manifest_sha256=str(payload["input_manifest_sha256"]),
+        ground_truth_sha256=str(payload["ground_truth_sha256"]),
         ordinary_prediction_key=str(payload["ordinary_prediction_key"]),
         primary=_primary_from_payload(primary_payload),
         diagnostics=_diagnostics_from_payload(diagnostics_payload),
@@ -390,6 +392,10 @@ class ResultStore:
             raise ValueError("resume results.json is unreadable") from exc
         if not isinstance(payload, Mapping):
             raise ValueError("resume results.json must contain an object")
+        if payload.get("schema_version") != METRIC_SCHEMA_VERSION:
+            raise ValueError(
+                "resume identity mismatch: metric result schema changed"
+            )
         stored_identity_payload = payload.get("identity")
         if not isinstance(stored_identity_payload, Mapping):
             raise ValueError("resume results.json has no run identity")
@@ -427,12 +433,20 @@ class ResultStore:
             failure_payloads, list
         ):
             raise ValueError("resume results.json has invalid record arrays")
-        self._sequences = [
-            _sequence_from_payload(item) for item in sequence_payloads
-        ]
-        self._failures = [
-            _failure_from_payload(item) for item in failure_payloads
-        ]
+        self._sequences = []
+        for item in sequence_payloads:
+            if not isinstance(item, Mapping):
+                raise ValueError("invalid stored sequence result")
+            sequence = _sequence_from_payload(item)
+            _json_safe(sequence)
+            self._sequences.append(sequence)
+        self._failures = []
+        for item in failure_payloads:
+            if not isinstance(item, Mapping):
+                raise ValueError("invalid stored failure record")
+            failure = _failure_from_payload(item)
+            _json_safe(failure)
+            self._failures.append(failure)
 
     def initialize(
         self,
@@ -521,12 +535,14 @@ class ResultStore:
         dataset: str,
         sequence: str,
         input_manifest_sha256: str,
+        ground_truth_sha256: str,
     ) -> SequenceResult | None:
         for result in self._sequences:
             if (
                 result.dataset == dataset
                 and result.sequence == sequence
                 and result.input_manifest_sha256 == input_manifest_sha256
+                and result.ground_truth_sha256 == ground_truth_sha256
             ):
                 return result
         return None
@@ -538,15 +554,25 @@ class ResultStore:
             raise ValueError(
                 f"unexpected sequence result: {result.dataset}/{result.sequence}"
             )
-        if any(
-            item.dataset == result.dataset and item.sequence == result.sequence
-            for item in self._sequences
-        ):
-            raise ValueError(
-                f"duplicate sequence result: {result.dataset}/{result.sequence}"
-            )
         _json_safe(result)
-        self._sequences.append(result)
+        existing_index = next(
+            (
+                index
+                for index, item in enumerate(self._sequences)
+                if item.dataset == result.dataset
+                and item.sequence == result.sequence
+            ),
+            None,
+        )
+        if existing_index is not None:
+            if not self.resume:
+                raise ValueError(
+                    f"duplicate sequence result: "
+                    f"{result.dataset}/{result.sequence}"
+                )
+            self._sequences[existing_index] = result
+        else:
+            self._sequences.append(result)
         self._failures = [
             failure
             for failure in self._failures
@@ -704,6 +730,7 @@ class ResultStore:
             "sequence": result.sequence,
             "frame_count": result.frame_count,
             "input_manifest_sha256": result.input_manifest_sha256,
+            "ground_truth_sha256": result.ground_truth_sha256,
             "ordinary_prediction_key": result.ordinary_prediction_key,
             **asdict(result.primary),
             **asdict(result.diagnostics.directional_normals),
@@ -733,6 +760,7 @@ class ResultStore:
             "sequence",
             "frame_count",
             "input_manifest_sha256",
+            "ground_truth_sha256",
             "ordinary_prediction_key",
             *(field.name for field in fields(PrimaryMetrics)),
             *(field.name for field in fields(DirectionalNormalMetrics)),

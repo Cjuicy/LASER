@@ -28,6 +28,7 @@ from mv_recon.protocol import (
     ResolvedEvaluationProtocol,
     SequenceSpec,
     build_dataset_plans,
+    digest_ground_truth,
     manifest_digest_for_paths,
     resolve_evaluation_protocol,
     validate_dataset_plan,
@@ -69,6 +70,7 @@ class LoadedSequence:
     ground_truth_points: np.ndarray
     valid_mask: np.ndarray
     input_manifest_sha256: str
+    ground_truth_sha256: str
 
 
 InferPointMaps = Callable[
@@ -281,6 +283,10 @@ def _load_sequence(
         ground_truth_points=ground_truth,
         valid_mask=valid_mask,
         input_manifest_sha256=manifest_digest_for_paths(image_paths),
+        ground_truth_sha256=digest_ground_truth(
+            ground_truth,
+            valid_mask,
+        ),
     )
 
 
@@ -315,6 +321,7 @@ def run_sequence(
         sequence=sequence.name,
         frame_count=len(sequence.frame_ids),
         input_manifest_sha256=loaded.input_manifest_sha256,
+        ground_truth_sha256=loaded.ground_truth_sha256,
         ordinary_prediction_key=inference.ordinary_prediction_key,
         primary=geometry_result.primary,
         diagnostics=geometry_result.diagnostics,
@@ -476,6 +483,19 @@ def run_evaluation(
     attempted = 0
     successful = 0
     failed = 0
+
+    def persist_progress(*, run_state: str | None = None) -> None:
+        updates: dict[str, object] = {
+            "attempted_sequences": attempted,
+            "successful_sequences": successful,
+            "failed_sequences": failed,
+            "sequence_cache": cache_records,
+        }
+        if run_state is not None:
+            updates["run_state"] = run_state
+        protocol_manifest.update(updates)
+        store.update_protocol_manifest(protocol_manifest)
+
     for plan in plans:
         dataset = datasets[plan.name]
         for sequence in plan.sequences:
@@ -486,6 +506,7 @@ def run_evaluation(
                     plan.name,
                     sequence.name,
                     loaded.input_manifest_sha256,
+                    loaded.ground_truth_sha256,
                 )
                 if reused is not None:
                     successful += 1
@@ -496,6 +517,9 @@ def run_evaluation(
                             "input_manifest_sha256": (
                                 reused.input_manifest_sha256
                             ),
+                            "ground_truth_sha256": (
+                                reused.ground_truth_sha256
+                            ),
                             "ordinary_prediction_key": (
                                 reused.ordinary_prediction_key
                             ),
@@ -503,6 +527,7 @@ def run_evaluation(
                             **dict(reused.cache_diagnostics),
                         }
                     )
+                    persist_progress()
                     continue
                 sequence_result = run_sequence(
                     dataset_name=plan.name,
@@ -524,6 +549,9 @@ def run_evaluation(
                         "input_manifest_sha256": (
                             sequence_result.input_manifest_sha256
                         ),
+                        "ground_truth_sha256": (
+                            sequence_result.ground_truth_sha256
+                        ),
                         "ordinary_prediction_key": (
                             sequence_result.ordinary_prediction_key
                         ),
@@ -531,6 +559,18 @@ def run_evaluation(
                         **dict(sequence_result.cache_diagnostics),
                     }
                 )
+            except KeyboardInterrupt as exc:
+                failed += 1
+                failure = FailureRecord(
+                    dataset=plan.name,
+                    sequence=sequence.name,
+                    category=type(exc).__name__,
+                    message=str(exc),
+                )
+                store.record_failure(failure)
+                interrupted_result = store.finalize()
+                persist_progress(run_state=interrupted_result.state)
+                raise
             except Exception as exc:
                 failed += 1
                 failure = FailureRecord(
@@ -540,43 +580,18 @@ def run_evaluation(
                     message=str(exc),
                 )
                 store.record_failure(failure)
-                protocol_manifest.update(
-                    {
-                        "attempted_sequences": attempted,
-                        "successful_sequences": successful,
-                        "failed_sequences": failed,
-                        "sequence_cache": cache_records,
-                    }
-                )
-                store.update_protocol_manifest(protocol_manifest)
-                store.finalize()
+                failed_result = store.finalize()
+                persist_progress(run_state=failed_result.state)
                 raise EvaluationFailed(
                     f"strict point-map evaluation failed at "
                     f"{plan.name}/{sequence.name}: {exc}"
                 ) from exc
             finally:
                 selected_dependencies.empty_cuda_cache()
-            protocol_manifest.update(
-                {
-                    "attempted_sequences": attempted,
-                    "successful_sequences": successful,
-                    "failed_sequences": failed,
-                    "sequence_cache": cache_records,
-                }
-            )
-            store.update_protocol_manifest(protocol_manifest)
+            persist_progress()
 
     result = store.finalize()
-    protocol_manifest.update(
-        {
-            "attempted_sequences": attempted,
-            "successful_sequences": successful,
-            "failed_sequences": failed,
-            "sequence_cache": cache_records,
-            "run_state": result.state,
-        }
-    )
-    store.update_protocol_manifest(protocol_manifest)
+    persist_progress(run_state=result.state)
     LOGGER.info("Finished LASER paper point-map evaluation: %s", result.state)
     return result
 

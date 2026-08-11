@@ -14,7 +14,7 @@
 - Modify only `configs/evaluation/`, `mv_recon/`, `tests/`, and `docs/`; do not modify `pipeline/`, `inference_engine/`, `pi3/`, or `loop_closure/`.
 - The locked reconstruction values are window `20/5`, Depth segmentation, both confidence keep ratios `0.5`, depth merge `0.1`, temporal IoU `0.3`, Felzenszwalb `300/1.1/500`, anchor enabled at IoU `0.4`, loop disabled, and traditional aggregation.
 - The locked geometry values are a `224 x 224` center crop, same-pixel Umeyama Sim(3), Open3D point-to-point ICP with identity initialization and threshold `0.1 m`, and Open3D default normal estimation.
-- The fixed sequence maps are `datasets/seq-id-maps/7scenes_mv-recon_seq-id-map-kf10.json` and `datasets/seq-id-maps/NRGBD_mv-recon_seq-id-map-kf10.json`; expected sequence counts are 18 and 9 respectively, and every consecutive frame difference is 10.
+- The fixed sequence maps are `datasets/seq-id-maps/7scenes_mv-recon_seq-id-map-kf10.json` (SHA256 `e9954bfcf4b4a3273224e8375d468638e1fe4d7b6d926ff32147367bb4574008`) and `datasets/seq-id-maps/NRGBD_mv-recon_seq-id-map-kf10.json` (SHA256 `f18f2143f8a373727aa4d7043b779b77639354fda80523cdc2a139164ddc33ba`); expected sequence counts are 18 and 9 respectively, and every consecutive frame difference is 10.
 - Primary metrics are Acc mean/median, Comp mean/median, and NC mean/median; NC mean and NC median each average their two directional statistics separately.
 - The final point metrics use only the GT validity mask and never filter by predicted confidence.
 - Dataset results are macro averages over exact sequence-map entries; missing sequences make the run non-complete and never reduce the paper denominator silently.
@@ -425,7 +425,7 @@ def load_sequence_map(path: Path, expected_count: int) -> tuple[SequenceSpec, ..
 
 - [ ] **Step 4: Implement dataset-plan construction and dataset metadata validation**
 
-`build_dataset_plans()` must accept only `7scenes-dense` and `NRGBD-dense`, resolve each `seq_id_map` against the repository root, retain JSON insertion order, hash the raw map with `sha256_file()`, then slice each plan with `max_sequences` only after full-map validation.
+`build_dataset_plans()` must accept only `7scenes-dense` and `NRGBD-dense`, require the fixed repository-relative map path and checked-in SHA256, retain JSON insertion order, then slice each plan with `max_sequences` only after full-map validation.
 
 ```python
 def validate_dataset_plan(dataset: object, plan: DatasetPlan) -> None:
@@ -441,7 +441,7 @@ def validate_dataset_plan(dataset: object, plan: DatasetPlan) -> None:
             )
 ```
 
-Add `manifest_digest_for_paths(paths)` using `ImageManifest` plus the existing `digest_image_manifest()` so result resume and ordinary prediction cache identify the same image contents.
+Add `manifest_digest_for_paths(paths)` using `ImageManifest` plus the existing `digest_image_manifest()` so result resume and ordinary prediction cache identify the same image contents. Add `digest_ground_truth(point_maps, valid_mask)` so changed GT geometry or validity cannot reuse stale metric results.
 
 - [ ] **Step 5: Run map/preflight tests and verify both shipped maps directly**
 
@@ -647,7 +647,7 @@ git commit -m "feat: add LASER point-map geometry metrics"
 - Create: `tests/mv_recon/test_results.py`
 
 **Interfaces:**
-- Consumes: `PrimaryMetrics`, geometry diagnostics, `DatasetPlan`, resolved protocol/pipeline hashes, checkpoint hash, and per-sequence input manifest hash.
+- Consumes: `PrimaryMetrics`, geometry diagnostics, `DatasetPlan`, resolved protocol/pipeline hashes, checkpoint hash, per-sequence input manifest hash, and per-sequence GT point-map/mask hash.
 - Produces: `RunIdentity`, `SequenceResult`, `FailureRecord`, `DatasetSummary`, `RunResults`, `ResultStore`, `aggregate_dataset()`, and `delta_to_reference()`.
 
 - [ ] **Step 1: Write failing tests for exact macro averages and run states**
@@ -745,7 +745,7 @@ Expected: collection fails because `mv_recon.results` does not exist.
 - [ ] **Step 4: Implement result dataclasses and canonical schema**
 
 ```python
-METRIC_SCHEMA_VERSION = "laser-pointmap-metrics-v1"
+METRIC_SCHEMA_VERSION = "laser-pointmap-metrics-v2"
 
 
 @dataclass(frozen=True)
@@ -763,6 +763,7 @@ class SequenceResult:
     sequence: str
     frame_count: int
     input_manifest_sha256: str
+    ground_truth_sha256: str
     ordinary_prediction_key: str
     primary: PrimaryMetrics
     diagnostics: GeometryDiagnostics
@@ -807,7 +808,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 - [ ] **Step 7: Implement exact resume selection**
 
-On `resume=True`, load `results.json`, compare every `RunIdentity` field, and build a lookup by `(dataset, sequence)`. Reuse a sequence only if its stored `input_manifest_sha256`, expected sequence-map identity, and metric version match exactly. Expose:
+On `resume=True`, load `results.json`, reject non-finite stored values, compare every `RunIdentity` field, and build a lookup by `(dataset, sequence)`. Reuse a sequence only if its stored `input_manifest_sha256`, `ground_truth_sha256`, expected sequence-map identity, and metric version match exactly. Expose:
 
 ```python
 def reusable_sequence(
@@ -815,6 +816,7 @@ def reusable_sequence(
     dataset: str,
     sequence: str,
     input_manifest_sha256: str,
+    ground_truth_sha256: str,
 ) -> SequenceResult | None:
     ...
 ```
@@ -1069,7 +1071,7 @@ accuracy_mean_m,accuracy_median_m,completion_mean_m,completion_median_m,
 normal_consistency_mean,normal_consistency_median
 ```
 
-Ensure `sequences.csv` has dataset/sequence/frame count/input manifest/cache key, all six primary values, directional NC values, Chamfer-L1, ICP fitness/RMSE, Umeyama scale, counts, and threshold precision/recall/F-score fields.
+Ensure `sequences.csv` has dataset/sequence/frame count/input manifest/GT content/cache key, all six primary values, directional NC values, Chamfer-L1, ICP fitness/RMSE, Umeyama scale, counts, and threshold precision/recall/F-score fields.
 
 - [ ] **Step 4: Document cloud setup and all four execution modes**
 

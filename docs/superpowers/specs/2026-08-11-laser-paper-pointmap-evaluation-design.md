@@ -214,7 +214,8 @@ override list. These fields must match exactly:
 - 224-pixel square center crop;
 - Umeyama Sim(3) followed by point-to-point ICP at 0.1 metres;
 - Open3D default normal estimation;
-- the fixed kf10 sequence maps for 7-Scenes and NeuralRGBD.
+- the fixed kf10 sequence maps for 7-Scenes and NeuralRGBD, including their
+  repository-relative paths and checked-in file SHA256 values.
 
 Changing a locked field while retaining the `laser_paper` label is an error
 before model construction.
@@ -405,7 +406,8 @@ paper-table preparation.
 - PyTorch, CUDA, Open3D, NumPy, and SciPy versions;
 - GPU model and effective dtype;
 - every locked and operational setting;
-- per-sequence input-manifest and ordinary-prediction cache keys;
+- per-sequence input-manifest, GT point-map/mask, and ordinary-prediction cache
+  keys;
 - attempted, successful, failed, and expected sequence counts.
 
 Writers use temporary sibling files followed by atomic replacement. They never
@@ -422,6 +424,7 @@ are reusable only when all of these identities match:
 - checkpoint hash;
 - sequence-map hash;
 - per-sequence input image manifest hash;
+- per-sequence GT point-map and validity-mask content hash;
 - metric implementation/schema version.
 
 The full resolved-protocol hash covers every serialized field. Resume compares
@@ -432,7 +435,8 @@ still includes `max_sequences`, all algorithmic settings, reference values,
 dataset selection, and operational pipeline inputs.
 
 Any mismatch rejects resume. A resumed sequence skips reconstruction and
-metrics only when its stored result is complete under the exact identity. The
+metrics only when its stored result is finite and complete under the exact
+identity. The
 ordinary prediction cache remains independent: a metric implementation change
 may invalidate sequence results while still allowing the validated Pi3
 ordinary predictions to be reused.
@@ -557,7 +561,7 @@ Implementation follows red-green-refactor. Tests cover:
 11. Results, CSV projections, failures, and manifests are atomic and reject
     non-finite JSON values.
 12. Resume accepts exact identities and rejects any protocol, checkpoint,
-    map, manifest, or metric-version mismatch.
+    map, input-manifest, GT-content, or metric-version mismatch.
 13. A fake model and fake dataset exercise the evaluator end-to-end without a
     GPU or Open3D installation by injecting deterministic alignment results.
 14. CLI preflight does not construct Pi3.

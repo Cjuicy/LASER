@@ -74,6 +74,7 @@ def _sequence(
         sequence=name,
         frame_count=100,
         input_manifest_sha256=(name[0] if name else "a") * 64,
+        ground_truth_sha256="e" * 64,
         ordinary_prediction_key="b" * 64,
         primary=_primary(**metric_overrides),
         diagnostics=_diagnostics(),
@@ -237,10 +238,18 @@ def test_resume_reuses_only_exact_input_manifest(tmp_path):
         "7scenes-dense",
         "a",
         sequence.input_manifest_sha256,
+        sequence.ground_truth_sha256,
     ) == sequence
     assert resumed.reusable_sequence(
         "7scenes-dense",
         "a",
+        "f" * 64,
+        sequence.ground_truth_sha256,
+    ) is None
+    assert resumed.reusable_sequence(
+        "7scenes-dense",
+        "a",
+        sequence.input_manifest_sha256,
         "f" * 64,
     ) is None
 
@@ -254,6 +263,22 @@ def test_nonfinite_metric_is_rejected_before_json_write(tmp_path):
         store.record_sequence(
             _sequence("a", accuracy_mean_m=float("nan"))
         )
+
+
+def test_resume_rejects_nonfinite_metric_in_stored_results(tmp_path):
+    output = tmp_path / "results"
+    first = ResultStore(output, _identity(), resume=False)
+    _initialize(first)
+    first.record_sequence(_sequence("a"))
+    payload = json.loads((output / "results.json").read_text(encoding="utf-8"))
+    payload["sequences"][0]["primary"]["accuracy_mean_m"] = float("nan")
+    (output / "results.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        ResultStore(output, _identity(), resume=True)
 
 
 def test_failure_after_success_preserves_sequence_and_is_incomplete(tmp_path):
@@ -303,3 +328,28 @@ def test_successful_resume_clears_prior_failure_for_same_sequence(tmp_path):
     assert result.state == "complete"
     assert result.failures == ()
     assert (output / "failures.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_resume_replaces_stale_sequence_when_ground_truth_changes(tmp_path):
+    output = tmp_path / "results"
+    first = ResultStore(output, _identity(), resume=False)
+    _initialize(first, expected=("a",), full_count=1)
+    original = _sequence("a")
+    first.record_sequence(original)
+    first.finalize()
+
+    resumed = ResultStore(output, _identity(), resume=True)
+    _initialize(resumed, expected=("a",), full_count=1)
+    changed = replace(original, ground_truth_sha256="f" * 64)
+    assert resumed.reusable_sequence(
+        "7scenes-dense",
+        "a",
+        changed.input_manifest_sha256,
+        changed.ground_truth_sha256,
+    ) is None
+    resumed.record_sequence(changed)
+
+    result = resumed.finalize()
+    assert result.state == "complete"
+    assert len(result.sequences) == 1
+    assert result.sequences[0].ground_truth_sha256 == "f" * 64

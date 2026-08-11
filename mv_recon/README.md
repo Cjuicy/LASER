@@ -51,9 +51,11 @@ data/nrgbd
 The evaluator uses these fixed maps:
 
 ```text
-datasets/seq-id-maps/7scenes_mv-recon_seq-id-map-kf10.json
-datasets/seq-id-maps/NRGBD_mv-recon_seq-id-map-kf10.json
+datasets/seq-id-maps/7scenes_mv-recon_seq-id-map-kf10.json  e9954bfcf4b4a3273224e8375d468638e1fe4d7b6d926ff32147367bb4574008
+datasets/seq-id-maps/NRGBD_mv-recon_seq-id-map-kf10.json      f18f2143f8a373727aa4d7043b779b77639354fda80523cdc2a139164ddc33ba
 ```
+
+Strict mode validates both the repository-relative paths and SHA256 values.
 
 ### Cloud execution
 
@@ -88,7 +90,8 @@ python mv_recon/eval.py \
 ```
 
 Resume an interrupted run only with the identical code, protocol, pipeline,
-checkpoint, sequence maps, image manifests, and metric schema:
+checkpoint, sequence maps, image manifests, GT point maps/masks, and metric
+schema:
 
 ```bash
 python mv_recon/eval.py \
@@ -150,7 +153,8 @@ failures.jsonl
 `results.json` is canonical. `summary.csv` and `sequences.csv` are derived
 views. `protocol_manifest.json` records source/config/checkpoint/map hashes,
 runtime versions, selected sequences, input manifest hashes, ordinary
-prediction keys, and cache counters.
+prediction keys, GT point-map/mask hashes, and cache counters. Ctrl-C records
+the active sequence as interrupted and leaves the run resumable.
 
 Only `complete` is a full paper-protocol result. `subset` is a deliberate
 limited run. `incomplete` and `failed` preserve diagnostics and successful

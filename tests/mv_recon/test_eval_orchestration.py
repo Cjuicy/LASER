@@ -59,12 +59,15 @@ class State:
     geometry_calls: int = 0
     empty_cache_calls: int = 0
     fail_geometry_call: int | None = None
+    interrupt_geometry_call: int | None = None
+    ground_truth_offset: float = 0.0
 
 
 class FakeDataset:
-    def __init__(self, dataset_name: str, root: Path):
+    def __init__(self, dataset_name: str, root: Path, state: State):
         self.dataset_name = dataset_name
         self.root = root
+        self.state = state
         self.sequence_list = (
             ["chess/seq-03"]
             if dataset_name == "7scenes-dense"
@@ -90,7 +93,7 @@ class FakeDataset:
             image_paths.append(str(path))
         frame_count = len(ids)
         pointclouds = np.zeros((frame_count, 2, 2, 3), dtype=np.float64)
-        pointclouds[..., 2] = 1.0
+        pointclouds[..., 2] = 1.0 + self.state.ground_truth_offset
         return {
             "image_paths": image_paths,
             "images": torch.zeros((frame_count, 3, 2, 2)),
@@ -144,7 +147,7 @@ def _dependencies(tmp_path: Path, state: State) -> EvaluationDependencies:
         dataset_name = (
             "7scenes-dense" if target.endswith("SevenScenes") else "NRGBD-dense"
         )
-        return FakeDataset(dataset_name, tmp_path / "fake-data")
+        return FakeDataset(dataset_name, tmp_path / "fake-data", state)
 
     def model_factory(config):
         state.model_constructions += 1
@@ -167,6 +170,8 @@ def _dependencies(tmp_path: Path, state: State) -> EvaluationDependencies:
 
     def evaluate_geometry(predicted, ground_truth, mask, geometry, backend):
         state.geometry_calls += 1
+        if state.interrupt_geometry_call == state.geometry_calls:
+            raise KeyboardInterrupt("injected user interruption")
         if state.fail_geometry_call == state.geometry_calls:
             raise RuntimeError("injected geometry failure")
         assert predicted.shape == ground_truth.shape
@@ -302,6 +307,42 @@ def test_sequence_failure_preserves_prior_result_and_raises_nonzero_error(
     ]
     assert payload["failures"][0]["sequence"] == "breakfast_room"
     assert state.empty_cache_calls == 2
+    manifest = json.loads(
+        (tmp_path / "results" / "protocol_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["run_state"] == "incomplete"
+
+
+def test_keyboard_interrupt_preserves_prior_result_and_incomplete_state(
+    tmp_path,
+):
+    state = State(interrupt_geometry_call=2)
+
+    with pytest.raises(KeyboardInterrupt, match="user interruption"):
+        run_evaluation(
+            _config(tmp_path),
+            dependencies=_dependencies(tmp_path, state),
+            repository_root=ROOT,
+        )
+
+    payload = json.loads(
+        (tmp_path / "results" / "results.json").read_text(encoding="utf-8")
+    )
+    assert payload["state"] == "incomplete"
+    assert [item["sequence"] for item in payload["sequences"]] == [
+        "chess/seq-03"
+    ]
+    assert payload["failures"][0]["category"] == "KeyboardInterrupt"
+    manifest = json.loads(
+        (tmp_path / "results" / "protocol_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["run_state"] == "incomplete"
+    assert manifest["attempted_sequences"] == 2
+    assert state.empty_cache_calls == 2
 
 
 def test_exact_resume_skips_inference_and_geometry(tmp_path):
@@ -324,3 +365,34 @@ def test_exact_resume_skips_inference_and_geometry(tmp_path):
     assert resumed_state.model_constructions == 1
     assert resumed_state.inference_sequences == []
     assert resumed_state.geometry_calls == 0
+
+
+def test_changed_ground_truth_invalidates_resumed_sequence_results(tmp_path):
+    first_state = State()
+    run_evaluation(
+        _config(tmp_path),
+        dependencies=_dependencies(tmp_path, first_state),
+        repository_root=ROOT,
+    )
+
+    changed_state = State(ground_truth_offset=0.25)
+    result = run_evaluation(
+        _config(tmp_path, resume=True),
+        dependencies=_dependencies(tmp_path, changed_state),
+        repository_root=ROOT,
+    )
+
+    assert result.state == "subset"
+    assert changed_state.inference_sequences == [
+        "chess-seq-03",
+        "breakfast_room",
+    ]
+    assert changed_state.geometry_calls == 2
+    assert all(
+        "ground_truth_sha256" in item
+        for item in json.loads(
+            (tmp_path / "results" / "results.json").read_text(
+                encoding="utf-8"
+            )
+        )["sequences"]
+    )

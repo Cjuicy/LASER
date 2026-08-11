@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from pipeline.config import (
@@ -28,6 +29,40 @@ PAPER_DATASETS = ("7scenes-dense", "NRGBD-dense")
 EXPECTED_DATASET_SEQUENCE_COUNTS = {
     "7scenes-dense": 18,
     "NRGBD-dense": 9,
+}
+PAPER_SEQUENCE_MAP_PATHS = {
+    "7scenes-dense": (
+        "datasets/seq-id-maps/7scenes_mv-recon_seq-id-map-kf10.json"
+    ),
+    "NRGBD-dense": (
+        "datasets/seq-id-maps/NRGBD_mv-recon_seq-id-map-kf10.json"
+    ),
+}
+PAPER_SEQUENCE_MAP_SHA256 = {
+    "7scenes-dense": (
+        "e9954bfcf4b4a3273224e8375d468638e1fe4d7b6d926ff32147367bb4574008"
+    ),
+    "NRGBD-dense": (
+        "f18f2143f8a373727aa4d7043b779b77639354fda80523cdc2a139164ddc33ba"
+    ),
+}
+PAPER_REFERENCE_VALUES = {
+    "7scenes-dense": {
+        "accuracy_mean_m": 0.013,
+        "accuracy_median_m": 0.005,
+        "completion_mean_m": 0.017,
+        "completion_median_m": 0.006,
+        "normal_consistency_mean": 0.607,
+        "normal_consistency_median": 0.665,
+    },
+    "NRGBD-dense": {
+        "accuracy_mean_m": 0.020,
+        "accuracy_median_m": 0.010,
+        "completion_mean_m": 0.012,
+        "completion_median_m": 0.004,
+        "normal_consistency_mean": 0.713,
+        "normal_consistency_median": 0.856,
+    },
 }
 
 _PROTOCOL_KEYS = frozenset(
@@ -385,6 +420,12 @@ def _validate_paper_locks(
             (0.01, 0.02, 0.05),
         ),
     }
+    for dataset, reference_values in PAPER_REFERENCE_VALUES.items():
+        reference = protocol.paper_reference[dataset]
+        for field_name, wanted in reference_values.items():
+            expected[
+                f"paper_reference.{dataset}.{field_name}"
+            ] = (getattr(reference, field_name), wanted)
     drift = [
         f"{path}: expected {wanted!r}, got {actual!r}"
         for path, (actual, wanted) in expected.items()
@@ -547,6 +588,12 @@ def build_dataset_plans(
         if not configured_path.is_absolute():
             configured_path = root / configured_path
         configured_path = configured_path.resolve()
+        fixed_path = (root / PAPER_SEQUENCE_MAP_PATHS[dataset_name]).resolve()
+        if configured_path != fixed_path:
+            raise ValueError(
+                f"laser paper protocol requires fixed sequence map path "
+                f"{fixed_path}; got {configured_path}"
+            )
         expected_count = EXPECTED_DATASET_SEQUENCE_COUNTS[dataset_name]
         complete_sequences = load_sequence_map(
             configured_path,
@@ -558,11 +605,18 @@ def build_dataset_plans(
             if limit is None
             else complete_sequences[:limit]
         )
+        sequence_map_sha256 = sha256_file(configured_path)
+        expected_sha256 = PAPER_SEQUENCE_MAP_SHA256[dataset_name]
+        if sequence_map_sha256 != expected_sha256:
+            raise ValueError(
+                f"laser paper sequence map hash drift for {dataset_name}: "
+                f"expected {expected_sha256}, got {sequence_map_sha256}"
+            )
         plans.append(
             DatasetPlan(
                 name=dataset_name,
                 sequence_map_path=configured_path,
-                sequence_map_sha256=sha256_file(configured_path),
+                sequence_map_sha256=sequence_map_sha256,
                 expected_sequence_count=expected_count,
                 sequences=selected,
             )
@@ -578,6 +632,15 @@ def validate_dataset_plan(dataset: object, plan: DatasetPlan) -> None:
             "point-map dataset must expose sequence_list and get_seq_framenum"
         )
     available = set(dataset.sequence_list)
+    load_img_size = getattr(dataset, "load_img_size", None)
+    if load_img_size is not None:
+        output_width = int(load_img_size)
+        output_height = round(480 * (output_width / 640) / 14) * 14
+        if min(output_width, output_height) < 224:
+            raise ValueError(
+                f"resized dataset shape ({output_height}, {output_width}) "
+                "cannot support the 224 center crop"
+            )
     for sequence in plan.sequences:
         if sequence.name not in available:
             raise ValueError(f"dataset is missing sequence {sequence.name}")
@@ -594,6 +657,36 @@ def validate_dataset_plan(dataset: object, plan: DatasetPlan) -> None:
                 f"sequence {sequence.name} requests frame {last_frame} "
                 f"but contains {frame_count} frames"
             )
+        requested_paths: list[Path] = []
+        if hasattr(dataset, "SEVENSCENES_DIR"):
+            root = Path(dataset.SEVENSCENES_DIR)
+            for frame_id in sequence.frame_ids:
+                prefix = root / sequence.name / f"frame-{frame_id:06d}"
+                requested_paths.extend(
+                    (
+                        Path(f"{prefix}.color.png"),
+                        Path(f"{prefix}.depth.proj.png"),
+                        Path(f"{prefix}.pose.txt"),
+                    )
+                )
+        elif hasattr(dataset, "NRGBD_DIR"):
+            root = Path(dataset.NRGBD_DIR) / sequence.name
+            requested_paths.append(root / "poses.txt")
+            for frame_id in sequence.frame_ids:
+                requested_paths.extend(
+                    (
+                        root / "images" / f"img{frame_id}.png",
+                        root / "depth" / f"depth{frame_id}.png",
+                    )
+                )
+        missing_path = next(
+            (path for path in requested_paths if not path.is_file()),
+            None,
+        )
+        if missing_path is not None:
+            raise FileNotFoundError(
+                f"requested frame file does not exist: {missing_path}"
+            )
 
 
 def manifest_digest_for_paths(paths: Sequence[str | Path]) -> str:
@@ -601,3 +694,31 @@ def manifest_digest_for_paths(paths: Sequence[str | Path]) -> str:
     if not normalized:
         raise ValueError("image manifest must contain at least one path")
     return digest_image_manifest(ImageManifest(paths=normalized))
+
+
+def _update_digest_bytes(digest, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, byteorder="big"))
+    digest.update(value)
+
+
+def digest_ground_truth(
+    point_maps: np.ndarray,
+    valid_mask: np.ndarray,
+) -> str:
+    points = np.asarray(point_maps)
+    mask = np.asarray(valid_mask, dtype=bool)
+    if points.ndim != 4 or points.shape[-1] != 3:
+        raise ValueError("ground-truth point maps must have shape (N,H,W,3)")
+    if mask.shape != points.shape[:-1]:
+        raise ValueError("ground-truth valid mask must match point-map shape")
+    digest = hashlib.sha256()
+    _update_digest_bytes(digest, b"laser-pointmap-ground-truth-v1")
+    for array in (points, mask):
+        contiguous = np.ascontiguousarray(array)
+        _update_digest_bytes(digest, contiguous.dtype.str.encode("ascii"))
+        _update_digest_bytes(
+            digest,
+            json.dumps(list(contiguous.shape)).encode("ascii"),
+        )
+        _update_digest_bytes(digest, contiguous.tobytes())
+    return digest.hexdigest()
