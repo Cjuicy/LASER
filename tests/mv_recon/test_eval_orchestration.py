@@ -21,6 +21,7 @@ from mv_recon.geometry_metrics import (
     PrimaryMetrics,
     ThresholdMetrics,
 )
+from mv_recon.results import METRIC_SCHEMA_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -281,6 +282,7 @@ def test_two_dataset_smoke_builds_one_model_and_returns_subset(tmp_path):
         (output / "protocol_manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["run_state"] == "subset"
+    assert manifest["metric_schema_version"] == METRIC_SCHEMA_VERSION
     assert manifest["attempted_sequences"] == 2
     assert manifest["successful_sequences"] == 2
     assert len(manifest["sequence_cache"]) == 2

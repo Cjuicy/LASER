@@ -35,6 +35,7 @@ from mv_recon.protocol import (
     validate_dataset_plan,
 )
 from mv_recon.results import (
+    METRIC_SCHEMA_VERSION,
     FailureRecord,
     ResultStore,
     RunIdentity,
@@ -368,6 +369,7 @@ def _build_protocol_manifest(
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
+        "metric_schema_version": METRIC_SCHEMA_VERSION,
         "git_commit": git_commit,
         "evaluation_mode": resolved.protocol.mode,
         "segmentation_method": (
