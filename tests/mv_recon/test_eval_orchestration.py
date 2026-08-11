@@ -1,3 +1,4 @@
+import csv
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -235,6 +236,49 @@ def test_two_dataset_smoke_builds_one_model_and_returns_subset(tmp_path):
     assert result.datasets[0].primary.normal_consistency_median == pytest.approx(
         0.8
     )
+
+    output = tmp_path / "results"
+    assert {
+        "resolved_protocol.yaml",
+        "resolved_pipeline.yaml",
+        "protocol_manifest.json",
+        "results.json",
+        "summary.csv",
+        "sequences.csv",
+        "failures.jsonl",
+    } <= {path.name for path in output.iterdir()}
+    canonical = json.loads(
+        (output / "results.json").read_text(encoding="utf-8")
+    )
+    assert set(canonical["datasets"][0]["primary"]) == {
+        "accuracy_mean_m",
+        "accuracy_median_m",
+        "completion_mean_m",
+        "completion_median_m",
+        "normal_consistency_mean",
+        "normal_consistency_median",
+    }
+    assert canonical["sequences"][0]["ordinary_prediction_key"] == "a" * 64
+    manifest = json.loads(
+        (output / "protocol_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["run_state"] == "subset"
+    assert manifest["attempted_sequences"] == 2
+    assert manifest["successful_sequences"] == 2
+    assert len(manifest["sequence_cache"]) == 2
+    with (output / "summary.csv").open(newline="", encoding="utf-8") as stream:
+        summary_rows = list(csv.DictReader(stream))
+    with (output / "sequences.csv").open(newline="", encoding="utf-8") as stream:
+        sequence_rows = list(csv.DictReader(stream))
+    assert [row["dataset"] for row in summary_rows] == [
+        "7scenes-dense",
+        "NRGBD-dense",
+    ]
+    assert float(summary_rows[0]["accuracy_mean_m"]) == pytest.approx(
+        canonical["datasets"][0]["primary"]["accuracy_mean_m"]
+    )
+    assert len(sequence_rows) == 2
+    assert (output / "failures.jsonl").read_text(encoding="utf-8") == ""
 
 
 def test_sequence_failure_preserves_prior_result_and_raises_nonzero_error(
