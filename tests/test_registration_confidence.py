@@ -10,9 +10,6 @@ from inference_engine.streaming_window_engine import StreamingWindowEngine
 from inference_engine.anchor_propagation import AnchorPropagator
 from inference_engine.segmentation import build_segmentation_strategy
 from inference_engine.utils import registration_confidence
-from loop_closure.methods import (
-    CorrectedWindowEngine,
-)
 from inference_engine.utils.registration_confidence import (
     select_top_confidence_mask,
     validate_confidence_keep_ratio,
@@ -137,36 +134,6 @@ def test_base_engine_uses_explicit_registration_keep_ratio(tmp_path):
     engine = make_base_engine(
         tmp_path,
         registration_confidence_keep_ratio=0.3,
-    )
-
-    assert engine.registration_confidence_keep_ratio == 0.3
-
-
-@pytest.mark.parametrize(
-    "engine_type",
-    (CorrectedWindowEngine,),
-)
-def test_loop_window_engines_use_same_registration_field(
-    tmp_path,
-    engine_type,
-):
-    segmentation = load_pipeline_config(
-        "configs/pipeline/test.yaml",
-        ("segmentation.method=depth",),
-    ).config.segmentation
-    engine = engine_type(
-        torch.nn.Identity(),
-        inference_device="cpu",
-        dtype=torch.float32,
-        segmentation_strategy=build_segmentation_strategy(segmentation),
-        anchor_propagator=AnchorPropagator(),
-        registration_confidence_keep_ratio=0.3,
-        anchor_enabled=True,
-        temporal_iou_threshold=0.3,
-        window_size=10,
-        overlap=5,
-        process_device="cpu",
-        cache_root=str(tmp_path),
     )
 
     assert engine.registration_confidence_keep_ratio == 0.3

@@ -1,19 +1,11 @@
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
 
-from inference_engine.prediction_cache.types import WindowSpec
-from inference_engine.streaming_window_engine import STOP_SIGNAL
-from loop_closure.methods.base import (
-    WINDOW_CACHE_SCHEMA_VERSION,
-    LoopSolution,
-    WindowCache,
-)
+from loop_closure.types import LoopSolution
 from loop_closure.methods.corrected import (
-    CorrectedLoopClosureStrategy,
-    CorrectedWindowEngine,
+    CorrectedLoopProcessor,
 )
 from loop_closure.methods.traditional import (
     TraditionalLoopProcessor,
@@ -22,22 +14,16 @@ from mv_recon.paper_streaming import (
     PaperStreamingDependencies,
     reconstruct_incremental_point_maps,
 )
-from pipeline.config import (
-    LoopMethod,
-    ModelName,
-    load_pipeline_config,
-)
+from pipeline.config import load_pipeline_config
 
 from .fixtures import (
-    CHECKPOINT_DIGEST,
-    PREDICTION_KEY,
     SPECS,
     LiteralProvider,
     OneRegionSegmenter,
     SequencedAnchor,
     identity_sim3,
-    literal_window,
 )
+from reconstruction.modes.corrected import CorrectedWindowState
 from reconstruction.modes.traditional import TraditionalWindowState
 
 
@@ -46,84 +32,6 @@ def _optimizer_config():
         "configs/pipeline/test.yaml",
         ("loop.optimizer.implementation=python",),
     ).config.loop.optimizer
-
-
-def _run_legacy_engine(engine, count: int):
-    caches = []
-
-    def save_cache():
-        caches.append(engine.prev_window_cache)
-        engine.cache_id += 1
-
-    engine._save_cache = save_cache
-    for index in range(count):
-        engine.registration_queue.put(
-            (
-                WindowSpec(index=index, frame_start=index, frame_end=index + 2),
-                literal_window(),
-                0.0,
-            )
-        )
-    engine.registration_queue.put(STOP_SIGNAL)
-    engine._registration_worker()
-    return tuple(caches)
-
-
-def _build_engine(engine_type, tmp_path, anchor_scale: float):
-    anchor = SequencedAnchor(scales=(anchor_scale, anchor_scale))
-    engine = engine_type(
-        torch.nn.Identity(),
-        inference_device="cpu",
-        dtype=torch.float32,
-        segmentation_strategy=OneRegionSegmenter(),
-        anchor_propagator=anchor,
-        registration_confidence_keep_ratio=0.5,
-        anchor_enabled=True,
-        temporal_iou_threshold=0.3,
-        window_size=2,
-        overlap=1,
-        cache_root=str(tmp_path),
-        intermediate_device="cpu",
-        process_device="cpu",
-        benchmark_latency=False,
-        prediction_key=PREDICTION_KEY,
-        model_name=ModelName.PI3,
-        checkpoint_digest=CHECKPOINT_DIGEST,
-    )
-    return engine
-
-
-def _legacy_cache(
-    *,
-    mode: LoopMethod,
-    window_index: int,
-    depth: float,
-    anchor_scale: float | None,
-    state: dict[str, object],
-) -> WindowCache:
-    return WindowCache(
-        schema_version=WINDOW_CACHE_SCHEMA_VERSION,
-        loop_method=mode,
-        prediction_key=PREDICTION_KEY,
-        model_name=ModelName.PI3,
-        checkpoint_digest=CHECKPOINT_DIGEST,
-        window_index=window_index,
-        frame_start=window_index,
-        frame_end=window_index + 2,
-        local_points=torch.full((2, 1, 1, 3), depth),
-        camera_poses=torch.eye(4).repeat(2, 1, 1),
-        confidence=torch.ones((2, 1, 1)),
-        segmentation_labels=(
-            np.zeros((1, 1), dtype=np.intp),
-            np.zeros((1, 1), dtype=np.intp),
-        ),
-        anchor_scale_mask=(
-            None
-            if anchor_scale is None
-            else torch.full((2, 1, 1, 1), anchor_scale)
-        ),
-        loop_state=state,
-    )
 
 
 def test_legacy_no_loop_uses_corrected_predecessor_for_next_registration():
@@ -220,30 +128,47 @@ def test_legacy_traditional_records_scale_before_final_application(
 
 
 def test_legacy_corrected_applies_online_scale_and_final_delta_once(
-    monkeypatch,
-    tmp_path,
 ):
-    from loop_closure.methods import corrected as corrected_module
-
-    engine = _build_engine(CorrectedWindowEngine, tmp_path, 3.0)
-    monkeypatch.setattr(
-        corrected_module,
-        "register_adjacent_windows",
-        lambda *arguments: identity_sim3(2.0),
+    states = (
+        CorrectedWindowState(
+            window_index=0,
+            frame_start=0,
+            frame_end=2,
+            local_points=torch.ones((2, 1, 1, 3)),
+            camera_poses=torch.eye(4).repeat(2, 1, 1),
+            confidence=torch.ones((2, 1, 1)),
+            segmentation_labels=(),
+            anchor_scale_mask=None,
+            sim3_abs=identity_sim3(),
+            sim3_edge=None,
+            segmentation_diagnostics=(),
+        ),
+        CorrectedWindowState(
+            window_index=1,
+            frame_start=1,
+            frame_end=3,
+            local_points=torch.full((2, 1, 1, 3), 6.0),
+            camera_poses=torch.eye(4).repeat(2, 1, 1),
+            confidence=torch.ones((2, 1, 1)),
+            segmentation_labels=(),
+            anchor_scale_mask=torch.full((2, 1, 1, 1), 3.0),
+            sim3_abs=identity_sim3(2.0),
+            sim3_edge=identity_sim3(2.0),
+            segmentation_diagnostics=(),
+        ),
     )
-    caches = _run_legacy_engine(engine, count=2)
     solution = LoopSolution(
         optimized_transforms=(identity_sim3(), identity_sim3(4.0)),
         constraints=(),
         used_no_loop_path=False,
     )
-    result = CorrectedLoopClosureStrategy(
-        optimizer_config=_optimizer_config(),
-        registration_confidence_keep_ratio=0.5,
-    ).aggregate(caches, solution)
+    result = CorrectedLoopProcessor(_optimizer_config()).aggregate(
+        states,
+        solution,
+    )
 
-    assert caches[1].local_points[:, 0, 0, 2].tolist() == [6.0, 6.0]
-    assert result.payload["local_points"][:, 0, 0, 2].tolist() == [
+    assert states[1].local_points[:, 0, 0, 2].tolist() == [6.0, 6.0]
+    assert result.local_points[:, 0, 0, 2].tolist() == [
         1.0,
         1.0,
         pytest.approx(12.0),

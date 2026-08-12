@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from pipeline.config import ReconstructionMode
 
-from .corrected import CorrectedLoopClosureStrategy
+from .corrected import CorrectedLoopProcessor
 from .traditional import TraditionalLoopProcessor
 
 
 LOOP_PROCESSORS = {
     ReconstructionMode.TRADITIONAL: TraditionalLoopProcessor,
-    ReconstructionMode.CORRECTED: CorrectedLoopClosureStrategy,
+    ReconstructionMode.CORRECTED: CorrectedLoopProcessor,
 }
 
 

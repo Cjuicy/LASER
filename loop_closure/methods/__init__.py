@@ -10,8 +10,7 @@ from .base import (
 )
 from .shared import detect_loop_candidates
 from .corrected import (
-    CorrectedLoopClosureStrategy,
-    CorrectedWindowEngine,
+    CorrectedLoopProcessor,
     build_local_loop_constraint,
 )
 from .traditional import (
@@ -29,8 +28,7 @@ __all__ = [
     "LoopSolution",
     "LOOP_PROCESSORS",
     "ReconstructionResult",
-    "CorrectedLoopClosureStrategy",
-    "CorrectedWindowEngine",
+    "CorrectedLoopProcessor",
     "TraditionalLoopProcessor",
     "WindowCache",
     "build_local_loop_constraint",
