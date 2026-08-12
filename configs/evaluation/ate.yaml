@@ -1,0 +1,3 @@
+version: 1
+alignment: sim3
+rpe_delta_frames: 1
