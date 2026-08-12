@@ -197,7 +197,6 @@ def test_public_pipeline_source_contains_no_legacy_parameter_names():
     roots = [
         Path("pipeline"),
         Path("run_laser.py"),
-        Path("inference_engine/streaming_window_engine.py"),
         Path("inference_engine/segmentation"),
         Path("loop_closure/methods"),
     ]

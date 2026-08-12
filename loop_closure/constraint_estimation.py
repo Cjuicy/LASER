@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 
 import torch
@@ -111,25 +110,6 @@ class JointAlignmentEstimator:
         alignment_a = self._align_side(cache_a, range_a, joint_a, "side A")
         alignment_b = self._align_side(cache_b, range_b, joint_b, "side B")
         return alignment_a, alignment_b
-
-    def __call__(
-        self,
-        cache_a: LoopWindow,
-        cache_b: LoopWindow,
-        candidate: LoopCandidate,
-        keep_ratio: float,
-    ) -> tuple[Sim3, Sim3]:
-        ratio = validate_confidence_keep_ratio(keep_ratio)
-        if not math.isclose(
-            ratio,
-            self.confidence_keep_ratio,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            raise ValueError(
-                "strategy keep ratio does not match joint estimator configuration"
-            )
-        return self.estimate(cache_a, cache_b, candidate)
 
     def _predict(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         prediction = self.model.predict(

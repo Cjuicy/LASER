@@ -100,50 +100,11 @@ def test_pointcloud_config_rejects_pipeline_fields(tmp_path):
         load_pointcloud_evaluation_config(path)
 
 
-def test_new_pointcloud_metrics_match_existing_implementation():
-    from mv_recon.geometry_metrics import (
-        BackendResult as OldBackendResult,
-        evaluate_point_maps as old_evaluate,
-    )
-    from mv_recon.protocol import GeometryProtocol
-
+def test_sim3_aligned_metrics_keep_characterized_values():
     points = _grid(5, 6)
     predicted = points * 2.0 + np.array([3.0, -1.0, 0.5])
     mask = np.ones(points.shape[:-1], dtype=bool)
 
-    class OldIdentityBackend:
-        def refine_and_estimate_normals(
-            self, predicted_points, ground_truth_points, threshold_m
-        ):
-            del threshold_m
-            return OldBackendResult(
-                predicted_points=np.asarray(predicted_points),
-                ground_truth_points=np.asarray(ground_truth_points),
-                predicted_normals=np.tile(
-                    [1.0, 0.0, 0.0], (len(predicted_points), 1)
-                ),
-                ground_truth_normals=np.tile(
-                    [1.0, 0.0, 0.0], (len(ground_truth_points), 1)
-                ),
-                transformation=np.eye(4),
-                fitness=1.0,
-                inlier_rmse=0.0,
-            )
-
-    old = old_evaluate(
-        predicted,
-        points,
-        mask,
-        GeometryProtocol(
-            center_crop_size=4,
-            alignment="umeyama_sim3_then_icp",
-            icp_type="point_to_point",
-            icp_threshold_m=0.1,
-            normal_estimation="open3d_default",
-            fscore_thresholds_m=(0.01, 0.02, 0.05),
-        ),
-        backend=OldIdentityBackend(),
-    )
     new = evaluate_point_maps(
         PointMapEstimate(
             (0,),
@@ -156,19 +117,10 @@ def test_new_pointcloud_metrics_match_existing_implementation():
         backend=IdentityBackend(),
     )
 
-    assert asdict(new.primary) == pytest.approx(
-        asdict(old.primary),
-        abs=1e-7,
-    )
-    assert asdict(new.diagnostics.directional_normals) == pytest.approx(
-        asdict(old.diagnostics.directional_normals),
-        abs=1e-12,
-    )
-    assert new.diagnostics.chamfer_l1_m == pytest.approx(
-        old.diagnostics.chamfer_l1_m,
-        abs=1e-7,
-    )
-    assert [asdict(item) for item in new.diagnostics.thresholds] == [
-        pytest.approx(asdict(item), abs=1e-12)
-        for item in old.diagnostics.thresholds
-    ]
+    assert new.primary.accuracy_mean_m == pytest.approx(0.0, abs=1e-7)
+    assert new.primary.completion_mean_m == pytest.approx(0.0, abs=1e-7)
+    assert new.primary.normal_consistency_mean == pytest.approx(1.0)
+    assert new.diagnostics.umeyama_scale == pytest.approx(0.5, abs=1e-9)
+    assert new.diagnostics.predicted_point_count == 16
+    assert new.diagnostics.ground_truth_point_count == 16
+    assert all(item.fscore == pytest.approx(1.0) for item in new.diagnostics.thresholds)

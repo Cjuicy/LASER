@@ -20,20 +20,13 @@ def run_model_inference(
         image_dir,
         image_paths,
 ):
-    if args.model in {'streaming_pi3', 'streaming_pi3_lc'}:
-        return model(
-            images,
-            image_dir,
-            image_paths=image_paths,
-        )
+    del args, image_dir, image_paths
     return model(images)
 
 
 def load_model_images(model_name, filelist, device):
-    images = load_and_preprocess_images(filelist)
-    if model_name == 'pi3':
-        return images.to(device)
-    return images
+    del model_name
+    return load_and_preprocess_images(filelist).to(device)
 
 
 def eval_pose_estimation(args, model, device, dtype, save_dir=None, inverse_extrinsic=True):

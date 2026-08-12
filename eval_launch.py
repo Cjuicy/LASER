@@ -1,22 +1,8 @@
 from eval.pose_eval import eval_pose_estimation
 from eval.depth_eval import eval_mono_depth_estimation
 from inference_engine import VanillaEngine
-from loop_closure.methods import detect_loop_candidates
-from loop_closure.constraint_estimation import JointAlignmentEstimator
-from pipeline.config import (
-    LoopMethod,
-    load_pipeline_config,
-)
-from pipeline.manifest import ImageManifest
-from pipeline.runner import (
-    build_model_handle,
-    complete_reconstruction_payload,
-    run_windows,
-    StreamingPipelineModel,
-)
-from inference_engine.prediction_cache.types import build_window_specs
-from contextlib import nullcontext
-from functools import partial
+from pipeline.config import load_pipeline_config
+from pipeline.runner import build_model_handle
 from dataclasses import replace
 import eval.misc as misc  # noqa
 import torch
@@ -25,7 +11,6 @@ import numpy as np
 import os
 import argparse
 import json
-from pathlib import Path
 
 
 def get_args_parser():
@@ -85,7 +70,7 @@ def get_args_parser():
                         help='choose dataset for pose evaluation')
     # model variant
     parser.add_argument('--model', type=str, required=True,
-                        choices=['pi3', 'streaming_pi3', 'streaming_pi3_lc'],
+                        choices=['pi3'],
                         help='choose model for pose evaluation')
     # checkpoint loading
     parser.add_argument('--ckpt_path', default=None, type=str, help='trained checkpoint for evaluation')
@@ -114,133 +99,6 @@ dtype = (
 )
 
 
-def _run_modular_evaluation(model, imgs, manifest, detect_loops):
-    engine = (
-        model.prepare(imgs, manifest)
-        if isinstance(model, StreamingPipelineModel)
-        else model
-    )
-    config = engine.pipeline_config
-    specs = getattr(
-        engine,
-        "window_specs",
-        build_window_specs(
-            len(manifest),
-            config.window.size,
-            config.window.overlap,
-        ),
-    )
-    store = getattr(engine, "prediction_store", None)
-    lock = store.entry_lock() if store is not None else nullcontext()
-    with lock:
-        caches = run_windows(engine, manifest, imgs, specs, config)
-    candidates = (
-        detect_loop_candidates(
-            config.loop.detection,
-            manifest,
-            Path(config.output.cache_dir) / "loop_candidates.txt",
-        )
-        if detect_loops and config.loop.enabled
-        else ()
-    )
-    constraint_estimator = (
-        JointAlignmentEstimator(
-            model=engine.model_handle,
-            images=imgs,
-            manifest=manifest,
-            chunk_size=config.loop.constraint.chunk_size,
-            confidence_keep_ratio=(
-                config.loop.registration.confidence_keep_ratio
-            ),
-        )
-        if candidates
-        else None
-    )
-    constraints = engine.loop_strategy.build_constraints(
-        caches,
-        candidates,
-        constraint_estimator=constraint_estimator,
-    )
-    solution = engine.loop_strategy.optimize(caches, constraints)
-    result = engine.loop_strategy.aggregate(caches, solution)
-    result = complete_reconstruction_payload(result, imgs)
-    return {
-        key: value.detach().cpu()
-        if isinstance(value, torch.Tensor)
-        else value
-        for key, value in result.payload.items()
-    }
-
-
-def inference_streaming_model(
-    model,
-    imgs,
-    img_dir=None,
-    image_paths=None,
-    *args,
-    **kwargs,
-):
-    if image_paths is None:
-        raise ValueError(
-            "streaming evaluation requires the exact image_paths "
-            "used to build imgs"
-        )
-    if len(image_paths) != len(imgs):
-        raise ValueError(
-            "image manifest length does not match evaluation tensor: "
-            f"{len(image_paths)} != {len(imgs)}"
-        )
-    manifest = ImageManifest(
-        paths=tuple(Path(path).resolve() for path in image_paths)
-    )
-    return _run_modular_evaluation(
-        model,
-        imgs,
-        manifest,
-        detect_loops=False,
-    )
-
-
-def inference_streaming_model_lc(
-        model,
-        imgs,
-        img_dir,
-        image_paths=None,
-        *args,
-        **kwargs,
-):
-    if image_paths is None:
-        raise ValueError(
-            "streaming_pi3_lc evaluation requires the exact image_paths "
-            "used to build imgs"
-        )
-    if len(image_paths) != len(imgs):
-        raise ValueError(
-            "image manifest length does not match evaluation tensor: "
-            f"{len(image_paths)} != {len(imgs)}"
-        )
-
-    manifest = ImageManifest(
-        paths=tuple(Path(path).resolve() for path in image_paths)
-    )
-    return _run_modular_evaluation(
-        model,
-        imgs,
-        manifest,
-        detect_loops=True,
-    )
-
-
-def _select_inference_function(model_kind, model):
-    if model_kind == "pi3":
-        return model
-    if model_kind == "streaming_pi3":
-        return partial(inference_streaming_model, model)
-    if model_kind == "streaming_pi3_lc":
-        return partial(inference_streaming_model_lc, model)
-    raise ValueError(f"unsupported evaluation model kind: {model_kind!r}")
-
-
 def pi3_main(args):
     print('Launching Pi3 eval')
     misc.init_distributed_mode(args)
@@ -263,33 +121,12 @@ def pi3_main(args):
             else "float16"
         ),
     )
-    if args.model == 'pi3':
-        model = VanillaEngine(
-            build_model_handle(runtime_model).get()
-        )
-    else:
-        runtime_loop = config.loop
-        if args.model == 'streaming_pi3':
-            runtime_loop = replace(
-                runtime_loop,
-                enabled=False,
-                method=LoopMethod.TRADITIONAL,
-            )
-        runtime_config = replace(
-            config,
-            model=runtime_model,
-            loop=runtime_loop,
-            output=replace(
-                config.output,
-                cache_dir=str(Path(args.output_dir) / "inference_cache"),
-            ),
-        )
-        model = StreamingPipelineModel(runtime_config)
+    model = VanillaEngine(build_model_handle(runtime_model).get())
     model.eval()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    infer_func = _select_inference_function(args.model, model)
+    infer_func = model
     if args.mode == 'eval_pose':
         ate_mean, rpe_trans_mean, rpe_rot_mean, seq_attr, outfile_list, bug = eval_pose_estimation(
             args,

@@ -120,14 +120,19 @@ def test_preflight_requires_loop_weights_when_enabled(
 def test_preflight_skips_loop_weights_when_loop_is_disabled(tmp_path):
     image_dir = tmp_path / "images"
     _create_images(image_dir)
-    config = _load_valid_config(
-        tmp_path,
-        image_dir,
-        "loop.enabled=false",
-        f"loop.detection.salad_checkpoint={tmp_path / 'missing-salad.ckpt'}",
-        f"loop.detection.dino_checkpoint={tmp_path / 'missing-dino.pth'}",
-        "model.inference_device=cpu",
-    )
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"x")
+    config = load_pipeline_config(
+        "configs/reconstruction/pi3_laser_no_loop.yaml",
+        (
+            f"input.image_dir={image_dir}",
+            f"model.checkpoint={checkpoint}",
+            "model.inference_device=cpu",
+            "model.process_device=cpu",
+            "window.size=6",
+            "window.overlap=5",
+        ),
+    ).config
     manifest = discover_image_manifest(image_dir, 1)
     validate_preflight(config, manifest, cuda_available=False)
 

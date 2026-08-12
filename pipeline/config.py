@@ -29,13 +29,6 @@ class ReconstructionMode(str, Enum):
     CORRECTED = "corrected"
 
 
-class LoopMethod(str, Enum):
-    """Internal migration enum; public configuration uses ReconstructionMode."""
-
-    TRADITIONAL = ReconstructionMode.TRADITIONAL.value
-    CORRECTED = ReconstructionMode.CORRECTED.value
-
-
 class ConfidenceQuantileMethod(str, Enum):
     HIGHER = "higher"
     NEAREST = "nearest"

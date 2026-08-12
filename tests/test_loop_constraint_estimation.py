@@ -1,7 +1,7 @@
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 
-import numpy as np
 import pytest
 import torch
 
@@ -12,12 +12,7 @@ from loop_closure.constraint_estimation import (
     centered_frame_range,
 )
 from inference_engine.models.lazy import LazyModelHandle
-from loop_closure.methods.base import (
-    WINDOW_CACHE_SCHEMA_VERSION,
-    LoopCandidate,
-    WindowCache,
-)
-from pipeline.config import LoopMethod, ModelName
+from loop_closure.types import LoopCandidate
 from pipeline.manifest import ImageManifest
 
 
@@ -67,25 +62,25 @@ class RegistrationCall:
         self.target_frame_ids = target[:, 0, 0, 0].tolist()
 
 
+@dataclass(frozen=True)
+class LoopWindowFixture:
+    window_index: int
+    frame_start: int
+    frame_end: int
+    local_points: torch.Tensor
+    camera_poses: torch.Tensor
+    confidence: torch.Tensor
+
+
 def _cache(frame_start, frame_end, window_index):
     frames = frame_end - frame_start
-    return WindowCache(
-        schema_version=WINDOW_CACHE_SCHEMA_VERSION,
-        loop_method=LoopMethod.TRADITIONAL,
-        prediction_key="prediction-key",
-        model_name=ModelName.PI3,
-        checkpoint_digest="a" * 64,
+    return LoopWindowFixture(
         window_index=window_index,
         frame_start=frame_start,
         frame_end=frame_end,
         local_points=torch.zeros((frames, 1, 1, 3)),
         camera_poses=torch.eye(4).repeat(frames, 1, 1),
         confidence=torch.ones((frames, 1, 1)),
-        segmentation_labels=tuple(
-            np.zeros((1, 1), dtype=np.intp) for _ in range(frames)
-        ),
-        anchor_scale_mask=None,
-        loop_state={"tag": LoopMethod.TRADITIONAL.value},
     )
 
 
@@ -177,16 +172,4 @@ def test_joint_estimator_rejects_legacy_image_manifest_keyword():
             image_manifest=_manifest(),
             chunk_size=4,
             confidence_keep_ratio=0.5,
-        )
-
-
-def test_joint_estimator_rejects_call_time_keep_ratio_mismatch():
-    estimator = _estimator(RecordingPi3())
-
-    with pytest.raises(ValueError, match="does not match"):
-        estimator(
-            _cache(4, 10, 1),
-            _cache(0, 6, 0),
-            LoopCandidate(frame_a=8, frame_b=1, similarity=0.9),
-            keep_ratio=0.3,
         )

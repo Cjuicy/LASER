@@ -10,11 +10,7 @@ from loop_closure.methods.corrected import (
 from loop_closure.methods.traditional import (
     TraditionalLoopProcessor,
 )
-from mv_recon.paper_streaming import (
-    PaperStreamingDependencies,
-    reconstruct_incremental_point_maps,
-)
-from pipeline.config import load_pipeline_config
+from pipeline.config import ReconstructionMode, load_pipeline_config
 
 from .fixtures import (
     SPECS,
@@ -24,7 +20,10 @@ from .fixtures import (
     identity_sim3,
 )
 from reconstruction.modes.corrected import CorrectedWindowState
+from reconstruction.modes.no_loop import NoLoopReconstructionMode
 from reconstruction.modes.traditional import TraditionalWindowState
+from reconstruction.modes.base import ReconstructionContext
+from reconstruction.prediction_stream import iter_window_predictions
 
 
 def _optimizer_config():
@@ -32,6 +31,29 @@ def _optimizer_config():
         "configs/pipeline/test.yaml",
         ("loop.optimizer.implementation=python",),
     ).config.loop.optimizer
+
+
+def _no_loop_context(anchor):
+    config = load_pipeline_config(
+        "configs/reconstruction/pi3_laser_no_loop.yaml",
+        ("window.size=2", "window.overlap=1", "model.process_device=cpu"),
+    ).config
+    return ReconstructionContext(
+        predictions=iter_window_predictions(
+            LiteralProvider(),
+            SPECS,
+            torch.zeros((4, 3, 1, 1)),
+            "cpu",
+        ),
+        frame_ids=(0, 1, 2, 3),
+        segmentation_strategy=OneRegionSegmenter(),
+        anchor_propagator=anchor,
+        segmentation_config=config.segmentation,
+        anchor_config=config.anchor_propagation,
+        registration_config=config.registration,
+        window_config=config.window,
+        reconstruction_mode=ReconstructionMode.NO_LOOP,
+    )
 
 
 def test_legacy_no_loop_uses_corrected_predecessor_for_next_registration():
@@ -49,26 +71,11 @@ def test_legacy_no_loop_uses_corrected_predecessor_for_next_registration():
         return identity_sim3(next(registration_scales))
 
     anchor = SequencedAnchor()
-    result = reconstruct_incremental_point_maps(
-        provider=LiteralProvider(),
-        specs=SPECS,
-        images=torch.zeros((4, 3, 1, 1)),
-        segmenter=OneRegionSegmenter(),
-        anchor_propagator=anchor,
-        overlap=1,
-        confidence_keep_ratio=0.5,
-        temporal_iou_threshold=0.3,
-        anchor_enabled=True,
-        dependencies=PaperStreamingDependencies(
-            register_adjacent_windows=register,
-            apply_sim3_to_pose=(
-                lambda poses, scale, rotation, translation: poses
-            ),
-            build_temporal_graphs=(
-                lambda results, threshold: (tuple(results), threshold)
-            ),
-        ),
-    )
+    result = NoLoopReconstructionMode(
+        register_adjacent=register,
+        apply_pose_sim3=lambda poses, scale, rotation, translation: poses,
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+    ).run(_no_loop_context(anchor))
 
     assert registration_sources == [(1.0, 1.0), (10.0, 1.0)]
     assert anchor.calls == [(1.0, 2.0), (10.0, 3.0)]
