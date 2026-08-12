@@ -26,8 +26,11 @@ from pipeline.manifest import ImageManifest
 
 PAPER_PROTOCOL_NAME = "laser_cvpr2026_table4_pi3"
 COMPARISON_PROTOCOL_NAME = "laser_neuralrgbd_pointmap_comparison"
-POINTMAP_ASSEMBLY = "laser-incremental-global-map-v1"
-PROTOCOL_MODES = frozenset({"paper", "comparison"})
+EXPERIMENT_PROTOCOL_NAME = "laser_neuralrgbd_pointmap_loop_experiment"
+PAPER_POINTMAP_ASSEMBLY = "laser-incremental-global-map-v1"
+LOOP_EXPERIMENT_POINTMAP_ASSEMBLY = "pipeline-loop-aggregate-v1"
+POINTMAP_ASSEMBLY = PAPER_POINTMAP_ASSEMBLY
+PROTOCOL_MODES = frozenset({"paper", "comparison", "experiment"})
 PAPER_DATASETS = ("7scenes-dense", "NRGBD-dense")
 EXPECTED_DATASET_SEQUENCE_COUNTS = {
     "7scenes-dense": 18,
@@ -156,6 +159,7 @@ class ResolvedEvaluationProtocol:
     pipeline: LoadedPipelineConfig
     datasets: tuple[str, ...]
     output_dir: Path
+    pointmap_assembly: str
     resolved_yaml: str
     sha256: str
     identity_sha256: str
@@ -412,8 +416,6 @@ def _validate_protocol_locks(
             config.anchor_propagation.correspondence_iou_threshold,
             0.4,
         ),
-        "loop.enabled": (config.loop.enabled, False),
-        "loop.method": (config.loop.method, LoopMethod.TRADITIONAL),
         "loop.registration.confidence_keep_ratio": (
             config.loop.registration.confidence_keep_ratio,
             0.5,
@@ -455,9 +457,14 @@ def _validate_protocol_locks(
                     config.prediction_cache.mode.value,
                     "auto",
                 ),
+                "loop.enabled": (config.loop.enabled, False),
+                "loop.method": (
+                    config.loop.method,
+                    LoopMethod.TRADITIONAL,
+                ),
             }
         )
-    else:
+    elif protocol.mode == "comparison":
         expected["protocol.name"] = (
             protocol.name,
             COMPARISON_PROTOCOL_NAME,
@@ -475,6 +482,30 @@ def _validate_protocol_locks(
             config.prediction_cache.mode.value,
             "auto" if method is SegmentationMethod.DEPTH else "readonly",
         )
+        expected["loop.enabled"] = (config.loop.enabled, False)
+        expected["loop.method"] = (
+            config.loop.method,
+            LoopMethod.TRADITIONAL,
+        )
+    else:
+        expected.update(
+            {
+                "protocol.name": (protocol.name, EXPERIMENT_PROTOCOL_NAME),
+                "segmentation.method": (
+                    config.segmentation.method,
+                    SegmentationMethod.DEPTH,
+                ),
+                "prediction_cache.mode": (
+                    config.prediction_cache.mode.value,
+                    "auto",
+                ),
+                "loop.enabled": (config.loop.enabled, True),
+                "loop.method": (
+                    config.loop.method,
+                    LoopMethod.TRADITIONAL,
+                ),
+            }
+        )
     for dataset, reference_values in PAPER_REFERENCE_VALUES.items():
         reference = protocol.paper_reference[dataset]
         for field_name, wanted in reference_values.items():
@@ -487,7 +518,7 @@ def _validate_protocol_locks(
         if actual != wanted
     ]
     if drift:
-        label = "paper" if protocol.mode == "paper" else "comparison"
+        label = protocol.mode
         raise ValueError(
             f"laser {label} protocol drift: " + "; ".join(drift)
         )
@@ -502,6 +533,14 @@ def _validate_datasets(
             raise ValueError(
                 "laser paper protocol drift: expected datasets "
                 f"{PAPER_DATASETS}, got {datasets}"
+            )
+        return
+    if protocol.mode == "experiment":
+        if datasets != ("NRGBD-dense",):
+            raise ValueError(
+                "laser experiment protocol drift: expected datasets "
+                "('NRGBD-dense',), got "
+                f"{datasets}"
             )
         return
     positions = [
@@ -530,6 +569,14 @@ def _jsonable(value: object) -> object:
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
     return value
+
+
+def pointmap_assembly_for_mode(mode: str) -> str:
+    if mode in {"paper", "comparison"}:
+        return PAPER_POINTMAP_ASSEMBLY
+    if mode == "experiment":
+        return LOOP_EXPERIMENT_POINTMAP_ASSEMBLY
+    raise ValueError(f"unsupported evaluation mode: {mode!r}")
 
 
 def resolve_evaluation_protocol(
@@ -566,10 +613,11 @@ def resolve_evaluation_protocol(
 
     datasets = tuple(str(name) for name in hydra_cfg.eval_datasets)
     _validate_datasets(protocol, datasets)
+    pointmap_assembly = pointmap_assembly_for_mode(protocol.mode)
     resolved_payload = {
         **_jsonable(asdict(protocol)),
         "eval_datasets": list(datasets),
-        "pointmap_assembly": POINTMAP_ASSEMBLY,
+        "pointmap_assembly": pointmap_assembly,
     }
     resolved_yaml = OmegaConf.to_yaml(
         OmegaConf.create(resolved_payload),
@@ -587,6 +635,7 @@ def resolve_evaluation_protocol(
         pipeline=loaded,
         datasets=datasets,
         output_dir=output_dir.resolve(),
+        pointmap_assembly=pointmap_assembly,
         resolved_yaml=resolved_yaml,
         sha256=hashlib.sha256(resolved_yaml.encode("utf-8")).hexdigest(),
         identity_sha256=hashlib.sha256(

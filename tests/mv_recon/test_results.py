@@ -225,6 +225,28 @@ def test_resume_rejects_changed_sequence_map_identity(tmp_path):
         ResultStore(output, changed, resume=True)
 
 
+def test_resume_identity_includes_auxiliary_checkpoint_hashes(tmp_path):
+    identity = _identity(
+        auxiliary_checkpoint_sha256={
+            "salad": "a" * 64,
+            "dino": "b" * 64,
+        }
+    )
+    output = tmp_path / "results"
+    store = ResultStore(output, identity, resume=False)
+    _initialize(store)
+    changed = replace(
+        identity,
+        auxiliary_checkpoint_sha256={
+            "salad": "c" * 64,
+            "dino": "b" * 64,
+        },
+    )
+
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        ResultStore(output, changed, resume=True)
+
+
 def test_resume_reuses_only_exact_input_manifest(tmp_path):
     output = tmp_path / "results"
     first = ResultStore(output, _identity(), resume=False)

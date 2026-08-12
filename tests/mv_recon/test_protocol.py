@@ -57,6 +57,58 @@ def _comparison_config(tmp_path: Path, *, method: str = "depth"):
     return config
 
 
+def _experiment_config(tmp_path: Path):
+    return _profile_config(
+        tmp_path,
+        "mv_recon_laser_nrgbd_depth_loop_traditional",
+    )
+
+
+def test_traditional_loop_experiment_profile_is_fully_locked(tmp_path):
+    resolved = resolve_evaluation_protocol(_experiment_config(tmp_path), ROOT)
+    pipeline = resolved.pipeline.config
+
+    assert resolved.protocol.mode == "experiment"
+    assert resolved.protocol.name == (
+        "laser_neuralrgbd_pointmap_loop_experiment"
+    )
+    assert resolved.datasets == ("NRGBD-dense",)
+    assert resolved.pointmap_assembly == "pipeline-loop-aggregate-v1"
+    assert (pipeline.window.size, pipeline.window.overlap) == (20, 5)
+    assert pipeline.segmentation.method.value == "depth"
+    assert pipeline.anchor_propagation.enabled is True
+    assert pipeline.loop.enabled is True
+    assert pipeline.loop.method.value == "traditional"
+    assert pipeline.prediction_cache.mode.value == "auto"
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        "loop.enabled=false",
+        "loop.method=corrected",
+        "segmentation.method=atomic",
+        "window.size=10",
+    ),
+)
+def test_traditional_loop_experiment_rejects_drift(tmp_path, override):
+    config = _experiment_config(tmp_path)
+    config.protocol.pipeline_overrides.append(override)
+
+    with pytest.raises(ValueError, match="experiment protocol drift"):
+        resolve_evaluation_protocol(config, ROOT)
+
+
+def test_paper_and_comparison_keep_incremental_assembly(tmp_path):
+    paper = resolve_evaluation_protocol(_root_config(tmp_path), ROOT)
+    depth = resolve_evaluation_protocol(
+        _profile_config(tmp_path, "mv_recon_laser_nrgbd_depth"), ROOT
+    )
+
+    assert paper.pointmap_assembly == "laser-incremental-global-map-v1"
+    assert depth.pointmap_assembly == "laser-incremental-global-map-v1"
+
+
 @pytest.mark.parametrize(
     ("profile", "method", "cache_mode"),
     (

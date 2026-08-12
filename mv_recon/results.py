@@ -6,7 +6,7 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -34,6 +34,9 @@ class RunIdentity:
     pipeline_sha256: str
     checkpoint_sha256: str
     sequence_map_sha256: Mapping[str, str]
+    auxiliary_checkpoint_sha256: Mapping[str, str] = field(
+        default_factory=dict
+    )
     metric_version: str = METRIC_SCHEMA_VERSION
 
 
@@ -330,12 +333,18 @@ def _identity_from_payload(payload: Mapping[str, object]) -> RunIdentity:
     map_hashes = payload["sequence_map_sha256"]
     if not isinstance(map_hashes, Mapping):
         raise ValueError("invalid stored sequence-map identity")
+    auxiliary_hashes = payload.get("auxiliary_checkpoint_sha256", {})
+    if not isinstance(auxiliary_hashes, Mapping):
+        raise ValueError("invalid stored auxiliary-checkpoint identity")
     return RunIdentity(
         protocol_identity_sha256=str(payload["protocol_identity_sha256"]),
         pipeline_sha256=str(payload["pipeline_sha256"]),
         checkpoint_sha256=str(payload["checkpoint_sha256"]),
         sequence_map_sha256={
             str(key): str(value) for key, value in map_hashes.items()
+        },
+        auxiliary_checkpoint_sha256={
+            str(key): str(value) for key, value in auxiliary_hashes.items()
         },
         metric_version=str(payload["metric_version"]),
     )

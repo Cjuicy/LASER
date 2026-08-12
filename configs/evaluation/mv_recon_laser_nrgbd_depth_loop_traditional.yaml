@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - mv_recon_laser_nrgbd_depth
+  - _self_
+
+name: mv_recon_laser_nrgbd_depth_loop_traditional
+
+protocol:
+  name: laser_neuralrgbd_pointmap_loop_experiment
+  mode: experiment
+  prediction_cache_mode: auto
+  pipeline_overrides:
+    - window.size=20
+    - window.overlap=5
+    - segmentation.method=depth
+    - segmentation.confidence_keep_ratio=0.5
+    - segmentation.depth_merge_threshold=0.1
+    - segmentation.temporal_iou_threshold=0.3
+    - segmentation.felzenszwalb.scale=300
+    - segmentation.felzenszwalb.sigma=1.1
+    - segmentation.felzenszwalb.min_size=500
+    - segmentation.geometry.normal_method=cross
+    - segmentation.geometry.normal_threshold_degrees=20.0
+    - segmentation.atomic.split_mode=conservative
+    - segmentation.atomic.split_score_threshold=0.10
+    - anchor_propagation.enabled=true
+    - anchor_propagation.correspondence_iou_threshold=0.4
+    - loop.enabled=true
+    - loop.method=traditional
+    - loop.registration.confidence_keep_ratio=0.5
