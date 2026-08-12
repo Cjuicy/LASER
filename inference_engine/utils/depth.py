@@ -53,7 +53,8 @@ def segment_depth_felzenszwalb_rag_stages(
         seg_scale=300,
         seg_sigma=1.1,
         seg_min_size=500,
-        batch_idx=None
+        batch_idx=None,
+        confidence_quantile_method="higher",
 ):
     initial_labels = felzenszwalb(
         depth_map,
@@ -75,6 +76,7 @@ def segment_depth_felzenszwalb_rag_stages(
         high_confidence = select_numpy_top_confidence_mask(
             frame_conf,
             confidence_keep_ratio,
+            method=confidence_quantile_method,
         )
         conf_depth = depth_map[high_confidence]
     else:
@@ -94,7 +96,8 @@ def segment_depth_felzenszwalb_rag(
         seg_scale=300,
         seg_sigma=1.1,
         seg_min_size=500,
-        batch_idx=None
+        batch_idx=None,
+        confidence_quantile_method="higher",
 ):
     _, coarse_labels, _ = segment_depth_felzenszwalb_rag_stages(
         depth_map,
@@ -105,6 +108,7 @@ def segment_depth_felzenszwalb_rag(
         seg_sigma,
         seg_min_size,
         batch_idx,
+        confidence_quantile_method,
     )
     return coarse_labels
 

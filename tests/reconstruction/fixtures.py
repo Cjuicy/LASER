@@ -7,6 +7,7 @@ import torch
 
 from inference_engine.prediction_cache.types import WindowSpec
 from inference_engine.segmentation.base import SegmentationResult
+from pipeline.config import SegmentationMethod
 
 
 PREDICTION_KEY = "characterization-prediction-key"
@@ -23,6 +24,8 @@ def identity_sim3(scale: float = 1.0):
 
 
 class LiteralProvider:
+    prediction_key = PREDICTION_KEY
+
     def get(self, spec: WindowSpec, images: torch.Tensor):
         if images.shape[0] != spec.frame_count:
             raise AssertionError("fixture images do not match WindowSpec")
@@ -40,6 +43,8 @@ class LiteralProvider:
 
 
 class OneRegionSegmenter:
+    name = SegmentationMethod.DEPTH
+
     def segment(self, points, confidence, images):
         if not points.shape[0] == confidence.shape[0] == images.shape[0]:
             raise AssertionError("fixture segmentation frame axes differ")

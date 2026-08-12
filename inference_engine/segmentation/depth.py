@@ -16,6 +16,7 @@ class DepthSegmentationStrategy:
 
     def __init__(self, config: SegmentationConfig) -> None:
         self.confidence_keep_ratio = config.confidence_keep_ratio
+        self.confidence_quantile_method = config.confidence_quantile_method
         self.depth_merge_threshold = config.depth_merge_threshold
         self.seg_scale = config.felzenszwalb.scale
         self.seg_sigma = config.felzenszwalb.sigma
@@ -47,6 +48,9 @@ class DepthSegmentationStrategy:
                 seg_scale=self.seg_scale,
                 seg_sigma=self.seg_sigma,
                 seg_min_size=self.seg_min_size,
+                confidence_quantile_method=(
+                    self.confidence_quantile_method.value
+                ),
             )
             labels = compact_labels(labels)
             results.append(
@@ -59,4 +63,3 @@ class DepthSegmentationStrategy:
                 )
             )
         return results
-
