@@ -61,6 +61,10 @@ class OrdinaryPredictionProvider(torch.nn.Module):
             return None
         return self._reference_intrinsic.clone()
 
+    @property
+    def prediction_key(self) -> str:
+        return self.store.fingerprint.key
+
     def _load_sequence_once(self) -> None:
         if self._sequence_checked:
             return

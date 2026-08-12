@@ -27,7 +27,7 @@ class MatrixEntry:
     name: str
     segmentation_method: str
     atomic_split_mode: str | None
-    loop_method: str
+    reconstruction_mode: str
 
     def overrides(
         self,
@@ -38,7 +38,7 @@ class MatrixEntry:
     ) -> tuple[str, ...]:
         values = [
             f"segmentation.method={self.segmentation_method}",
-            f"loop.method={self.loop_method}",
+            f"reconstruction.mode={self.reconstruction_mode}",
         ]
         if self.atomic_split_mode is not None:
             values.append(
@@ -189,7 +189,7 @@ def main(argv=None) -> int:
             f"{entry.name}: "
             f"segmentation={entry.segmentation_method}, "
             f"split={entry.atomic_split_mode or 'n/a'}, "
-            f"loop={entry.loop_method}, "
+            f"reconstruction={entry.reconstruction_mode}, "
             f"config_hash={loaded.sha256}"
         )
         if not args.dry_run:

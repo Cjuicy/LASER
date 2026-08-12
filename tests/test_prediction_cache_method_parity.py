@@ -23,6 +23,7 @@ from loop_closure.methods.base import WindowCache
 from pipeline.config import (
     LoopMethod,
     PredictionCacheMode,
+    ReconstructionMode,
     SegmentationMethod,
     load_pipeline_config,
 )
@@ -141,10 +142,9 @@ def _run_mode(
             base_config.anchor_propagation,
             enabled=True,
         ),
-        loop=replace(
-            base_config.loop,
-            enabled=False,
-            method=method,
+        reconstruction=replace(
+            base_config.reconstruction,
+            mode=ReconstructionMode(method.value),
         ),
     )
     specs = build_window_specs(
