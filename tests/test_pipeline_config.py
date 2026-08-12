@@ -4,15 +4,78 @@ import pytest
 
 from pipeline.config import (
     AtomicSplitMode,
-    LoopMethod,
+    ConfidenceQuantileMethod,
     ModelName,
     PredictionCacheMode,
+    ReconstructionMode,
     SegmentationMethod,
     load_pipeline_config,
 )
 
 
 DEFAULT = Path("configs/pipeline/default.yaml")
+RECONSTRUCTION = Path("configs/reconstruction/pi3_laser.yaml")
+NO_LOOP = Path("configs/reconstruction/pi3_laser_no_loop.yaml")
+
+
+def test_version_two_selects_exact_reconstruction_mode():
+    loaded = load_pipeline_config(
+        RECONSTRUCTION,
+        ("reconstruction.mode=traditional",),
+    )
+    assert loaded.config.version == 2
+    assert loaded.config.reconstruction.mode is ReconstructionMode.TRADITIONAL
+    assert loaded.config.registration.confidence_keep_ratio == pytest.approx(
+        0.5
+    )
+    assert (
+        loaded.config.segmentation.confidence_quantile_method
+        is ConfidenceQuantileMethod.HIGHER
+    )
+
+
+def test_retired_loop_enable_and_method_are_rejected(tmp_path):
+    path = tmp_path / "legacy.yaml"
+    source = RECONSTRUCTION.read_text(encoding="utf-8")
+    path.write_text(
+        source.replace(
+            "loop:\n",
+            "loop:\n  enabled: false\n  method: traditional\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown configuration field"):
+        load_pipeline_config(path)
+
+
+def test_no_loop_config_may_omit_loop_section():
+    loaded = load_pipeline_config(NO_LOOP)
+    assert loaded.config.reconstruction.mode is ReconstructionMode.NO_LOOP
+    assert loaded.config.loop is None
+
+
+def test_loop_mode_requires_loop_configuration():
+    with pytest.raises(ValueError, match="traditional requires loop configuration"):
+        load_pipeline_config(
+            NO_LOOP,
+            ("reconstruction.mode=traditional",),
+        )
+
+
+@pytest.mark.parametrize(
+    ("size", "overlap"),
+    ((10, 5), (20, 5), (20, 10)),
+)
+def test_window_configuration_remains_experiment_controlled(size, overlap):
+    loaded = load_pipeline_config(
+        NO_LOOP,
+        (f"window.size={size}", f"window.overlap={overlap}"),
+    )
+    assert (loaded.config.window.size, loaded.config.window.overlap) == (
+        size,
+        overlap,
+    )
 
 
 def test_default_config_has_approved_methods_and_defaults():
@@ -31,7 +94,9 @@ def test_default_config_has_approved_methods_and_defaults():
         loaded.config.segmentation.atomic.split_mode
         is AtomicSplitMode.CONSERVATIVE
     )
-    assert loaded.config.loop.method is LoopMethod.CORRECTED
+    assert (
+        loaded.config.reconstruction.mode is ReconstructionMode.CORRECTED
+    )
     assert loaded.config.segmentation.felzenszwalb.scale == 300
     assert loaded.config.segmentation.felzenszwalb.sigma == pytest.approx(1.1)
     assert loaded.config.segmentation.felzenszwalb.min_size == 500
@@ -76,14 +141,14 @@ def test_dotlist_overrides_use_new_field_paths_only():
         DEFAULT,
         (
             "segmentation.method=geometry",
-            "loop.method=traditional",
-            "loop.registration.confidence_keep_ratio=0.4",
+            "reconstruction.mode=traditional",
+            "registration.confidence_keep_ratio=0.4",
         ),
     )
     assert loaded.config.segmentation.method is SegmentationMethod.GEOMETRY
-    assert loaded.config.loop.method is LoopMethod.TRADITIONAL
+    assert loaded.config.reconstruction.mode is ReconstructionMode.TRADITIONAL
     assert (
-        loaded.config.loop.registration.confidence_keep_ratio
+        loaded.config.registration.confidence_keep_ratio
         == pytest.approx(0.4)
     )
 
@@ -116,7 +181,7 @@ def test_invalid_keep_ratio_is_rejected(ratio):
     with pytest.raises(ValueError, match="keep_ratio"):
         load_pipeline_config(
             DEFAULT,
-            (f"loop.registration.confidence_keep_ratio={ratio}",),
+            (f"registration.confidence_keep_ratio={ratio}",),
         )
 
 

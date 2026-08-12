@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 input:
   image_dir: tests/fixtures/images
@@ -28,6 +28,7 @@ window:
 segmentation:
   method: atomic
   confidence_keep_ratio: 0.5
+  confidence_quantile_method: higher
   depth_merge_threshold: 0.1
   temporal_iou_threshold: 0.3
 
@@ -48,13 +49,13 @@ anchor_propagation:
   enabled: true
   correspondence_iou_threshold: 0.4
 
+registration:
+  confidence_keep_ratio: 0.30
+
+reconstruction:
+  mode: corrected
+
 loop:
-  enabled: true
-  method: corrected
-
-  registration:
-    confidence_keep_ratio: 0.30
-
   detection:
     method: salad
     salad_checkpoint: weights/dino_salad.ckpt

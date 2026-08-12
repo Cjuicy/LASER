@@ -23,9 +23,22 @@ class AtomicSplitMode(str, Enum):
     NORMAL_ONLY = "normal_only"
 
 
-class LoopMethod(str, Enum):
+class ReconstructionMode(str, Enum):
+    NO_LOOP = "no_loop"
     TRADITIONAL = "traditional"
     CORRECTED = "corrected"
+
+
+class LoopMethod(str, Enum):
+    """Internal migration enum; public configuration uses ReconstructionMode."""
+
+    TRADITIONAL = ReconstructionMode.TRADITIONAL.value
+    CORRECTED = ReconstructionMode.CORRECTED.value
+
+
+class ConfidenceQuantileMethod(str, Enum):
+    HIGHER = "higher"
+    NEAREST = "nearest"
 
 
 class ModelName(str, Enum):
@@ -97,6 +110,7 @@ class AtomicConfig:
 class SegmentationConfig:
     method: SegmentationMethod = MISSING
     confidence_keep_ratio: float = MISSING
+    confidence_quantile_method: ConfidenceQuantileMethod = MISSING
     depth_merge_threshold: float = MISSING
     temporal_iou_threshold: float = MISSING
     felzenszwalb: FelzenszwalbConfig = field(default_factory=FelzenszwalbConfig)
@@ -113,6 +127,11 @@ class AnchorPropagationConfig:
 @dataclass(frozen=True)
 class RegistrationConfig:
     confidence_keep_ratio: float = MISSING
+
+
+@dataclass(frozen=True)
+class ReconstructionConfig:
+    mode: ReconstructionMode = MISSING
 
 
 @dataclass(frozen=True)
@@ -143,9 +162,6 @@ class OptimizerConfig:
 
 @dataclass(frozen=True)
 class LoopConfig:
-    enabled: bool = MISSING
-    method: LoopMethod = MISSING
-    registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     constraint: ConstraintConfig = field(default_factory=ConstraintConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -165,7 +181,13 @@ class PipelineConfig:
     anchor_propagation: AnchorPropagationConfig = field(
         default_factory=AnchorPropagationConfig
     )
-    loop: LoopConfig = field(default_factory=LoopConfig)
+    registration: RegistrationConfig = field(
+        default_factory=RegistrationConfig
+    )
+    reconstruction: ReconstructionConfig = field(
+        default_factory=ReconstructionConfig
+    )
+    loop: LoopConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -178,10 +200,12 @@ class LoadedPipelineConfig:
 def _make_schema_mutable(node: object) -> None:
     """Let OmegaConf populate frozen dataclass nodes before reconstruction."""
 
-    if not OmegaConf.is_config(node):
+    if not OmegaConf.is_config(node) or node is None:
         return
     OmegaConf.set_readonly(node, False)
     if isinstance(node, DictConfig):
+        if node._is_none():
+            return
         for _, child in node.items_ex(resolve=False):
             _make_schema_mutable(child)
 
@@ -192,7 +216,11 @@ def _normalize_enum_values(config: DictConfig) -> None:
         ("prediction_cache.mode", PredictionCacheMode),
         ("segmentation.method", SegmentationMethod),
         ("segmentation.atomic.split_mode", AtomicSplitMode),
-        ("loop.method", LoopMethod),
+        (
+            "segmentation.confidence_quantile_method",
+            ConfidenceQuantileMethod,
+        ),
+        ("reconstruction.mode", ReconstructionMode),
     ):
         value = OmegaConf.select(config, path, default=None)
         if value is None or isinstance(value, enum_type):
@@ -211,8 +239,8 @@ def _normalize_enum_values(config: DictConfig) -> None:
 
 
 def _validate_config(config: PipelineConfig) -> None:
-    if config.version != 1:
-        raise ValueError("version must be 1")
+    if config.version != 2:
+        raise ValueError("version must be 2")
     if config.input.sample_stride < 1:
         raise ValueError("input.sample_stride must be at least 1")
     if not config.window.size > config.window.overlap >= 1:
@@ -226,8 +254,8 @@ def _validate_config(config: PipelineConfig) -> None:
             config.segmentation.confidence_keep_ratio,
         ),
         (
-            "loop.registration.confidence_keep_ratio",
-            config.loop.registration.confidence_keep_ratio,
+            "registration.confidence_keep_ratio",
+            config.registration.confidence_keep_ratio,
         ),
     ):
         if not math.isfinite(ratio) or not 0.0 < ratio <= 1.0:
@@ -283,6 +311,12 @@ def _validate_config(config: PipelineConfig) -> None:
             "must be in (0, 180]"
         )
 
+    if config.reconstruction.mode is ReconstructionMode.NO_LOOP:
+        return
+    if config.loop is None:
+        raise ValueError(
+            f"{config.reconstruction.mode.value} requires loop configuration"
+        )
     if config.loop.detection.method != "salad":
         raise ValueError("loop.detection.method must be salad")
     if (
@@ -322,10 +356,18 @@ def load_pipeline_config(
     """Load, resolve, validate, and fingerprint the one canonical config."""
 
     try:
-        schema = OmegaConf.structured(PipelineConfig)
-        _make_schema_mutable(schema)
         source = OmegaConf.load(Path(path))
         dotlist = OmegaConf.from_dotlist(list(overrides))
+        has_loop_configuration = (
+            OmegaConf.select(source, "loop", default=None) is not None
+            or OmegaConf.select(dotlist, "loop", default=None) is not None
+        )
+        schema = OmegaConf.structured(
+            PipelineConfig(
+                loop=LoopConfig() if has_loop_configuration else None
+            )
+        )
+        _make_schema_mutable(schema)
         _normalize_enum_values(source)
         _normalize_enum_values(dotlist)
         merged = OmegaConf.merge(schema, source, dotlist)

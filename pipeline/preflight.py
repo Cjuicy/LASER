@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from pipeline.config import PipelineConfig
+from pipeline.config import PipelineConfig, ReconstructionMode
 from pipeline.manifest import ImageManifest
 
 
@@ -54,7 +54,11 @@ def validate_preflight(
         )
 
     required_files = [("model.checkpoint", config.model.checkpoint)]
-    if config.loop.enabled:
+    if config.reconstruction.mode is not ReconstructionMode.NO_LOOP:
+        if config.loop is None:
+            raise ValueError(
+                f"{config.reconstruction.mode.value} requires loop configuration"
+            )
         required_files.extend(
             [
                 (

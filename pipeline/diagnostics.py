@@ -183,7 +183,7 @@ def write_diagnostics(
         "git_commit": git_commit,
         "segmentation_method": config.segmentation.method.value,
         "atomic_split_mode": config.segmentation.atomic.split_mode.value,
-        "loop_method": config.loop.method.value,
+        "reconstruction_mode": config.reconstruction.mode.value,
         "image_count": len(manifest),
         "first_image": str(manifest.paths[0]),
         "last_image": str(manifest.paths[-1]),

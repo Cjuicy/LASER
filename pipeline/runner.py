@@ -41,8 +41,10 @@ from loop_closure.methods.registry import build_loop_strategy
 from loop_closure.methods.shared import detect_loop_candidates
 from pipeline.config import (
     LoadedPipelineConfig,
+    LoopMethod,
     ModelConfig,
     PipelineConfig,
+    ReconstructionMode,
     load_pipeline_config,
 )
 from pipeline.diagnostics import (
@@ -109,6 +111,20 @@ def expected_window_count(
     return len(build_window_specs(image_count, window_size, overlap))
 
 
+def _legacy_loop_method(config: PipelineConfig) -> LoopMethod:
+    if config.reconstruction.mode is ReconstructionMode.NO_LOOP:
+        raise ValueError("no_loop requires the dedicated reconstruction mode")
+    return LoopMethod(config.reconstruction.mode.value)
+
+
+def _require_loop_config(config: PipelineConfig):
+    if config.loop is None:
+        raise ValueError(
+            f"{config.reconstruction.mode.value} requires loop configuration"
+        )
+    return config.loop
+
+
 def run_windows(
     engine,
     manifest: ImageManifest,
@@ -153,7 +169,7 @@ def run_windows(
                 map_location="cpu",
                 weights_only=False,
             ),
-            expected_method=config.loop.method,
+            expected_method=_legacy_loop_method(config),
             expected_prediction_key=engine.prediction_key,
             expected_model_name=engine.model_name,
             expected_checkpoint_digest=engine.checkpoint_digest,
@@ -266,11 +282,12 @@ def build_default_window_engine(
     anchor = AnchorPropagator(
         config.anchor_propagation.correspondence_iou_threshold
     )
+    loop_config = _require_loop_config(config)
     loop_strategy = build_loop_strategy(
-        config.loop.method,
-        optimizer_config=config.loop.optimizer,
+        _legacy_loop_method(config),
+        optimizer_config=loop_config.optimizer,
         registration_confidence_keep_ratio=(
-            config.loop.registration.confidence_keep_ratio
+            config.registration.confidence_keep_ratio
         ),
     )
     engine = loop_strategy.create_window_engine(
@@ -280,7 +297,7 @@ def build_default_window_engine(
         segmentation_strategy=segmenter,
         anchor_propagator=anchor,
         registration_confidence_keep_ratio=(
-            config.loop.registration.confidence_keep_ratio
+            config.registration.confidence_keep_ratio
         ),
         anchor_enabled=config.anchor_propagation.enabled,
         temporal_iou_threshold=(
@@ -466,11 +483,12 @@ class PipelineRunner:
         anchor = dependencies.build_anchor_propagator(
             config.anchor_propagation.correspondence_iou_threshold
         )
+        loop_config = _require_loop_config(config)
         loop_strategy = dependencies.build_loop_strategy(
-            config.loop.method,
-            optimizer_config=config.loop.optimizer,
+            _legacy_loop_method(config),
+            optimizer_config=loop_config.optimizer,
             registration_confidence_keep_ratio=(
-                config.loop.registration.confidence_keep_ratio
+                config.registration.confidence_keep_ratio
             ),
         )
         engine = loop_strategy.create_window_engine(
@@ -480,7 +498,7 @@ class PipelineRunner:
             segmentation_strategy=segmenter,
             anchor_propagator=anchor,
             registration_confidence_keep_ratio=(
-                config.loop.registration.confidence_keep_ratio
+                config.registration.confidence_keep_ratio
             ),
             anchor_enabled=config.anchor_propagation.enabled,
             temporal_iou_threshold=(
@@ -526,12 +544,10 @@ class PipelineRunner:
         started = time.perf_counter()
         candidates = (
             dependencies.detect_loop_candidates(
-                config.loop.detection,
+                loop_config.detection,
                 manifest,
                 output_root / "loop_candidates.json",
             )
-            if config.loop.enabled
-            else ()
         )
         timings["loop_detection"] = (
             time.perf_counter() - started
@@ -543,9 +559,9 @@ class PipelineRunner:
                 model=model,
                 images=images,
                 manifest=manifest,
-                chunk_size=config.loop.constraint.chunk_size,
+                chunk_size=loop_config.constraint.chunk_size,
                 confidence_keep_ratio=(
-                    config.loop.registration.confidence_keep_ratio
+                    config.registration.confidence_keep_ratio
                 ),
             )
             if candidates
@@ -576,7 +592,7 @@ class PipelineRunner:
         summary = {
             **dict(result.summary),
             "segmentation_method": config.segmentation.method.value,
-            "loop_method": config.loop.method.value,
+            "reconstruction_mode": config.reconstruction.mode.value,
         }
         result = ReconstructionResult(
             payload=result.payload,

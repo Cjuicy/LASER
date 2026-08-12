@@ -29,7 +29,13 @@ from loop_closure.methods.base import (
     ReconstructionResult,
     WindowCache,
 )
-from pipeline.config import LoopMethod, ModelName, load_pipeline_config
+from pipeline.config import (
+    LoopMethod,
+    ModelName,
+    ReconstructionMode,
+    load_pipeline_config,
+)
+from pipeline.preflight import validate_preflight
 from pipeline.runner import (
     PipelineDependencies,
     PipelineRunner,
@@ -43,6 +49,36 @@ from run_laser import build_parser
 
 
 IDENTITY_SIM3 = (1.0, torch.eye(3), torch.zeros(3))
+
+
+def test_no_loop_preflight_does_not_require_loop_checkpoints(tmp_path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    image_paths = []
+    for index in range(3):
+        path = image_dir / f"frame-{index}.png"
+        path.touch()
+        image_paths.append(path)
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.touch()
+    loaded = load_pipeline_config(
+        "configs/reconstruction/pi3_laser_no_loop.yaml",
+        (
+            f"input.image_dir={image_dir}",
+            f"model.checkpoint={checkpoint}",
+            "model.inference_device=cpu",
+            "model.process_device=cpu",
+            "window.size=3",
+            "window.overlap=1",
+        ),
+    )
+    assert loaded.config.reconstruction.mode is ReconstructionMode.NO_LOOP
+
+    validate_preflight(
+        loaded.config,
+        ImageManifest(paths=tuple(image_paths)),
+        cuda_available=False,
+    )
 
 
 @dataclass
@@ -229,7 +265,12 @@ def recording_dependencies(state, *, candidates=()):
         state.inference_manifests.append(manifest)
         state.window_specs.append(tuple(specs))
         assert images.shape[0] == len(manifest)
-        return (_cache(config.loop.method, len(manifest)),)
+        return (
+            _cache(
+                LoopMethod(config.reconstruction.mode.value),
+                len(manifest),
+            ),
+        )
 
     def detect_candidates(config, manifest, output_path):
         state.salad_manifests.append(manifest)
@@ -284,7 +325,7 @@ def _pipeline_args(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("segmentation_method", "loop_method"),
+    ("segmentation_method", "reconstruction_mode"),
     (
         ("depth", "traditional"),
         ("depth", "corrected"),
@@ -297,7 +338,7 @@ def _pipeline_args(tmp_path):
 def test_runner_selects_requested_strategies(
     tmp_path,
     segmentation_method,
-    loop_method,
+    reconstruction_mode,
 ):
     state = RecordingState()
     config_path, base_overrides, _ = _pipeline_args(tmp_path)
@@ -306,14 +347,14 @@ def test_runner_selects_requested_strategies(
         (
             *base_overrides,
             f"segmentation.method={segmentation_method}",
-            f"loop.method={loop_method}",
+            f"reconstruction.mode={reconstruction_mode}",
         ),
         dependencies=recording_dependencies(state),
     )
     assert state.segmentation_calls == [segmentation_method]
-    assert state.loop_calls == [loop_method]
+    assert state.loop_calls == [reconstruction_mode]
     assert result.summary["segmentation_method"] == segmentation_method
-    assert result.summary["loop_method"] == loop_method
+    assert result.summary["reconstruction_mode"] == reconstruction_mode
 
 
 def test_preflight_runs_before_prediction_fingerprint_and_model_handle(

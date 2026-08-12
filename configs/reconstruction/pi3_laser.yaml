@@ -7,7 +7,7 @@ input:
 output:
   scene_name: kitti_00
   cache_dir: inference_cache/kitti_00
-  result_dir: viser_results
+  result_dir: outputs/reconstruction
   save_diagnostics: true
 
 model:
@@ -22,25 +22,22 @@ prediction_cache:
   mode: auto
 
 window:
-  size: 10
+  size: 20
   overlap: 5
 
 segmentation:
-  method: atomic
+  method: depth
   confidence_keep_ratio: 0.5
   confidence_quantile_method: higher
   depth_merge_threshold: 0.1
   temporal_iou_threshold: 0.3
-
   felzenszwalb:
     scale: 300
     sigma: 1.1
     min_size: 500
-
   geometry:
     normal_method: cross
     normal_threshold_degrees: 20.0
-
   atomic:
     split_mode: conservative
     split_score_threshold: 0.10
@@ -50,7 +47,7 @@ anchor_propagation:
   correspondence_iou_threshold: 0.4
 
 registration:
-  confidence_keep_ratio: 0.30
+  confidence_keep_ratio: 0.5
 
 reconstruction:
   mode: corrected
@@ -66,10 +63,8 @@ loop:
     top_k: 5
     nms_enabled: true
     nms_frame_radius: 25
-
   constraint:
     chunk_size: 20
-
   optimizer:
     implementation: cpp
     use_sim3: true
