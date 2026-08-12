@@ -84,6 +84,18 @@ def _write_run(
     loop: bool,
     accuracy_delta: float = 0.0,
 ) -> Path:
+    resolved_protocol = (
+        "geometry:\n"
+        "  alignment: umeyama_sim3_then_icp\n"
+        "  center_crop_size: 224\n"
+        "  fscore_thresholds_m:\n"
+        "  - 0.01\n"
+        "  - 0.02\n"
+        "  - 0.05\n"
+        "  icp_threshold_m: 0.1\n"
+        "  icp_type: point_to_point\n"
+        "  normal_estimation: open3d_default\n"
+    )
     primary = {**PRIMARY, "accuracy_mean_m": 0.0201 + accuracy_delta}
     sequences = []
     for index, name in enumerate(EXPECTED_NAMES):
@@ -186,7 +198,9 @@ def _write_run(
         "schema_version": 1,
         "metric_schema_version": METRIC_VERSION,
         "git_commit": "loop-commit" if loop else "no-loop-commit",
-        "resolved_protocol_sha256": _digest(f"resolved:{loop}"),
+        "resolved_protocol_sha256": hashlib.sha256(
+            resolved_protocol.encode("utf-8")
+        ).hexdigest(),
         "protocol_identity_sha256": protocol,
         "resolved_pipeline_sha256": pipeline,
         "evaluation_mode": "experiment" if loop else "comparison",
@@ -231,6 +245,10 @@ def _write_run(
     }
     _write_json(run_dir / "results.json", results)
     _write_json(run_dir / "protocol_manifest.json", manifest)
+    (run_dir / "resolved_protocol.yaml").write_text(
+        resolved_protocol,
+        encoding="utf-8",
+    )
     return run_dir
 
 
@@ -278,6 +296,50 @@ def test_compare_loop_runs_writes_metrics_deltas_and_warning(tmp_path):
             "no_loop",
             "traditional_loop",
         ]
+
+
+def test_compare_loop_accepts_hashed_legacy_protocol_geometry(tmp_path):
+    no_loop = _write_run(tmp_path / "no-loop", loop=False)
+    loop = _write_run(tmp_path / "loop", loop=True)
+    _mutate(
+        no_loop,
+        "protocol_manifest.json",
+        lambda value: value.pop("geometry"),
+    )
+    _mutate(
+        loop,
+        "protocol_manifest.json",
+        lambda value: value.pop("geometry"),
+    )
+
+    report = compare_loop_run_directories(
+        no_loop,
+        loop,
+        tmp_path / "comparison",
+    )
+
+    assert report["sequence_count"] == 9
+
+
+def test_compare_loop_rejects_tampered_legacy_protocol_geometry(tmp_path):
+    no_loop = _write_run(tmp_path / "no-loop", loop=False)
+    loop = _write_run(tmp_path / "loop", loop=True)
+    _mutate(
+        no_loop,
+        "protocol_manifest.json",
+        lambda value: value.pop("geometry"),
+    )
+    (no_loop / "resolved_protocol.yaml").write_text(
+        "geometry:\n  center_crop_size: 112\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="protocol file hash mismatch"):
+        compare_loop_run_directories(
+            no_loop,
+            loop,
+            tmp_path / "comparison",
+        )
 
 
 @pytest.mark.parametrize(

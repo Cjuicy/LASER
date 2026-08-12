@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 from typing import Mapping, Sequence
+
+from omegaconf import OmegaConf
 
 from mv_recon.compare_results import (
     DATASET,
@@ -44,8 +47,35 @@ EXPECTED_GEOMETRY = {
 }
 
 
-def _require_geometry(manifest: Mapping[str, object]) -> None:
-    geometry = dict(_mapping(manifest.get("geometry"), "manifest.geometry"))
+def _require_geometry(
+    manifest: Mapping[str, object],
+    run_dir: Path,
+) -> None:
+    raw_geometry = manifest.get("geometry")
+    if raw_geometry is None:
+        protocol_path = Path(run_dir) / "resolved_protocol.yaml"
+        try:
+            protocol_text = protocol_path.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                "comparison input lacks geometry provenance: "
+                f"{protocol_path}"
+            ) from exc
+        expected_digest = _digest(
+            manifest.get("resolved_protocol_sha256"),
+            "manifest.resolved_protocol_sha256",
+        )
+        observed_digest = hashlib.sha256(
+            protocol_text.encode("utf-8")
+        ).hexdigest()
+        if observed_digest != expected_digest:
+            raise ValueError("resolved protocol file hash mismatch")
+        protocol = OmegaConf.to_container(
+            OmegaConf.create(protocol_text),
+            resolve=True,
+        )
+        raw_geometry = _mapping(protocol, "resolved protocol").get("geometry")
+    geometry = dict(_mapping(raw_geometry, "protocol.geometry"))
     if geometry != EXPECTED_GEOMETRY:
         raise ValueError("point-map geometry evaluation configuration mismatch")
 
@@ -140,7 +170,7 @@ def _load_traditional_loop_run(run_dir: Path) -> dict[str, object]:
         raise ValueError("traditional loop run does not enable loop closure")
     if manifest.get("loop_method") != "traditional":
         raise ValueError("run does not use the traditional loop method")
-    _require_geometry(manifest)
+    _require_geometry(manifest, selected_dir)
     pipeline = _mapping(manifest.get("pipeline"), "manifest.pipeline")
     _require_pipeline_settings(pipeline, loop_enabled=True)
 
@@ -248,7 +278,7 @@ def _validate_no_loop_settings(run: Mapping[str, object]) -> None:
         raise ValueError("no-loop run is not a comparison profile")
     if manifest.get("pointmap_assembly") != NO_LOOP_ASSEMBLY:
         raise ValueError("no-loop run uses the wrong point-map assembly")
-    _require_geometry(manifest)
+    _require_geometry(manifest, Path(run["run_dir"]))
     pipeline = _mapping(manifest.get("pipeline"), "manifest.pipeline")
     _require_pipeline_settings(pipeline, loop_enabled=False)
 

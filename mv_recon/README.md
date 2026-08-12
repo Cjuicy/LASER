@@ -339,6 +339,133 @@ sequences lack registered `.depth.proj.png`, Office is empty, and redkitchen
 is absent. No complete two-dataset Table 4 claim should be made until those
 data are repaired independently.
 
+## NeuralRGBD traditional-loop point-map experiment
+
+`mv_recon_laser_nrgbd_depth_loop_traditional` is an explicitly non-paper
+experiment. It keeps the validated nine-sequence NeuralRGBD kf10 Depth setup,
+including 20/5 windows, but enables LASER's existing traditional path:
+SALAD candidate detection, joint Pi3 constraint estimation, Sim(3)
+optimization, and delayed global aggregation. Core loop, Pi3, segmentation,
+anchor, and metric implementations are not changed.
+
+The result is labeled `evaluation_mode=experiment` and
+`pointmap_assembly=pipeline-loop-aggregate-v1`. This differs from the
+paper-compatible no-loop assembly `laser-incremental-global-map-v1`; the
+comparison reports their numerical delta but does not describe it as a pure
+loop-only causal effect.
+
+### Preparation and preflight
+
+Use the cloud checkout and all three local weights. Preflight validates their
+contents, the protocol, the nine-sequence map, data coverage, and runtime
+without constructing Pi3 or a loop detector:
+
+```bash
+cd /root/autodl-tmp/LASER-pointmap-eval
+conda activate vggt
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+
+ln -sfn NeuralRGBD data/nrgbd
+ln -sfn PI3/model.safetensors weights/model.safetensors
+test -d data/nrgbd/breakfast_room
+test -f weights/model.safetensors
+test -f weights/dino_salad.ckpt
+test -f weights/dinov2_vitb14_pretrain.pth
+
+python mv_recon/eval.py \
+  evaluation=mv_recon_laser_nrgbd_depth_loop_traditional \
+  protocol.preflight_only=true \
+  output_dir=outputs/pointmap/nrgbd_depth_loop_traditional_preflight
+```
+
+Pi3, SALAD, and DINO SHA256 values participate in resume identity. Changing
+any weight rejects reuse of an existing result directory.
+
+### One-sequence smoke and diagnostics
+
+Use a new output directory:
+
+```bash
+python mv_recon/eval.py \
+  evaluation=mv_recon_laser_nrgbd_depth_loop_traditional \
+  protocol.max_sequences=1 \
+  output_dir=outputs/pointmap/nrgbd_depth_loop_traditional_smoke
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("outputs/pointmap/nrgbd_depth_loop_traditional_smoke")
+manifest = json.loads((root / "protocol_manifest.json").read_text())
+results = json.loads((root / "results.json").read_text())
+print("mode:", manifest["evaluation_mode"])
+print("assembly:", manifest["pointmap_assembly"])
+print("loop:", manifest["loop_method"], manifest["loop_enabled"])
+for sequence in results["sequences"]:
+    diagnostics = sequence["cache_diagnostics"]
+    print(
+        sequence["sequence"],
+        "candidates=", diagnostics["candidate_count"],
+        "constraints=", diagnostics["constraint_count"],
+        "rejected=", diagnostics["rejected_candidate_count"],
+        "joint_forward=", diagnostics["joint_forward_count"],
+        "no_loop_fallback=", diagnostics["used_no_loop_path"],
+    )
+PY
+```
+
+The dispatch and fields prove that the experiment path ran even if
+`breakfast_room` has no valid loop. A loop was actually consumed when a
+sequence has positive candidates, constraints, and joint forwards, with
+`no_loop_fallback=False`. If the first sequence has none, run all fixed
+sequences; do not tune the locked detector threshold after observing the
+result.
+
+### Full run and comparison
+
+Run all nine sequences in a persistent session:
+
+```bash
+mkdir -p outputs/pointmap/logs
+screen -dmS nrgbd_depth_loop_traditional bash -lc '
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate vggt
+cd /root/autodl-tmp/LASER-pointmap-eval
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+python mv_recon/eval.py \
+  evaluation=mv_recon_laser_nrgbd_depth_loop_traditional \
+  output_dir=outputs/pointmap/nrgbd_depth_loop_traditional \
+  > outputs/pointmap/logs/nrgbd_depth_loop_traditional.log 2>&1
+'
+
+screen -ls
+tail -n 80 outputs/pointmap/logs/nrgbd_depth_loop_traditional.log
+```
+
+After the run finishes successfully, compare it with the preserved cloud
+no-loop Depth result:
+
+```bash
+python mv_recon/compare_loop_results.py \
+  --no-loop-run outputs/pointmap/nrgbd_depth_replay \
+  --traditional-loop-run \
+    outputs/pointmap/nrgbd_depth_loop_traditional \
+  --output-dir outputs/pointmap/nrgbd_loop_comparison
+
+cat outputs/pointmap/nrgbd_loop_comparison/loop_comparison.csv
+python -m json.tool \
+  outputs/pointmap/nrgbd_loop_comparison/loop_comparison.json
+```
+
+`outputs/pointmap/nrgbd_depth_replay` is the existing audited cloud result. A
+fresh clone must first run the full `mv_recon_laser_nrgbd_depth` profile and
+pass that result directory to `--no-loop-run`. The reader accepts the older
+audited result format by hash-checking its `resolved_protocol.yaml`; it still
+rejects wrong coverage, checkpoints, maps, inputs, GT, ordinary cache keys,
+runtime, thresholds, or metric settings.
+
 ## Custom sampling experiments
 
 A sequence map records a mapping from sequence name to selected frame IDs.
