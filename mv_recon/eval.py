@@ -435,6 +435,7 @@ def _build_protocol_manifest(
         "pointmap_assembly": resolved.pointmap_assembly,
         "loop_enabled": resolved.pipeline.config.loop.enabled,
         "loop_method": resolved.pipeline.config.loop.method.value,
+        "geometry": asdict(resolved.protocol.geometry),
         "segmentation_method": (
             resolved.pipeline.config.segmentation.method.value
         ),
