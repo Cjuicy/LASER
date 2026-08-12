@@ -6,9 +6,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from inference_engine.prediction_cache.types import WindowSpec
 from inference_engine.segmentation.base import SegmentationResult
+from mv_recon.loop_experiment import LoopPointMapResult
 from mv_recon.paper_streaming import (
     PaperDepthSegmentationStrategy,
     PaperStreamingDependencies,
@@ -346,11 +348,21 @@ def test_eval_inference_uses_paper_incremental_replay(monkeypatch, tmp_path):
         "collect_prediction_diagnostics",
         lambda **kwargs: {"ordinary_hits": 1, "ordinary_misses": 0},
     )
+    monkeypatch.setattr(
+        eval_module,
+        "reconstruct_traditional_loop_point_maps",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("paper evaluation must not use the loop adapter")
+        ),
+        raising=False,
+    )
 
     output = eval_module.run_streaming_inference(
         image_paths,
         model,
-        SimpleNamespace(),
+        OmegaConf.create(
+            {"protocol": {"mode": "paper"}, "output_dir": str(tmp_path)}
+        ),
         (2, 3),
     )
 
@@ -364,3 +376,83 @@ def test_eval_inference_uses_paper_incremental_replay(monkeypatch, tmp_path):
         "ordinary_hits": 1,
         "ordinary_misses": 0,
     }
+
+
+def test_eval_inference_dispatches_experiment_to_traditional_loop(
+    monkeypatch,
+    tmp_path,
+):
+    from mv_recon import eval as eval_module
+
+    image_paths = []
+    for index in range(4):
+        path = tmp_path / f"loop-{index}.png"
+        path.write_bytes(b"image")
+        image_paths.append(str(path))
+
+    class Store:
+        fingerprint = SimpleNamespace(key="e" * 64)
+
+    engine = SimpleNamespace(
+        prediction_store=Store(),
+        model_handle=object(),
+    )
+    model = SimpleNamespace(prepare=lambda images, manifest: engine)
+    loop_calls = []
+
+    def loop_reconstruct(**kwargs):
+        loop_calls.append(kwargs)
+        points = torch.zeros((4, 1, 1, 3))
+        points[..., 2] = 3.0
+        return LoopPointMapResult(
+            points=points,
+            confidence=torch.ones((4, 1, 1)),
+            ordinary_prediction_key="e" * 64,
+            diagnostics={
+                "candidate_count": 1,
+                "constraint_count": 1,
+                "rejected_candidate_count": 0,
+                "used_no_loop_path": False,
+            },
+        )
+
+    monkeypatch.setattr(
+        eval_module,
+        "load_and_preprocess_images",
+        lambda paths: torch.zeros((len(paths), 3, 1, 1)),
+    )
+    monkeypatch.setattr(
+        eval_module,
+        "reconstruct_traditional_loop_point_maps",
+        loop_reconstruct,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        eval_module,
+        "reconstruct_incremental_point_maps",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("experiment must not use paper incremental replay")
+        ),
+    )
+
+    output = eval_module.run_streaming_inference(
+        image_paths,
+        model,
+        OmegaConf.create(
+            {
+                "protocol": {"mode": "experiment"},
+                "output_dir": str(tmp_path),
+            }
+        ),
+        (2, 3),
+    )
+
+    assert len(loop_calls) == 1
+    assert loop_calls[0]["engine"] is engine
+    assert loop_calls[0]["artifact_dir"] == (
+        tmp_path / "loop_artifacts" / ("e" * 64)
+    )
+    assert output.points.shape == (4, 2, 3, 3)
+    assert np.all(output.points[..., 2] == 3.0)
+    assert output.ordinary_prediction_key == "e" * 64
+    assert output.cache_diagnostics["constraint_count"] == 1

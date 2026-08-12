@@ -23,13 +23,13 @@ from mv_recon.geometry_metrics import (
     Open3DGeometryBackend,
     evaluate_point_maps,
 )
+from mv_recon.loop_experiment import reconstruct_traditional_loop_point_maps
 from mv_recon.paper_streaming import (
     build_paper_segmentation_strategy,
     reconstruct_incremental_point_maps,
 )
 from mv_recon.protocol import (
     PAPER_DATASETS,
-    POINTMAP_ASSEMBLY,
     DatasetPlan,
     GeometryProtocol,
     ResolvedEvaluationProtocol,
@@ -197,52 +197,71 @@ def run_streaming_inference(
     hydra_cfg: DictConfig,
     data_size: tuple[int, int],
 ) -> InferenceOutput:
-    del hydra_cfg
     images = load_and_preprocess_images(filelist)
     manifest = ImageManifest(
         paths=tuple(Path(path).resolve() for path in filelist)
     )
     engine = inference_model.prepare(images, manifest)
-    config = engine.pipeline_config
-    store = engine.prediction_store
-    segmenter = build_paper_segmentation_strategy(config.segmentation)
-    anchor = AnchorPropagator(
-        config.anchor_propagation.correspondence_iou_threshold
-    )
-    with store.entry_lock():
-        result = reconstruct_incremental_point_maps(
-            provider=engine.delegate,
-            specs=engine.window_specs,
+    mode = str(hydra_cfg.protocol.mode)
+    if mode == "experiment":
+        loop_result = reconstruct_traditional_loop_point_maps(
+            engine=engine,
             images=images,
-            segmenter=segmenter,
-            anchor_propagator=anchor,
-            overlap=config.window.overlap,
-            confidence_keep_ratio=(
-                config.loop.registration.confidence_keep_ratio
+            manifest=manifest,
+            artifact_dir=(
+                Path(str(hydra_cfg.output_dir))
+                / "loop_artifacts"
+                / engine.prediction_store.fingerprint.key
             ),
-            temporal_iou_threshold=(
-                config.segmentation.temporal_iou_threshold
-            ),
-            anchor_enabled=config.anchor_propagation.enabled,
-            process_device=config.model.process_device,
+        )
+        points = loop_result.points
+        confidence = loop_result.confidence
+        prediction_key = loop_result.ordinary_prediction_key
+        prediction_diagnostics = dict(loop_result.diagnostics)
+    else:
+        config = engine.pipeline_config
+        store = engine.prediction_store
+        segmenter = build_paper_segmentation_strategy(config.segmentation)
+        anchor = AnchorPropagator(
+            config.anchor_propagation.correspondence_iou_threshold
+        )
+        with store.entry_lock():
+            result = reconstruct_incremental_point_maps(
+                provider=engine.delegate,
+                specs=engine.window_specs,
+                images=images,
+                segmenter=segmenter,
+                anchor_propagator=anchor,
+                overlap=config.window.overlap,
+                confidence_keep_ratio=(
+                    config.loop.registration.confidence_keep_ratio
+                ),
+                temporal_iou_threshold=(
+                    config.segmentation.temporal_iou_threshold
+                ),
+                anchor_enabled=config.anchor_propagation.enabled,
+                process_device=config.model.process_device,
+            )
+        points = result.points
+        confidence = result.confidence
+        prediction_key = store.fingerprint.key
+        prediction_diagnostics = collect_prediction_diagnostics(
+            config=config,
+            fingerprint=store.fingerprint,
+            model=engine.model_handle,
+            store=store,
         )
     resized_points = F.interpolate(
-        result.points.permute(0, 3, 1, 2),
+        points.permute(0, 3, 1, 2),
         data_size,
         mode="bilinear",
         align_corners=False,
         antialias=True,
     ).permute(0, 2, 3, 1)
-    prediction_diagnostics = collect_prediction_diagnostics(
-        config=config,
-        fingerprint=store.fingerprint,
-        model=engine.model_handle,
-        store=store,
-    )
     return InferenceOutput(
         points=resized_points.detach().cpu().numpy(),
-        confidence=result.confidence.detach().cpu().numpy(),
-        ordinary_prediction_key=store.fingerprint.key,
+        confidence=confidence.detach().cpu().numpy(),
+        ordinary_prediction_key=prediction_key,
         cache_diagnostics=prediction_diagnostics,
     )
 
@@ -374,11 +393,37 @@ def _instantiate_and_validate_datasets(
     return datasets
 
 
+def _auxiliary_checkpoint_digests(
+    resolved: ResolvedEvaluationProtocol,
+    repository_root: Path,
+    digest: Callable[[Path], str],
+) -> dict[str, str]:
+    if resolved.protocol.mode != "experiment":
+        return {}
+    detection = resolved.pipeline.config.loop.detection
+    paths = {
+        "salad": Path(detection.salad_checkpoint),
+        "dino": Path(detection.dino_checkpoint),
+    }
+    result = {}
+    for label, path in paths.items():
+        selected = path if path.is_absolute() else repository_root / path
+        selected = selected.resolve()
+        if not selected.is_file():
+            raise FileNotFoundError(
+                f"loop {label} checkpoint does not exist or is not a file: "
+                f"{selected}"
+            )
+        result[label] = digest(selected)
+    return result
+
+
 def _build_protocol_manifest(
     *,
     resolved: ResolvedEvaluationProtocol,
     plans: tuple[DatasetPlan, ...],
     checkpoint_sha256: str,
+    auxiliary_checkpoint_sha256: Mapping[str, str],
     runtime_metadata: Mapping[str, object],
     git_commit: str,
 ) -> dict[str, object]:
@@ -387,7 +432,9 @@ def _build_protocol_manifest(
         "metric_schema_version": METRIC_SCHEMA_VERSION,
         "git_commit": git_commit,
         "evaluation_mode": resolved.protocol.mode,
-        "pointmap_assembly": POINTMAP_ASSEMBLY,
+        "pointmap_assembly": resolved.pointmap_assembly,
+        "loop_enabled": resolved.pipeline.config.loop.enabled,
+        "loop_method": resolved.pipeline.config.loop.method.value,
         "segmentation_method": (
             resolved.pipeline.config.segmentation.method.value
         ),
@@ -395,6 +442,9 @@ def _build_protocol_manifest(
         "protocol_identity_sha256": resolved.identity_sha256,
         "resolved_pipeline_sha256": resolved.pipeline.sha256,
         "checkpoint_sha256": checkpoint_sha256,
+        "auxiliary_checkpoint_sha256": dict(
+            auxiliary_checkpoint_sha256
+        ),
         "sequence_map_sha256": {
             plan.name: plan.sequence_map_sha256 for plan in plans
         },
@@ -454,6 +504,11 @@ def run_evaluation(
     checkpoint_sha256 = selected_dependencies.checkpoint_digest(
         local_checkpoint
     )
+    auxiliary_checkpoint_sha256 = _auxiliary_checkpoint_digests(
+        resolved,
+        root,
+        selected_dependencies.checkpoint_digest,
+    )
     identity = RunIdentity(
         protocol_identity_sha256=resolved.identity_sha256,
         pipeline_sha256=resolved.pipeline.sha256,
@@ -461,6 +516,7 @@ def run_evaluation(
         sequence_map_sha256={
             plan.name: plan.sequence_map_sha256 for plan in plans
         },
+        auxiliary_checkpoint_sha256=auxiliary_checkpoint_sha256,
     )
     store = ResultStore(
         resolved.output_dir,
@@ -497,6 +553,7 @@ def run_evaluation(
         resolved=resolved,
         plans=plans,
         checkpoint_sha256=checkpoint_sha256,
+        auxiliary_checkpoint_sha256=auxiliary_checkpoint_sha256,
         runtime_metadata=runtime_metadata,
         git_commit=selected_dependencies.git_commit(),
     )

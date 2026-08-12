@@ -56,6 +56,32 @@ def _config(
         )
 
 
+def _experiment_preflight_config(
+    tmp_path: Path,
+    *,
+    missing: str | None = None,
+):
+    checkpoints = {
+        "salad": tmp_path / "dino_salad.ckpt",
+        "dino": tmp_path / "dinov2_vitb14_pretrain.pth",
+    }
+    for label, path in checkpoints.items():
+        if label != missing:
+            path.write_bytes(label.encode("utf-8"))
+    config = _config(
+        tmp_path,
+        profile="mv_recon_laser_nrgbd_depth_loop_traditional",
+        preflight_only=True,
+    )
+    config.protocol.pipeline_overrides.extend(
+        [
+            f"loop.detection.salad_checkpoint={checkpoints['salad']}",
+            f"loop.detection.dino_checkpoint={checkpoints['dino']}",
+        ]
+    )
+    return config
+
+
 @dataclass
 class State:
     model_constructions: int = 0
@@ -232,6 +258,49 @@ def test_preflight_only_never_constructs_streaming_model(tmp_path):
     assert (tmp_path / "results" / "resolved_protocol.yaml").is_file()
     assert (tmp_path / "results" / "resolved_pipeline.yaml").is_file()
     assert (tmp_path / "results" / "protocol_manifest.json").is_file()
+
+
+def test_traditional_loop_preflight_records_auxiliary_provenance(tmp_path):
+    state = State()
+
+    result = run_evaluation(
+        _experiment_preflight_config(tmp_path),
+        dependencies=_dependencies(tmp_path, state),
+        repository_root=ROOT,
+    )
+
+    assert result.state == "preflight"
+    assert state.model_constructions == 0
+    manifest = json.loads(
+        (tmp_path / "results" / "protocol_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert set(manifest["auxiliary_checkpoint_sha256"]) == {
+        "salad",
+        "dino",
+    }
+    assert manifest["evaluation_mode"] == "experiment"
+    assert manifest["pointmap_assembly"] == "pipeline-loop-aggregate-v1"
+    assert manifest["loop_enabled"] is True
+    assert manifest["loop_method"] == "traditional"
+
+
+@pytest.mark.parametrize("missing", ("salad", "dino"))
+def test_traditional_loop_preflight_rejects_missing_auxiliary_checkpoint(
+    tmp_path,
+    missing,
+):
+    state = State()
+
+    with pytest.raises(FileNotFoundError, match=f"loop {missing} checkpoint"):
+        run_evaluation(
+            _experiment_preflight_config(tmp_path, missing=missing),
+            dependencies=_dependencies(tmp_path, state),
+            repository_root=ROOT,
+        )
+
+    assert state.model_constructions == 0
 
 
 def test_two_dataset_smoke_builds_one_model_and_returns_subset(tmp_path):
