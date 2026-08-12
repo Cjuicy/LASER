@@ -23,7 +23,7 @@ from tests.reconstruction.fixtures import (
 )
 
 
-def _context(anchor, predictions):
+def _context(anchor, predictions, *, segmenter=None):
     config = load_pipeline_config(
         "configs/reconstruction/pi3_laser_no_loop.yaml",
         (
@@ -35,7 +35,7 @@ def _context(anchor, predictions):
     return ReconstructionContext(
         predictions=predictions,
         frame_ids=(0, 1, 2, 3),
-        segmentation_strategy=OneRegionSegmenter(),
+        segmentation_strategy=segmenter or OneRegionSegmenter(),
         anchor_propagator=anchor,
         segmentation_config=config.segmentation,
         anchor_config=config.anchor_propagation,
@@ -96,6 +96,50 @@ def test_no_loop_matches_table_four_incremental_order():
         1.0,
         10.0,
         21.0,
+    ]
+
+
+def test_no_loop_consumes_predictions_incrementally():
+    events = []
+
+    class RecordingSegmenter(OneRegionSegmenter):
+        def segment(self, points, confidence, images):
+            events.append("segment")
+            return super().segment(points, confidence, images)
+
+    source = iter_window_predictions(
+        LiteralProvider(),
+        SPECS,
+        torch.zeros((4, 3, 1, 1)),
+        "cpu",
+    )
+
+    def guarded_stream():
+        for index, prediction in enumerate(source):
+            if index:
+                assert events[-1] == "segment"
+            events.append(f"yield:{index}")
+            yield prediction
+
+    NoLoopReconstructionMode(
+        register_adjacent=lambda *arguments: identity_sim3(),
+        apply_pose_sim3=lambda poses, *arguments: poses,
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+    ).run(
+        _context(
+            SequencedAnchor(scales=(1.0, 1.0)),
+            guarded_stream(),
+            segmenter=RecordingSegmenter(),
+        )
+    )
+
+    assert events == [
+        "yield:0",
+        "segment",
+        "yield:1",
+        "segment",
+        "yield:2",
+        "segment",
     ]
 
 

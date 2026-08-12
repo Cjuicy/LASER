@@ -36,9 +36,6 @@ class NoLoopReconstructionMode:
     def run(self, context: ReconstructionContext) -> ReconstructionArtifact:
         if context.reconstruction_mode is not ReconstructionMode.NO_LOOP:
             raise ValueError("NoLoopReconstructionMode requires no_loop context")
-        predictions = tuple(context.predictions)
-        if not predictions:
-            raise ValueError("no_loop requires at least one prediction window")
         overlap = context.window_config.overlap
         previous = None
         previous_graph = None
@@ -48,11 +45,20 @@ class NoLoopReconstructionMode:
         pose_chunks = []
         confidence_chunks = []
         segmentation_summaries = []
+        prediction_key = None
+        window_count = 0
 
-        for expected_index, prediction in enumerate(predictions):
+        for expected_index, prediction in enumerate(context.predictions):
             spec = prediction.spec
             if spec.index != expected_index:
                 raise ValueError("no_loop predictions must be in WindowSpec order")
+            if prediction_key is None:
+                prediction_key = prediction.prediction_key
+            elif prediction.prediction_key != prediction_key:
+                raise ValueError(
+                    "no_loop prediction windows use different cache keys"
+                )
+            window_count += 1
             local_points = prediction.local_points
             camera_poses = prediction.camera_poses
             confidence = prediction.confidence
@@ -137,6 +143,8 @@ class NoLoopReconstructionMode:
             }
             previous_graph = graph
 
+        if window_count == 0:
+            raise ValueError("no_loop requires at least one prediction window")
         local_points = torch.cat(point_chunks).detach().cpu()
         camera_poses = torch.cat(pose_chunks).detach().cpu()
         confidence = torch.cat(confidence_chunks).detach().cpu()
@@ -147,9 +155,6 @@ class NoLoopReconstructionMode:
             camera_poses,
             homogenize_points(local_points),
         )[..., :3]
-        prediction_keys = {prediction.prediction_key for prediction in predictions}
-        if len(prediction_keys) != 1:
-            raise ValueError("no_loop prediction windows use different cache keys")
         return ReconstructionArtifact(
             schema_version=1,
             frame_ids=context.frame_ids,
@@ -159,12 +164,12 @@ class NoLoopReconstructionMode:
             confidence=confidence,
             segmentation_method=context.segmentation_strategy.name,
             reconstruction_mode=ReconstructionMode.NO_LOOP,
-            prediction_key=next(iter(prediction_keys)),
+            prediction_key=prediction_key,
             diagnostics=ReconstructionDiagnostics(
                 stage_timings_ms={},
                 segmentation_summaries=tuple(segmentation_summaries),
                 candidate_count=0,
                 constraint_count=0,
-                mode_scalars={"window_count": len(predictions)},
+                mode_scalars={"window_count": window_count},
             ),
         )
