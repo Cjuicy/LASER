@@ -1,0 +1,7 @@
+version: 1
+center_crop_size: 224
+alignment: umeyama_sim3_then_icp
+icp_type: point_to_point
+icp_threshold_m: 0.1
+normal_estimation: open3d_default
+fscore_thresholds_m: [0.01, 0.02, 0.05]
