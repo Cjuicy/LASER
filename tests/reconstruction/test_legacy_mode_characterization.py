@@ -16,8 +16,7 @@ from loop_closure.methods.corrected import (
     CorrectedWindowEngine,
 )
 from loop_closure.methods.traditional import (
-    TraditionalLoopClosureStrategy,
-    TraditionalWindowEngine,
+    TraditionalLoopProcessor,
 )
 from mv_recon.paper_streaming import (
     PaperStreamingDependencies,
@@ -39,6 +38,7 @@ from .fixtures import (
     identity_sim3,
     literal_window,
 )
+from reconstruction.modes.traditional import TraditionalWindowState
 
 
 def _optimizer_config():
@@ -173,31 +173,46 @@ def test_legacy_no_loop_uses_corrected_predecessor_for_next_registration():
 
 
 def test_legacy_traditional_records_scale_before_final_application(
-    monkeypatch,
-    tmp_path,
 ):
-    from loop_closure.methods import traditional as traditional_module
-
-    engine = _build_engine(TraditionalWindowEngine, tmp_path, 3.0)
-    monkeypatch.setattr(
-        traditional_module,
-        "register_adjacent_windows",
-        lambda *arguments: identity_sim3(2.0),
+    states = (
+        TraditionalWindowState(
+            window_index=0,
+            frame_start=0,
+            frame_end=2,
+            local_points=torch.ones((2, 1, 1, 3)),
+            camera_poses=torch.eye(4).repeat(2, 1, 1),
+            confidence=torch.ones((2, 1, 1)),
+            segmentation_labels=(),
+            anchor_scale_mask=None,
+            relative_sim3=identity_sim3(),
+            segmentation_diagnostics=(),
+        ),
+        TraditionalWindowState(
+            window_index=1,
+            frame_start=1,
+            frame_end=3,
+            local_points=torch.ones((2, 1, 1, 3)),
+            camera_poses=torch.eye(4).repeat(2, 1, 1),
+            confidence=torch.ones((2, 1, 1)),
+            segmentation_labels=(),
+            anchor_scale_mask=torch.full((2, 1, 1, 1), 3.0),
+            relative_sim3=identity_sim3(2.0),
+            segmentation_diagnostics=(),
+        ),
     )
-    caches = _run_legacy_engine(engine, count=2)
     solution = LoopSolution(
         optimized_transforms=(identity_sim3(), identity_sim3(2.0)),
         constraints=(),
         used_no_loop_path=False,
     )
-    result = TraditionalLoopClosureStrategy(
-        optimizer_config=_optimizer_config(),
-        registration_confidence_keep_ratio=0.5,
-    ).aggregate(caches, solution)
+    result = TraditionalLoopProcessor(_optimizer_config()).aggregate(
+        states,
+        solution,
+    )
 
-    assert caches[1].local_points[:, 0, 0, 2].tolist() == [1.0, 1.0]
-    assert caches[1].anchor_scale_mask[:, 0, 0, 0].tolist() == [3.0, 3.0]
-    assert result.payload["local_points"][:, 0, 0, 2].tolist() == [
+    assert states[1].local_points[:, 0, 0, 2].tolist() == [1.0, 1.0]
+    assert states[1].anchor_scale_mask[:, 0, 0, 0].tolist() == [3.0, 3.0]
+    assert result.local_points[:, 0, 0, 2].tolist() == [
         1.0,
         1.0,
         3.0,

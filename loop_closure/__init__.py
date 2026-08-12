@@ -1,17 +1,15 @@
-from .types import LoopCandidate, LoopConstraint, LoopSolution
-from .methods import (
-    LoopClosureStrategy,
-    ReconstructionResult,
-    WindowCache,
-    build_loop_strategy,
+from .types import (
+    LoopCandidate,
+    LoopConstraint,
+    LoopSolution,
+    Sim3,
+    validate_sim3,
 )
 
 __all__ = [
     "LoopCandidate",
-    "LoopClosureStrategy",
     "LoopConstraint",
     "LoopSolution",
-    "ReconstructionResult",
-    "WindowCache",
-    "build_loop_strategy",
+    "Sim3",
+    "validate_sim3",
 ]

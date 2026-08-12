@@ -41,6 +41,8 @@ def mutual_confidence_mask(
     current_confidence: torch.Tensor,
     overlap: int,
     keep_ratio: float,
+    *,
+    context: str = "sequential registration",
 ) -> torch.Tensor:
     previous = select_top_confidence_mask(
         previous_confidence[-overlap:],
@@ -53,5 +55,5 @@ def mutual_confidence_mask(
     return intersect_confidence_masks(
         previous,
         current,
-        context="no_loop sequential registration",
+        context=context,
     )

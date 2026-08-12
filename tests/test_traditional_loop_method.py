@@ -1,157 +1,29 @@
+from __future__ import annotations
+
 import numpy as np
 import pytest
 import torch
 
-from inference_engine.segmentation import SegmentationResult
-from inference_engine.prediction_cache.types import WindowSpec
-from inference_engine.streaming_window_engine import STOP_SIGNAL
-from loop_closure.methods import shared
-from loop_closure.methods.base import (
-    WINDOW_CACHE_SCHEMA_VERSION,
-    LoopCandidate,
-    LoopSolution,
-    WindowCache,
-)
-from loop_closure.methods.traditional import (
-    TraditionalLoopClosureStrategy,
-    TraditionalWindowEngine,
-)
-from pipeline.config import (
-    LoopMethod,
-    ModelName,
-    SegmentationMethod,
-    load_pipeline_config,
-)
-
-
-PREDICTION_KEY = "prediction-key"
-CHECKPOINT_DIGEST = "a" * 64
+from loop_closure.methods.traditional import TraditionalLoopProcessor
+from loop_closure.types import LoopCandidate, LoopSolution
+from pipeline.config import load_pipeline_config
+from reconstruction.modes.traditional import TraditionalWindowState
 
 
 def identity_sim3(scale=1.0):
     return scale, torch.eye(3), torch.zeros(3)
 
 
-class OneRegionStrategy:
-    name = SegmentationMethod.DEPTH
-
-    def segment(self, point_maps, confidence, images):
-        return [
-            SegmentationResult(
-                labels=np.zeros(point_maps.shape[1:3], dtype=np.intp),
-                diagnostics={"method": "depth", "region_count": 1},
-            )
-            for _ in point_maps
-        ]
-
-
-class ConstantAnchor:
-    def __init__(self, scale=3.0):
-        self.scale = scale
-
-    def propagate(self, source_points, target_points, *args):
-        return torch.full(
-            (*target_points.shape[:-1], 1),
-            self.scale,
-        )
-
-
-def make_window(depth=1.0):
-    frames, height, width = 2, 1, 1
-    points = torch.full((1, frames, height, width, 3), depth)
-    return {
-        "local_points": points,
-        "camera_poses": torch.eye(4).repeat(1, frames, 1, 1),
-        "conf": torch.ones((1, frames, height, width)),
-        "images": torch.zeros((1, frames, 3, height, width)),
-    }
-
-
-def test_traditional_window_defers_sim3_and_anchor_scale_application(
-    monkeypatch,
-    tmp_path,
+def traditional_state(
+    index: int,
+    *,
+    relative_scale: float = 1.0,
+    anchor_scale: float | None = None,
 ):
-    from loop_closure.methods import traditional as traditional_module
-
-    engine = TraditionalWindowEngine(
-        torch.nn.Identity(),
-        inference_device="cpu",
-        dtype=torch.float32,
-        segmentation_strategy=OneRegionStrategy(),
-        anchor_propagator=ConstantAnchor(scale=3.0),
-        registration_confidence_keep_ratio=0.5,
-        anchor_enabled=True,
-        temporal_iou_threshold=0.3,
-        window_size=2,
-        overlap=1,
-        cache_root=str(tmp_path),
-        intermediate_device="cpu",
-        process_device="cpu",
-        benchmark_latency=False,
-        prediction_key=PREDICTION_KEY,
-        model_name=ModelName.PI3,
-        checkpoint_digest=CHECKPOINT_DIGEST,
-    )
-    monkeypatch.setattr(
-        traditional_module,
-        "estimate_pseudo_depth_and_intrinsics",
-        lambda *args: (_ for _ in ()).throw(
-            AssertionError("provider already normalized the intrinsic")
-        ),
-    )
-    monkeypatch.setattr(
-        traditional_module,
-        "unproject_depth_to_local_points",
-        lambda *args: (_ for _ in ()).throw(
-            AssertionError("provider already unprojected local points")
-        ),
-    )
-    monkeypatch.setattr(
-        traditional_module,
-        "register_adjacent_windows",
-        lambda *args: identity_sim3(scale=2.0),
-    )
-    caches = []
-    engine._save_cache = lambda: (
-        caches.append(engine.prev_window_cache),
-        setattr(engine, "cache_id", engine.cache_id + 1),
-    )
-
-    engine.registration_queue.put(
-        (WindowSpec(0, 0, 2), make_window(), 0.0)
-    )
-    engine.registration_queue.put(
-        (WindowSpec(1, 1, 3), make_window(), 0.0)
-    )
-    engine.registration_queue.put(STOP_SIGNAL)
-    engine._registration_worker()
-
-    cache = caches[1]
-    assert cache.loop_state["tag"] == "traditional"
-    assert cache.loop_state["anchor_scale_applied"] is False
-    assert torch.as_tensor(
-        cache.loop_state["relative_sim3"][0]
-    ).item() == pytest.approx(2.0)
-    torch.testing.assert_close(
-        cache.local_points,
-        torch.ones_like(cache.local_points),
-    )
-    torch.testing.assert_close(
-        cache.anchor_scale_mask,
-        torch.full_like(cache.anchor_scale_mask, 3.0),
-    )
-
-
-def traditional_cache_fixture():
-    first = WindowCache(
-        schema_version=WINDOW_CACHE_SCHEMA_VERSION,
-        loop_method=LoopMethod.TRADITIONAL,
-        prediction_key=PREDICTION_KEY,
-        model_name=ModelName.PI3,
-        checkpoint_digest=CHECKPOINT_DIGEST,
-        window_index=0,
-        frame_start=0,
-        frame_end=2,
+    return TraditionalWindowState(
+        window_index=index,
+        frame_start=index,
+        frame_end=index + 2,
         local_points=torch.ones((2, 1, 1, 3)),
         camera_poses=torch.eye(4).repeat(2, 1, 1),
         confidence=torch.ones((2, 1, 1)),
@@ -159,92 +31,76 @@ def traditional_cache_fixture():
             np.zeros((1, 1), dtype=np.intp),
             np.zeros((1, 1), dtype=np.intp),
         ),
-        anchor_scale_mask=None,
-        loop_state={
-            "tag": "traditional",
-            "relative_sim3": identity_sim3(),
-            "anchor_scale_applied": False,
-        },
-    )
-    second = WindowCache(
-        schema_version=WINDOW_CACHE_SCHEMA_VERSION,
-        loop_method=LoopMethod.TRADITIONAL,
-        prediction_key=PREDICTION_KEY,
-        model_name=ModelName.PI3,
-        checkpoint_digest=CHECKPOINT_DIGEST,
-        window_index=1,
-        frame_start=1,
-        frame_end=3,
-        local_points=torch.ones((2, 1, 1, 3)),
-        camera_poses=torch.eye(4).repeat(2, 1, 1),
-        confidence=torch.ones((2, 1, 1)),
-        segmentation_labels=(
-            np.zeros((1, 1), dtype=np.intp),
-            np.zeros((1, 1), dtype=np.intp),
+        anchor_scale_mask=(
+            None
+            if anchor_scale is None
+            else torch.full((2, 1, 1, 1), anchor_scale)
         ),
-        anchor_scale_mask=torch.full((2, 1, 1, 1), 3.0),
-        loop_state={
-            "tag": "traditional",
-            "relative_sim3": identity_sim3(scale=2.0),
-            "anchor_scale_applied": False,
-        },
+        relative_sim3=identity_sim3(relative_scale),
+        segmentation_diagnostics=(),
     )
-    return (first, second)
 
 
-def strategy_fixture(optimizer=None, constraint_estimator=None):
+def traditional_states():
+    return (
+        traditional_state(0),
+        traditional_state(1, relative_scale=2.0, anchor_scale=3.0),
+    )
+
+
+def processor_fixture(optimizer=None):
     optimizer_config = load_pipeline_config(
         "configs/pipeline/test.yaml",
         ("loop.optimizer.implementation=python",),
     ).config.loop.optimizer
-    return TraditionalLoopClosureStrategy(
-        optimizer_config=optimizer_config,
-        registration_confidence_keep_ratio=0.3,
+    return TraditionalLoopProcessor(
+        optimizer_config,
         optimizer=optimizer,
-        constraint_estimator=constraint_estimator,
     )
 
 
 def test_traditional_aggregation_applies_delayed_transforms_once():
-    strategy = strategy_fixture()
+    states = traditional_states()
     solution = LoopSolution(
         optimized_transforms=(identity_sim3(), identity_sim3(scale=2.0)),
         constraints=(),
         used_no_loop_path=False,
     )
-    result = strategy.aggregate(traditional_cache_fixture(), solution)
-    assert result.payload["local_points"].shape[0] == 3
+
+    result = processor_fixture().aggregate(states, solution)
+
+    assert result.local_points.shape[0] == 3
     torch.testing.assert_close(
-        result.payload["local_points"][-1],
-        torch.full_like(result.payload["local_points"][-1], 3.0),
+        result.local_points[-1],
+        torch.full_like(result.local_points[-1], 3.0),
     )
-    for cache in traditional_cache_fixture():
+    for state in states:
         torch.testing.assert_close(
-            cache.local_points,
-            torch.ones_like(cache.local_points),
+            state.local_points,
+            torch.ones_like(state.local_points),
         )
 
 
-def test_traditional_cross_window_constraint_requires_joint_estimator():
-    candidate = (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),)
+class FixedEvidence:
+    def __init__(self, alignment_a, alignment_b):
+        self.alignment_a = alignment_a
+        self.alignment_b = alignment_b
 
-    with pytest.raises(ValueError, match="joint constraint estimator"):
-        strategy_fixture().build_constraints(
-            traditional_cache_fixture(),
-            candidate,
-        )
+    def estimate(self, window_a, window_b, candidate):
+        del window_a, window_b, candidate
+        return self.alignment_a, self.alignment_b
 
 
-def test_traditional_converts_joint_estimator_alignments_to_common_frame():
-    alignment_a = identity_sim3(scale=2.0)
-    alignment_b = identity_sim3(scale=6.0)
-    strategy = strategy_fixture(
-        constraint_estimator=lambda *arguments: (alignment_a, alignment_b)
+def test_traditional_converts_joint_evidence_to_common_frame():
+    evidence = FixedEvidence(
+        identity_sim3(scale=2.0),
+        identity_sim3(scale=6.0),
     )
 
-    constraint = strategy.build_constraints(
-        traditional_cache_fixture(),
+    constraint = processor_fixture().build_constraints(
+        traditional_states(),
         (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),),
+        evidence,
     )[0]
 
     assert torch.as_tensor(constraint.measurement[0]).item() == pytest.approx(
@@ -252,27 +108,64 @@ def test_traditional_converts_joint_estimator_alignments_to_common_frame():
     )
 
 
-def test_traditional_no_loop_does_not_invoke_optimizer():
+def test_traditional_no_constraints_does_not_invoke_optimizer():
     class FailingOptimizer:
         def optimize(self, *args):
             raise AssertionError("optimizer must not be called")
 
-    caches = traditional_cache_fixture()
-    solution = strategy_fixture(FailingOptimizer()).optimize(caches, [])
+    states = traditional_states()
+    solution = processor_fixture(FailingOptimizer()).optimize(states, [])
+
     assert solution.used_no_loop_path is True
     assert solution.optimized_transforms == tuple(
-        cache.loop_state["relative_sim3"] for cache in caches
+        state.relative_sim3 for state in states
     )
 
 
-def test_traditional_cache_payload_round_trips_with_method_tag():
-    cache = traditional_cache_fixture()[1]
-    restored = WindowCache.from_payload(
-        cache.to_payload(),
-        expected_method=LoopMethod.TRADITIONAL,
-        expected_prediction_key=PREDICTION_KEY,
-        expected_model_name=ModelName.PI3,
-        expected_checkpoint_digest=CHECKPOINT_DIGEST,
+def test_traditional_candidate_value_error_is_isolated_and_pair_deduplicated():
+    states = tuple(traditional_state(index) for index in range(3))
+    calls = []
+
+    class RecordingEvidence:
+        def estimate(self, window_a, window_b, candidate):
+            del window_a, window_b
+            calls.append(candidate)
+            if len(calls) == 1:
+                raise ValueError("no mutual confidence")
+            return identity_sim3(), identity_sim3()
+
+    first = LoopCandidate(frame_a=2, frame_b=0, similarity=0.8)
+    second = LoopCandidate(frame_a=3, frame_b=0, similarity=0.7)
+    duplicate = LoopCandidate(frame_a=2, frame_b=1, similarity=0.6)
+
+    constraints = processor_fixture().build_constraints(
+        states,
+        (first, second, duplicate),
+        RecordingEvidence(),
     )
-    assert restored.loop_state["tag"] == "traditional"
-    assert restored.loop_state["anchor_scale_applied"] is False
+
+    assert [constraint.candidate for constraint in constraints] == [duplicate]
+    assert calls == [first, duplicate]
+
+
+def test_traditional_optimizer_receives_relative_tail_and_constraints():
+    class RecordingOptimizer:
+        def optimize(self, edges, constraints):
+            self.edges = edges
+            self.constraints = constraints
+            return edges
+
+    optimizer = RecordingOptimizer()
+    states = traditional_states()
+    processor = processor_fixture(optimizer)
+    constraint = processor.build_constraints(
+        states,
+        (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),),
+        FixedEvidence(identity_sim3(), identity_sim3()),
+    )[0]
+
+    solution = processor.optimize(states, [constraint])
+
+    assert optimizer.edges == [states[1].relative_sim3]
+    assert optimizer.constraints == [(1, 0, constraint.measurement)]
+    assert len(solution.optimized_transforms) == len(states)

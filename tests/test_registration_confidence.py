@@ -12,7 +12,6 @@ from inference_engine.segmentation import build_segmentation_strategy
 from inference_engine.utils import registration_confidence
 from loop_closure.methods import (
     CorrectedWindowEngine,
-    TraditionalWindowEngine,
 )
 from inference_engine.utils.registration_confidence import (
     select_top_confidence_mask,
@@ -145,7 +144,7 @@ def test_base_engine_uses_explicit_registration_keep_ratio(tmp_path):
 
 @pytest.mark.parametrize(
     "engine_type",
-    (TraditionalWindowEngine, CorrectedWindowEngine),
+    (CorrectedWindowEngine,),
 )
 def test_loop_window_engines_use_same_registration_field(
     tmp_path,

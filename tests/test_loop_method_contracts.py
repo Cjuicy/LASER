@@ -13,7 +13,6 @@ from loop_closure.methods.base import (
     WindowCache,
 )
 from loop_closure.methods.corrected import CorrectedLoopClosureStrategy
-from loop_closure.methods.traditional import TraditionalLoopClosureStrategy
 from loop_closure.loop_model import LoopDetector
 from loop_closure.utils.sim3loop import Sim3LoopOptimizer
 from pipeline.config import LoopMethod, ModelName, load_pipeline_config
@@ -196,29 +195,18 @@ def test_both_methods_receive_same_candidate_tuple():
     assert corrected.received_candidates is candidates
 
 
-def _strategy_and_caches(loop_method, constraint_estimator):
+def _strategy_and_caches(constraint_estimator):
     optimizer_config = load_pipeline_config(
         "configs/pipeline/test.yaml",
         ("loop.optimizer.implementation=python",),
     ).config.loop.optimizer
-    strategy_type = {
-        LoopMethod.TRADITIONAL: TraditionalLoopClosureStrategy,
-        LoopMethod.CORRECTED: CorrectedLoopClosureStrategy,
-    }[loop_method]
-    state = (
-        {
-            "tag": loop_method.value,
-            "relative_sim3": _identity_sim3(),
-            "anchor_scale_applied": False,
-        }
-        if loop_method is LoopMethod.TRADITIONAL
-        else {
-            "tag": loop_method.value,
-            "sim3_abs": _identity_sim3(),
-            "sim3_edge": _identity_sim3(),
-            "anchor_scale_applied": True,
-        }
-    )
+    loop_method = LoopMethod.CORRECTED
+    state = {
+        "tag": loop_method.value,
+        "sim3_abs": _identity_sim3(),
+        "sim3_edge": _identity_sim3(),
+        "anchor_scale_applied": True,
+    }
     caches = tuple(
         WindowCache(
             schema_version=WINDOW_CACHE_SCHEMA_VERSION,
@@ -241,17 +229,14 @@ def _strategy_and_caches(loop_method, constraint_estimator):
         )
         for index in range(3)
     )
-    return strategy_type(
+    return CorrectedLoopClosureStrategy(
         optimizer_config=optimizer_config,
         registration_confidence_keep_ratio=0.3,
         constraint_estimator=constraint_estimator,
     ), caches
 
 
-@pytest.mark.parametrize("loop_method", tuple(LoopMethod))
-def test_loop_constraint_value_error_isolated_and_pair_deduplicated(
-    loop_method,
-):
+def test_corrected_loop_constraint_value_error_isolated_and_pair_deduplicated():
     calls = []
 
     def estimate(*arguments):
@@ -260,7 +245,7 @@ def test_loop_constraint_value_error_isolated_and_pair_deduplicated(
             raise ValueError("no mutual confidence")
         return _identity_sim3(), _identity_sim3()
 
-    strategy, caches = _strategy_and_caches(loop_method, estimate)
+    strategy, caches = _strategy_and_caches(estimate)
     first = LoopCandidate(frame_a=2, frame_b=0, similarity=0.8)
     second = LoopCandidate(frame_a=4, frame_b=0, similarity=0.7)
     third = LoopCandidate(frame_a=3, frame_b=1, similarity=0.6)
@@ -271,12 +256,11 @@ def test_loop_constraint_value_error_isolated_and_pair_deduplicated(
     assert calls == [first, second]
 
 
-@pytest.mark.parametrize("loop_method", tuple(LoopMethod))
-def test_loop_constraint_system_error_escapes_candidate_isolation(loop_method):
+def test_corrected_loop_constraint_system_error_escapes_candidate_isolation():
     def estimate(*arguments):
         raise RuntimeError("CUDA out of memory")
 
-    strategy, caches = _strategy_and_caches(loop_method, estimate)
+    strategy, caches = _strategy_and_caches(estimate)
 
     with pytest.raises(RuntimeError, match="CUDA out of memory"):
         strategy.build_constraints(

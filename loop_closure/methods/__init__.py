@@ -15,10 +15,10 @@ from .corrected import (
     build_local_loop_constraint,
 )
 from .traditional import (
-    TraditionalLoopClosureStrategy,
-    TraditionalWindowEngine,
+    TraditionalLoopProcessor,
+    compute_sim3_ab,
 )
-from .registry import LOOP_STRATEGIES, build_loop_strategy
+from .registry import LOOP_PROCESSORS, build_loop_processor
 
 
 __all__ = [
@@ -27,15 +27,15 @@ __all__ = [
     "LoopClosureStrategy",
     "LoopConstraint",
     "LoopSolution",
-    "LOOP_STRATEGIES",
+    "LOOP_PROCESSORS",
     "ReconstructionResult",
     "CorrectedLoopClosureStrategy",
     "CorrectedWindowEngine",
-    "TraditionalLoopClosureStrategy",
-    "TraditionalWindowEngine",
+    "TraditionalLoopProcessor",
     "WindowCache",
     "build_local_loop_constraint",
-    "build_loop_strategy",
+    "build_loop_processor",
+    "compute_sim3_ab",
     "detect_loop_candidates",
     "validate_sim3",
 ]
