@@ -1,0 +1,13 @@
+version: 1
+evaluation: ate
+reconstruction_config: configs/reconstruction/pi3_laser.yaml
+evaluation_config: configs/evaluation/ate.yaml
+output_root: outputs/experiments/laser
+dataset:
+  name: fixture
+  sequence: sequence-0
+  ground_truth: data/groundtruth.txt
+  ground_truth_format: tum
+matrix:
+  segmentation: [depth, geometry, atomic]
+  reconstruction_modes: [no_loop, traditional, corrected]

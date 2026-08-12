@@ -179,11 +179,15 @@ class PipelineRunner:
         loaded: LoadedPipelineConfig,
         *,
         dependencies: PipelineDependencies | None = None,
+        artifact_output_dir: str | Path | None = None,
     ) -> None:
         if not isinstance(loaded, LoadedPipelineConfig):
             raise ValueError("PipelineRunner requires LoadedPipelineConfig")
         self.loaded = loaded
         self.dependencies = dependencies or PipelineDependencies()
+        self._artifact_output_dir = (
+            None if artifact_output_dir is None else Path(artifact_output_dir)
+        )
         self.artifact_dir: Path | None = None
 
     def run(self) -> ReconstructionArtifact:
@@ -243,7 +247,7 @@ class PipelineRunner:
         anchor = dependencies.build_anchor_propagator(
             config.anchor_propagation.correspondence_iou_threshold
         )
-        output_dir = (
+        output_dir = self._artifact_output_dir or (
             Path(config.output.result_dir)
             / config.output.scene_name
             / f"{config.segmentation.method.value}-{config.reconstruction.mode.value}"
