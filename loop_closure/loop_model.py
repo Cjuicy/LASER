@@ -8,7 +8,7 @@ from tqdm import tqdm
 from pipeline.config import DetectionConfig
 from pipeline.manifest import ImageManifest
 
-from .methods.base import LoopCandidate
+from .types import LoopCandidate
 from .vpr_model import VPRModel
 
 

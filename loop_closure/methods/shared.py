@@ -9,7 +9,7 @@ from inference_engine.utils.registration_confidence import (
     select_top_confidence_mask,
 )
 
-from .base import LoopCandidate
+from loop_closure.types import LoopCandidate
 
 
 __all__ = [

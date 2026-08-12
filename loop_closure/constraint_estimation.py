@@ -17,7 +17,8 @@ from inference_engine.utils.registration_confidence import (
 )
 from pipeline.manifest import ImageManifest
 
-from .methods.base import LoopCandidate, Sim3, WindowCache, validate_sim3
+from .evidence import LoopWindow
+from .types import LoopCandidate, Sim3, validate_sim3
 
 
 def centered_frame_range(
@@ -78,23 +79,12 @@ class JointAlignmentEstimator:
             confidence_keep_ratio
         )
 
-    def __call__(
+    def estimate(
         self,
-        cache_a: WindowCache,
-        cache_b: WindowCache,
+        cache_a: LoopWindow,
+        cache_b: LoopWindow,
         candidate: LoopCandidate,
-        keep_ratio: float,
     ) -> tuple[Sim3, Sim3]:
-        ratio = validate_confidence_keep_ratio(keep_ratio)
-        if not math.isclose(
-            ratio,
-            self.confidence_keep_ratio,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            raise ValueError(
-                "strategy keep ratio does not match joint estimator configuration"
-            )
         range_a = centered_frame_range(
             cache_a.frame_start,
             cache_a.frame_end,
@@ -121,6 +111,25 @@ class JointAlignmentEstimator:
         alignment_a = self._align_side(cache_a, range_a, joint_a, "side A")
         alignment_b = self._align_side(cache_b, range_b, joint_b, "side B")
         return alignment_a, alignment_b
+
+    def __call__(
+        self,
+        cache_a: LoopWindow,
+        cache_b: LoopWindow,
+        candidate: LoopCandidate,
+        keep_ratio: float,
+    ) -> tuple[Sim3, Sim3]:
+        ratio = validate_confidence_keep_ratio(keep_ratio)
+        if not math.isclose(
+            ratio,
+            self.confidence_keep_ratio,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "strategy keep ratio does not match joint estimator configuration"
+            )
+        return self.estimate(cache_a, cache_b, candidate)
 
     def _predict(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         prediction = self.model.predict(
@@ -160,7 +169,7 @@ class JointAlignmentEstimator:
 
     def _align_side(
         self,
-        cache: WindowCache,
+        cache: LoopWindow,
         frame_range: tuple[int, int],
         joint: Mapping[str, torch.Tensor],
         side_name: str,

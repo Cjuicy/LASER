@@ -132,11 +132,10 @@ def test_joint_estimator_infers_once_and_registers_each_cached_side(
     )
     estimator = _estimator(model)
 
-    alignment_a, alignment_b = estimator(
+    alignment_a, alignment_b = estimator.estimate(
         _cache(4, 10, 1),
         _cache(0, 6, 0),
         LoopCandidate(frame_a=8, frame_b=1, similarity=0.9),
-        keep_ratio=0.5,
     )
 
     assert model.inputs[0][:, 0, 0, 0].tolist() == [
