@@ -33,7 +33,11 @@ def reconstruction_commands(output: str):
     return [
         line
         for line in output.splitlines()
-        if line.startswith("DRY-RUN ") and "run_reconstruction.py" in line
+        if line.startswith("DRY-RUN ")
+        and (
+            "run_reconstruction.py" in line
+            or "run-reconstruction-loop-safe" in line
+        )
     ]
 
 
@@ -126,6 +130,7 @@ def test_kitti_dry_run_emits_one_traditional_and_five_corrected_methods(tmp_path
     assert result.returncode == 0, result.stderr
     commands = reconstruction_commands(result.stdout)
     assert len(commands) == 12
+    assert all("run-reconstruction-loop-safe" in command for command in commands)
     assert_method_overrides_are_set_options(commands)
     assert all("window.size=75" in command for command in commands)
     assert all("window.overlap=30" in command for command in commands)

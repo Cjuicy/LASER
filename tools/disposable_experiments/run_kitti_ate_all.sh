@@ -121,7 +121,7 @@ for sequence in "${sequences[@]}"; do
         --allowed-root "${ARTIFACT_ROOT}"
     fi
 
-    run_laser_python run_reconstruction.py \
+    run_laser_python "${UTILITY}" run-reconstruction-loop-safe \
       --config configs/reconstruction/pi3_laser.yaml \
       --set "input.image_dir=${image_dir}" \
       --set input.sample_stride=1 \

@@ -76,6 +76,60 @@ ATE_METRICS = (
 FSCORE_THRESHOLDS = (0.01, 0.02, 0.05)
 
 
+def build_loop_detector_outside_artifact(
+    config,
+    *,
+    output_path: str | Path,
+    detector_factory=None,
+):
+    """Keep SALAD diagnostics beside, rather than inside, a pending artifact."""
+    if detector_factory is None:
+        from loop_closure.detection import SaladLoopDetector
+
+        detector_factory = SaladLoopDetector
+    requested = Path(output_path)
+    artifact_directory = requested.parent
+    diagnostic_path = artifact_directory.parent / (
+        f"{artifact_directory.name}.loop_candidates.json"
+    )
+    return detector_factory(config, output_path=diagnostic_path)
+
+
+def run_reconstruction_loop_safe(
+    config_path: str | Path,
+    overrides: Sequence[str],
+) -> Path:
+    """Run loop reconstruction without pre-creating the final artifact path."""
+    from pipeline.config import load_pipeline_config
+    from pipeline.runner import PipelineDependencies, PipelineRunner
+
+    loaded = load_pipeline_config(config_path, tuple(overrides))
+    dependencies = PipelineDependencies(
+        build_loop_detector=build_loop_detector_outside_artifact,
+    )
+    runner = PipelineRunner(loaded, dependencies=dependencies)
+    artifact = runner.run()
+    diagnostics = artifact.diagnostics
+    print(
+        " ".join(
+            (
+                f"mode={artifact.reconstruction_mode.value}",
+                f"segmentation={artifact.segmentation_method.value}",
+                f"prediction_key={artifact.prediction_key}",
+                f"window={loaded.config.window.size}",
+                f"overlap={loaded.config.window.overlap}",
+                f"config_hash={loaded.sha256}",
+                f"frames={len(artifact.frame_ids)}",
+                f"windows={int(diagnostics.mode_scalars.get('window_count', 0))}",
+                f"artifact_dir={runner.artifact_dir}",
+            )
+        )
+    )
+    if runner.artifact_dir is None:  # pragma: no cover - runner owns this invariant
+        raise RuntimeError("reconstruction did not write an artifact")
+    return runner.artifact_dir
+
+
 def _atomic_json(path: str | Path, payload: Mapping[str, object]) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -718,6 +772,16 @@ def build_parser() -> argparse.ArgumentParser:
     overrides.add_argument("--evaluation", choices=("pointcloud", "ate"), required=True)
     overrides.add_argument("--method", required=True)
 
+    reconstruct = subparsers.add_parser("run-reconstruction-loop-safe")
+    reconstruct.add_argument("--config", required=True)
+    reconstruct.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+    )
+
     prepare = subparsers.add_parser("prepare-pointcloud")
     prepare.add_argument("--dataset", choices=("7scenes", "nrgbd"), required=True)
     prepare.add_argument("--root", required=True)
@@ -780,6 +844,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif arguments.command == "method-overrides":
         for override in build_method_overrides(arguments.method, arguments.evaluation):
             print(override)
+    elif arguments.command == "run-reconstruction-loop-safe":
+        run_reconstruction_loop_safe(arguments.config, arguments.overrides)
     elif arguments.command == "prepare-pointcloud":
         print(
             prepare_pointcloud(
