@@ -279,6 +279,47 @@ registration:
     assert not (tmp_path / "compact.json").exists()
 
 
+def test_artifact_identity_accepts_serialized_enum_name(tmp_path):
+    module = load_module()
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    write_json(
+        artifact / "manifest.json",
+        {
+            "schema_version": 1,
+            "segmentation_method": "depth",
+            "reconstruction_mode": "no_loop",
+            "prediction_key": "a" * 64,
+        },
+    )
+    (artifact / "resolved_reconstruction.yaml").write_text(
+        """
+segmentation:
+  atomic:
+    split_mode: NONE
+input:
+  sample_stride: 1
+window:
+  size: 20
+  overlap: 5
+registration:
+  confidence_keep_ratio: 0.5
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    identity = module.method_identity(
+        evaluation="pointcloud",
+        dataset="7scenes",
+        scene="chess/seq-03",
+        method="depth",
+    )
+
+    manifest, _ = module._validate_artifact_identity(artifact, identity)
+
+    assert manifest["prediction_key"] == "a" * 64
+
+
 def test_nrgbd_preparation_reads_only_requested_scene(tmp_path):
     module = load_module()
     from PIL import Image

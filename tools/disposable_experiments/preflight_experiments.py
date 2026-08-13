@@ -432,7 +432,7 @@ def _validate_artifact_identity(
     checks = {
         "segmentation_method": manifest.get("segmentation_method"),
         "reconstruction_mode": manifest.get("reconstruction_mode"),
-        "split_mode": str(resolved.segmentation.atomic.split_mode),
+        "split_mode": str(resolved.segmentation.atomic.split_mode).lower(),
         "sample_stride": int(resolved.input.sample_stride),
         "window_size": int(resolved.window.size),
         "overlap": int(resolved.window.overlap),
