@@ -9,6 +9,8 @@ __pycache__/
 
 # C extensions
 *.so
+inference_engine/utils/_segmentation_cy.cpp
+inference_engine/utils/fast_seg.cpp
 
 # Distribution / packaging
 .Python

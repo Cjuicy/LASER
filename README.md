@@ -3,235 +3,162 @@
 <a href="http://arxiv.org/abs/2512.13680"><img src="https://img.shields.io/badge/arXiv-2512.13680-b31b1b" alt="arXiv"></a>
 <a href="https://neu-vi.github.io/LASER/"><img src="https://img.shields.io/badge/Project-Website-orange" alt="Project Page"></a>
 
-[Tianye Ding<sup>1*</sup>](https://jerrygcding.github.io/), 
-[Yiming Xie<sup>1*</sup>](https://ymingxie.github.io/), 
-[Yiqing Liang<sup>2*</sup>](https://lynl7130.github.io/), 
-[Moitreya Chatterjee<sup>3</sup>](https://sites.google.com/site/metrosmiles/), 
-[Pedro Miraldo<sup>3</sup>](https://pmiraldo.github.io/), 
-[Huaizu Jiang<sup>1</sup>](https://jianghz.me/)\
-<sup>1</sup> Northeastern University, <sup>2</sup> Independent Researcher, <sup>3</sup> Mitsubishi Electric Research Laboratories\
+[Tianye Ding<sup>1*</sup>](https://jerrygcding.github.io/),
+[Yiming Xie<sup>1*</sup>](https://ymingxie.github.io/),
+[Yiqing Liang<sup>2*</sup>](https://lynl7130.github.io/),
+[Moitreya Chatterjee<sup>3</sup>](https://sites.google.com/site/metrosmiles/),
+[Pedro Miraldo<sup>3</sup>](https://pmiraldo.github.io/),
+[Huaizu Jiang<sup>1</sup>](https://jianghz.me/)<br>
+<sup>1</sup> Northeastern University, <sup>2</sup> Independent Researcher, <sup>3</sup> Mitsubishi Electric Research Laboratories<br>
 <sup>*</sup> Equal Contribution
 </div>
 
-## 📢 Updates
-* **[2026-03-12]** Loop-closure module released with robustness fix.
-* **[2026-02-21]** Paper accepted by CVPR 2026.
-* **[2025-12-15]** ArXiv preprint released.
+## Updates
 
-## 📝 To-Do List
+- **[2026-08-13]** Reconstruction and evaluation paths decoupled into typed artifacts.
+- **[2026-03-12]** Loop-closure module released with robustness fix.
+- **[2026-02-21]** Paper accepted by CVPR 2026.
 
-- [x] Release framework codebase
-- [x] Release inference code
-- [x] Add data preparation instruction
-- [x] Release evaluation code
-- [x] Add Viser integration
-- [x] Release loop-closure demo
+## Abstract
 
-## 💡 Abstract
-We propose LASER, a training-free framework that converts an offline reconstruction model into a streaming system by aligning predictions across consecutive temporal windows. 
-We observe that simple similarity transformation (Sim(3)) alignment fails due to layer depth misalignment: monocular scale ambiguity causes relative depth scales of different scene layers to vary inconsistently between windows. 
-To address this, we introduce layer-wise scale alignment, which segments depth predictions into discrete layers, computes per-layer scale factors, and propagates them across both adjacent windows and timestamps.
+LASER is a training-free framework that converts an offline reconstruction
+model into a streaming system by aligning predictions across consecutive
+temporal windows. Layer-wise scale alignment segments depth predictions,
+computes per-layer scale factors, and propagates them across adjacent windows
+and timestamps.
 
-## 🛠️ Installation
+## Installation
 
 ```bash
-# 1. Clone the repository
-git clone --recursive git@github.com:neu-vi/LASER.git
+git clone --recursive --branch codex/laser-paper-pointmap-eval https://github.com/Cjuicy/LASER.git
 cd LASER
-
-# 2. Create environment
-conda create -n laser -y python=3.11
-conda activate laser
-
-# 3. Install dependencies
+conda create -n laser-decoupled python=3.11 -y
+conda activate laser-decoupled
 pip install -r requirements.txt
-
-# 4. Compile cython modules
 python setup.py build_ext --inplace
-
-# 5. Install Viser
 pip install -e viser
+bash scripts/download_weights.sh
 ```
 
-(Optional) Download checkpoints needed for loop-closure inference
+The ordinary PI3 model is expected at `weights/model.safetensors`. Traditional
+and Corrected reconstruction also require `weights/dino_salad.ckpt` and
+`weights/dinov2_vitb14_pretrain.pth`.
+
+## Decoupled architecture
+
+```text
+PI3 prediction stream
+  -> depth | geometry | atomic segmentation
+  -> original LASER AnchorPropagator
+  -> no_loop | traditional | corrected reconstruction
+  -> ReconstructionArtifact
+       -> ATE evaluator (all reconstruction modes)
+       -> point-cloud evaluator (no_loop only)
+```
+
+The evaluator boundary is strict: evaluators load artifact views and calculate
+metrics; they never run PI3, segmentation, anchor propagation, registration, or
+loop closure.
+
+The three reconstruction modes preserve their original operation order:
+
+- `no_loop`: incremental adjacent registration, segmentation, anchor
+  propagation, and point-map assembly. No loop service is constructed.
+- `traditional`: record all windows first, detect loops, estimate constraints,
+  optimize, then apply deferred alignment and depth-scale correction.
+- `corrected`: apply adjacent alignment and anchor correction online, detect
+  loops after all windows, optimize sequential edges, then apply one final
+  correction delta.
+
+## One reconstruction
+
+Choose any segmentation, reconstruction mode, window size, and overlap:
 
 ```bash
-bash ./scripts/download_weights.sh
+python run_reconstruction.py \
+  --config configs/reconstruction/pi3_laser.yaml \
+  --set input.image_dir=/data/sequence/images \
+  --set output.scene_name=my-sequence \
+  --set segmentation.method=geometry \
+  --set reconstruction.mode=traditional \
+  --set window.size=20 \
+  --set window.overlap=5
 ```
 
-## 🚀 Usage
+Use `configs/reconstruction/pi3_laser_no_loop.yaml` when loop checkpoints are
+unavailable. Valid windows satisfy `window.size > window.overlap >= 1`; `10/5`,
+`20/5`, and `20/10` are supported examples.
 
-### Modular inference
+Each run writes:
 
-LASER now uses one strict YAML configuration and one public entry point:
+```text
+outputs/reconstruction/<scene>/<segmentation>-<mode>/
+  manifest.json
+  trajectory.pt
+  pointmap.pt
+  confidence.pt
+```
+
+Ordinary PI3 predictions are cached independently of segmentation,
+reconstruction mode, anchor, loop, and evaluation settings.
+
+## Artifact-only evaluation
+
+ATE accepts artifacts from all three reconstruction modes:
 
 ```bash
-python run_laser.py --config configs/pipeline/default.yaml
+python evaluate_ate.py \
+  --artifact outputs/reconstruction/my-sequence/geometry-traditional \
+  --config configs/evaluation/ate.yaml \
+  --ground-truth /data/sequence/groundtruth.txt \
+  --ground-truth-format tum \
+  --output outputs/evaluation/ate/my-sequence
 ```
 
-Select any segmentation, atomic split, or loop strategy through canonical
-configuration paths:
+Point-cloud evaluation accepts only `no_loop` artifacts:
 
 ```bash
-python run_laser.py \
-  --config configs/pipeline/default.yaml \
-  --set segmentation.method=atomic \
-  --set segmentation.atomic.split_mode=normal_only \
-  --set loop.method=traditional
+python evaluate_pointcloud.py \
+  --artifact outputs/reconstruction/my-sequence/depth-no_loop \
+  --config configs/evaluation/pointcloud.yaml \
+  --ground-truth /data/sequence/groundtruth_pointmaps.npz \
+  --dataset NeuralRGBD \
+  --sequence my-sequence \
+  --output outputs/evaluation/pointcloud/my-sequence
 ```
 
-The exact supported methods are:
+Point-cloud ground truth is an NPZ with `point_maps` shaped `(N,H,W,3)` and
+`valid_mask` shaped `(N,H,W)`. A loop artifact is rejected before the Open3D
+backend is constructed.
 
-- reconstruction model: `pi3`
-- segmentation: `depth`, `geometry`, `atomic`
-- atomic split: `none`, `conservative`, `normal_only`
-- loop closure: `traditional`, `corrected`
+## Experiment matrices
 
-Pi3 ordinary sliding-window predictions can be shared across segmentation and
-loop-method experiments:
+- ATE: `depth|geometry|atomic × no_loop|traditional|corrected` = 9 entries.
+- Point cloud: `depth|geometry|atomic × no_loop` = 3 entries.
+
+Set dataset paths in the experiment YAML and run:
 
 ```bash
-python run_laser.py \
-  --config configs/pipeline/default.yaml \
-  --set model.name=pi3 \
-  --set prediction_cache.mode=auto
+python run_experiment_matrix.py --config configs/experiments/ate_matrix.yaml
+python run_experiment_matrix.py --config configs/experiments/pointcloud_matrix.yaml
 ```
 
-The cache stores ordinary depth, confidence, poses, and one sequence reference
-intrinsic. RGB images, SALAD descriptors, loop candidates, and candidate joint
-A/B inference are not cached.
+The matrix runner shares ordinary prediction cache entries and reuses complete
+reconstruction artifacts by content identity. Point-cloud matrix runs
+explicitly use the LASER Table 4 `nearest` confidence quantile; ATE retains the
+`higher` rule.
 
-Loop closure additionally requires `faiss-gpu-cu12`. See the
-[modular pipeline guide](docs/pipeline-configuration.md) for the complete YAML,
-method semantics, diagnostics, ten-configuration matrix, and AutoDL/KITTI
-commands. See the
-[Pi3 prediction-cache validation guide](docs/pi3-prediction-cache-validation.md)
-for cache modes, storage layout, cold/warm tests, and acceptance criteria.
+For complete setup, dry-run, output, and cloud verification commands, see
+[docs/reconstruction-evaluation-cloud-validation.md](docs/reconstruction-evaluation-cloud-validation.md).
 
-### Visualization
-To visualize the interactive 4D results, you can use the following command:
+## Visualization
+
 ```bash
 python viser/visualizer_monst3r.py --data viser_results/SEQ_NAME
-
-# example visualization script
-python viser/visualizer_monst3r.py --data viser_results/titanic
 ```
-
-## Evaluation
-Please refer to [MonST3R](https://github.com/Junyi42/monst3r/blob/main/data/prepare_training.md#dataset-setup) for dataset setup details.
-
-Put all datasets in `data/`.
-
-### Video Depth
-
-Sintel
-```bash
-export PYTHONPATH="./":$PYTHONPATH
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 eval_launch.py \
-    --mode=eval_pose \
-    --model=streaming_pi3 \
-    --eval_dataset=sintel \
-    --output_dir="outputs/video_depth/sintel_depth" \
-    --full_seq \
-    --no_crop
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 depth_metric.py \
-    --eval_dataset=sintel \
-    --result_dir="outputs/video_depth/sintel_depth" \
-    --output_dir="outputs/video_depth"
-```
-
-Bonn
-```bash
-export PYTHONPATH="./":$PYTHONPATH
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 eval_launch.py \
-    --mode=eval_pose \
-    --model=streaming_pi3 \
-    --eval_dataset=bonn \
-    --output_dir="outputs/video_depth/bonn_depth" \
-    --no_crop
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 depth_metric.py \
-    --eval_dataset=bonn \
-    --result_dir="outputs/video_depth/bonn_depth" \
-    --output_dir="outputs/video_depth"
-```
-
-KITTI
-```bash
-export PYTHONPATH="./":$PYTHONPATH
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 eval_launch.py \
-    --mode=eval_pose \
-    --model=streaming_pi3 \
-    --eval_dataset=kitti \
-    --output_dir="outputs/video_depth/kitti_depth" \
-    --no_crop \
-    --flow_loss_weight 0 \
-    --translation_weight 1e-3
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 depth_metric.py \
-    --eval_dataset=kitti \
-    --result_dir="outputs/video_depth/kitti_depth" \
-    --output_dir="outputs/video_depth"
-```
-
-### Camera Pose
-
-Sintel
-```bash
-export PYTHONPATH="./":$PYTHONPATH
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 eval_launch.py \
-    --mode=eval_pose \
-    --model=streaming_pi3 \
-    --eval_dataset=sintel \
-    --output_dir="outputs/cam_pose/sintel_pose"
-```
-
-ScanNet
-```bash
-export PYTHONPATH="./":$PYTHONPATH
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 eval_launch.py \
-    --mode=eval_pose \
-    --model=streaming_pi3 \
-    --eval_dataset=scannet \
-    --output_dir="outputs/cam_pose/scannet_pose"
-```
-
-TUM
-```bash
-export PYTHONPATH="./":$PYTHONPATH
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 eval_launch.py \
-    --mode=eval_pose \
-    --model=streaming_pi3 \
-    --eval_dataset=tum \
-    --output_dir="outputs/cam_pose/tum_pose"
-```
-<!-- 
-KITTI Odometry
-```bash
-export PYTHONPATH="./":$PYTHONPATH
-
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 --master_port=12345 eval_launch.py \
---mode=eval_pose \
---model=streaming_pi3_lc \
---eval_dataset=kitti_odometry \
---output_dir="outputs/cam_pose/kitti_odometry_pose"
-```
-
-### MV Recon
-```bash
-export PYTHONPATH="./":$PYTHONPATH
-python mv_recon/eval.py
-``` -->
 
 ## Citation
-If you find this repository useful in your research, please consider giving a star ⭐ and a citation
+
 ```bibtex
 @article{ding2025laser,
   title={LASER: Layer-wise Scale Alignment for Training-Free Streaming 4D Reconstruction},
@@ -241,10 +168,9 @@ If you find this repository useful in your research, please consider giving a st
 ```
 
 ## Acknowledgements
-We would like to thank the authors for the following excellent open source projects:
-[VGGT](https://github.com/facebookresearch/vggt/tree/main), 
-[&pi;<sup>3</sup>](https://github.com/yyfz/Pi3),
+
+We thank the authors of [VGGT](https://github.com/facebookresearch/vggt),
+[PI3](https://github.com/yyfz/Pi3),
 [MonST3R](https://github.com/Junyi42/monst3r),
-[CUT3R](https://github.com/CUT3R/CUT3R),
-[VGGT-Long](https://github.com/DengKaiCQ/VGGT-Long/tree/main)
-and many other inspiring works in the community.
+[CUT3R](https://github.com/CUT3R/CUT3R), and
+[VGGT-Long](https://github.com/DengKaiCQ/VGGT-Long).

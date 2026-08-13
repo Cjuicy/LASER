@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import json
+from pathlib import Path
 
+import torch
+
+from experiments.ate import evaluate_ate_artifact
 from experiments.config import EvaluationKind, ExperimentConfig, ExperimentDatasetConfig
 from experiments.matrix import (
     ArtifactRepository,
@@ -12,6 +18,8 @@ from pipeline.artifacts import write_reconstruction_artifact
 from tests.test_pipeline_runner import _artifact
 from pipeline.config import load_pipeline_config
 from pipeline.config import ReconstructionMode
+from pipeline.artifacts import ReconstructionArtifact, ReconstructionDiagnostics
+from pipeline.config import SegmentationMethod
 
 
 def _config(tmp_path):
@@ -97,3 +105,47 @@ def test_incomplete_artifact_directory_fails_instead_of_overwrite(tmp_path):
 
     with pytest.raises(ValueError, match="incomplete artifact"):
         repository.get_or_create(identity, lambda path: path)
+
+
+def test_ate_result_records_real_artifact_manifest_digest(tmp_path):
+    artifact_dir = tmp_path / "artifact"
+    poses = torch.eye(4).repeat(3, 1, 1)
+    points = torch.zeros((3, 1, 1, 3))
+    confidence = torch.ones((3, 1, 1))
+    write_reconstruction_artifact(
+        ReconstructionArtifact(
+            schema_version=1,
+            frame_ids=(0, 1, 2),
+            local_points=points,
+            global_points=points,
+            camera_poses=poses,
+            confidence=confidence,
+            segmentation_method=SegmentationMethod.DEPTH,
+            reconstruction_mode=ReconstructionMode.NO_LOOP,
+            prediction_key="prediction-key",
+            diagnostics=ReconstructionDiagnostics({}, (), 0, 0, {}),
+        ),
+        artifact_dir,
+        resolved_yaml="version: 2\n",
+        config_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+        git_commit="c" * 40,
+    )
+    experiment = _config(tmp_path)
+    Path(experiment.dataset.ground_truth).write_text(
+        "0 0 0 0 0 0 0 1\n"
+        "1 0 0 0 0 0 0 1\n"
+        "2 0 0 0 0 0 0 1\n",
+        encoding="utf-8",
+    )
+
+    output = evaluate_ate_artifact(
+        artifact_dir,
+        experiment,
+        tmp_path / "evaluation",
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert payload["artifact_manifest_sha256"] == hashlib.sha256(
+        (artifact_dir / "manifest.json").read_bytes()
+    ).hexdigest()

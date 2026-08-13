@@ -34,11 +34,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     estimate = load_pointmap_estimate(arguments.artifact)
     config = load_pointcloud_evaluation_config(arguments.config)
     try:
-        data = np.load(arguments.ground_truth, allow_pickle=False)
-        ground_truth = PointCloudGroundTruth(
-            point_maps=data["point_maps"],
-            valid_mask=data["valid_mask"],
-        )
+        with np.load(arguments.ground_truth, allow_pickle=False) as data:
+            ground_truth = PointCloudGroundTruth(
+                point_maps=data["point_maps"],
+                valid_mask=data["valid_mask"],
+            )
     except (OSError, KeyError, ValueError) as exc:
         raise ValueError("ground-truth NPZ must contain point_maps and valid_mask") from exc
     evaluation = evaluate_point_maps(

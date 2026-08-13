@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from evaluation.trajectory import (
@@ -11,6 +12,13 @@ from evaluation.trajectory import (
 from pipeline.artifacts import load_trajectory_estimate
 
 from .config import ExperimentConfig
+
+
+def _artifact_manifest_sha256(artifact_dir: str | Path) -> str:
+    manifest = Path(artifact_dir) / "manifest.json"
+    if not manifest.is_file():
+        raise FileNotFoundError(f"artifact manifest does not exist: {manifest}")
+    return hashlib.sha256(manifest.read_bytes()).hexdigest()
 
 
 def evaluate_ate_artifact(
@@ -30,5 +38,5 @@ def evaluate_ate_artifact(
     return write_trajectory_metrics(
         metrics,
         output_dir,
-        artifact_manifest_sha256="managed-by-experiment-artifact-repository",
+        artifact_manifest_sha256=_artifact_manifest_sha256(artifact_dir),
     )
