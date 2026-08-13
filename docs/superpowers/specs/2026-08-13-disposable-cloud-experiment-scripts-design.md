@@ -77,7 +77,8 @@ required metrics are finite. There is no database or campaign state machine.
 Methods within one scene run serially and share the existing content-addressed
 ordinary PI3 prediction cache. A failed command stops the script immediately,
 leaves intermediates intact, and returns a non-zero status. Running `run_all.sh`
-again skips validated results and resumes at the first missing method.
+again skips validated results, removes only the failed method's stale
+campaign-owned directory, and retries the first missing method.
 
 Logs are written per dataset, scene, and method. The scripts run in the
 foreground; the delivered command wraps `run_all.sh` in `screen` so it survives
@@ -85,9 +86,10 @@ SSH disconnection without agent monitoring.
 
 ## Safe Cleanup
 
-Cleanup occurs only after every requested method for the current scene or
-sequence has a validated compact metric JSON. Cleanup targets are resolved
-below campaign-owned roots and checked against explicit scene names before
+Each method artifact is removed immediately after its compact metric JSON
+validates. Prepared benchmark data and prediction-cache entries are removed
+only after every requested method for the current scene or sequence validates.
+Cleanup targets are resolved below campaign-owned roots and checked before
 removal.
 
 The scripts may delete only:
