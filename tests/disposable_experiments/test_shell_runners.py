@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -36,6 +37,25 @@ def reconstruction_commands(output: str):
     ]
 
 
+def assert_method_overrides_are_set_options(commands):
+    for command in commands:
+        tokens = shlex.split(command.removeprefix("DRY-RUN "))
+        override_tokens = [
+            token
+            for token in tokens
+            if token.startswith(
+                (
+                    "segmentation.method=",
+                    "segmentation.atomic.split_mode=",
+                    "reconstruction.mode=",
+                )
+            )
+        ]
+        assert len(override_tokens) == 3
+        for override in override_tokens:
+            assert tokens[tokens.index(override) - 1] == "--set"
+
+
 def test_pointcloud_dry_run_emits_five_exact_methods_per_scene(tmp_path):
     seven_map = tmp_path / "seven.json"
     nrgbd_map = tmp_path / "nrgbd.json"
@@ -54,6 +74,7 @@ def test_pointcloud_dry_run_emits_five_exact_methods_per_scene(tmp_path):
     assert result.returncode == 0, result.stderr
     commands = reconstruction_commands(result.stdout)
     assert len(commands) == 10
+    assert_method_overrides_are_set_options(commands)
     assert all("window.size=20" in command for command in commands)
     assert all("window.overlap=5" in command for command in commands)
     assert all("registration.confidence_keep_ratio=0.5" in command for command in commands)
@@ -105,6 +126,7 @@ def test_kitti_dry_run_emits_one_traditional_and_five_corrected_methods(tmp_path
     assert result.returncode == 0, result.stderr
     commands = reconstruction_commands(result.stdout)
     assert len(commands) == 12
+    assert_method_overrides_are_set_options(commands)
     assert all("window.size=75" in command for command in commands)
     assert all("window.overlap=30" in command for command in commands)
     assert all("registration.confidence_keep_ratio=0.5" in command for command in commands)

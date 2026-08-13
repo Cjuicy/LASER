@@ -96,7 +96,11 @@ for sequence in "${sequences[@]}"; do
     done < <(
         "${CONTROL_PYTHON}" "${UTILITY}" method-overrides \
           --evaluation ate --method "${method}"
-      )
+    )
+    method_arguments=()
+    for override in "${method_overrides[@]}"; do
+      method_arguments+=(--set "${override}")
+    done
     segmentation=""
     reconstruction=""
     for override in "${method_overrides[@]}"; do
@@ -132,7 +136,7 @@ for sequence in "${sequences[@]}"; do
       --set "output.result_dir=${method_root}" \
       --set "loop.detection.salad_checkpoint=${SALAD_CHECKPOINT}" \
       --set "loop.detection.dino_checkpoint=${DINO_CHECKPOINT}" \
-      "${method_overrides[@]}" 2>&1 | tee -a "${log_path}"
+      "${method_arguments[@]}" 2>&1 | tee -a "${log_path}"
 
     run_laser_python evaluate_ate.py \
       --artifact "${artifact_dir}" \

@@ -143,10 +143,14 @@ run_dataset() {
       done < <(
           "${CONTROL_PYTHON}" "${UTILITY}" method-overrides \
             --evaluation pointcloud --method "${method}"
-        )
+      )
+      local method_arguments=()
+      local override
+      for override in "${method_overrides[@]}"; do
+        method_arguments+=(--set "${override}")
+      done
       local segmentation=""
       local reconstruction=""
-      local override
       for override in "${method_overrides[@]}"; do
         [[ "${override}" == segmentation.method=* ]] && segmentation="${override#*=}"
         [[ "${override}" == reconstruction.mode=* ]] && reconstruction="${override#*=}"
@@ -177,7 +181,7 @@ run_dataset() {
         --set output.scene_name=artifact \
         --set "output.cache_dir=${method_root}/legacy_cache" \
         --set "output.result_dir=${method_root}" \
-        "${method_overrides[@]}" 2>&1 | tee -a "${log_path}"
+        "${method_arguments[@]}" 2>&1 | tee -a "${log_path}"
 
       run_laser_python "${UTILITY}" compact-pointcloud \
         --artifact "${artifact_dir}" \
