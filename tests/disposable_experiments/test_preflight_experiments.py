@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import hashlib
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -114,6 +117,30 @@ def test_requested_matrices_resolve_to_exact_runtime_overrides():
         "segmentation.atomic.split_mode=normal_only",
         "reconstruction.mode=corrected",
     )
+
+
+def test_direct_script_load_adds_repository_root_to_import_path(tmp_path):
+    environment = {**os.environ, "PYTHONPATH": ""}
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import runpy; "
+                f"runpy.run_path({str(MODULE_PATH)!r}, run_name='probe'); "
+                "import evaluation, pipeline; "
+                "print(evaluation.__file__); print(pipeline.__file__)"
+            ),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    assert str(REPOSITORY_ROOT) in probe.stdout
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])

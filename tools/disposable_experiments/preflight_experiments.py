@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPOSITORY_ROOT = SCRIPT_DIR.parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+
 SOURCE_BASELINE = "cfe26f8b57341a9320eae2ef71532a353654d1a6"
 SOURCE_FILE_SHA256 = {
     "configs/evaluation/ate.yaml": "82f49312c5c3422e33abef11cf40e8e263606c4ed77a469995b64423a724dec4",
