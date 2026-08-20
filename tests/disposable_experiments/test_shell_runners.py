@@ -4,7 +4,17 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
+
+import torch
+
+from pipeline.artifacts import (
+    ReconstructionArtifact,
+    ReconstructionDiagnostics,
+    write_reconstruction_artifact,
+)
+from pipeline.config import ReconstructionMode, SegmentationMethod
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -310,3 +320,140 @@ def test_completed_pointcloud_scene_is_not_prepared_again(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "[skip-scene]" in result.stdout
     assert "prepare-pointcloud" not in result.stdout
+
+
+def test_kitti_retry_reuses_valid_artifact_for_evaluation(tmp_path):
+    experiment_root = tmp_path / "experiment"
+    artifact_dir = (
+        experiment_root
+        / "work"
+        / "ate_artifacts"
+        / "kitti"
+        / "00"
+        / "depth-traditional"
+        / "artifact"
+        / "depth-traditional"
+    )
+    points = torch.zeros((2, 1, 1, 3), dtype=torch.float32)
+    artifact = ReconstructionArtifact(
+        schema_version=1,
+        frame_ids=(0, 1),
+        local_points=points,
+        global_points=points.clone(),
+        camera_poses=torch.eye(4).repeat(2, 1, 1),
+        confidence=torch.ones((2, 1, 1), dtype=torch.float32),
+        segmentation_method=SegmentationMethod.DEPTH,
+        reconstruction_mode=ReconstructionMode.TRADITIONAL,
+        prediction_key="a" * 64,
+        diagnostics=ReconstructionDiagnostics(
+            stage_timings_ms={},
+            segmentation_summaries=(),
+            candidate_count=0,
+            constraint_count=0,
+            mode_scalars={"window_count": 1},
+        ),
+    )
+    write_reconstruction_artifact(
+        artifact,
+        artifact_dir,
+        resolved_yaml="""
+segmentation:
+  atomic:
+    split_mode: none
+input:
+  sample_stride: 1
+window:
+  size: 75
+  overlap: 30
+registration:
+  confidence_keep_ratio: 0.5
+""".lstrip(),
+        config_sha256="b" * 64,
+        checkpoint_sha256="c" * 64,
+        git_commit="fixture",
+    )
+
+    methods = (
+        "depth-traditional",
+        "depth-corrected",
+        "geometry-corrected",
+        "atomic-original-corrected",
+        "atomic-split-assisted-corrected",
+        "atomic-split-no-assisted-corrected",
+    )
+    for sequence in (f"{index:02d}" for index in range(11)):
+        for method in methods:
+            if sequence == "00" and method == "depth-traditional":
+                continue
+            result = (
+                experiment_root
+                / "metrics"
+                / "ate"
+                / "kitti"
+                / sequence
+                / f"{method}.json"
+            )
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text("{}\n", encoding="utf-8")
+
+    call_log = tmp_path / "calls.log"
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        """#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\\n' "$*" >> "$FAKE_CALL_LOG"
+if [[ "$1" == */preflight_experiments.py && "${2:-}" == artifact-ok ]]; then
+  exec "$REAL_PYTHON" "$@"
+fi
+write_output() {
+  local output=''
+  while (($#)); do
+    if [[ "$1" == --output ]]; then
+      output="$2"
+      break
+    fi
+    shift
+  done
+  if [[ -n "$output" ]]; then
+    mkdir -p "$(dirname "$output")"
+    printf '{}\\n' > "$output"
+  fi
+}
+if [[ "$1" == *evaluate_ate.py ]]; then
+  write_output "$@"
+elif [[ "$1" == */preflight_experiments.py ]]; then
+  case "${2:-}" in
+    compact-ate) write_output "$@" ;;
+    result-ok|cleanup-artifact|cleanup-scene-cache) ;;
+  esac
+fi
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    environment = {
+        **os.environ,
+        "CONTROL_PYTHON": sys.executable,
+        "DRY_RUN": "0",
+        "EXPERIMENT_ROOT": str(experiment_root),
+        "FAKE_CALL_LOG": str(call_log),
+        "KITTI_ROOT": str(tmp_path / "KITTI"),
+        "LASER_PYTHON": str(fake_python),
+        "REAL_PYTHON": sys.executable,
+    }
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT_ROOT / "run_kitti_ate_all.sh")],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    calls = call_log.read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stderr
+    assert "artifact-ok" in calls
+    assert "run-reconstruction-loop-safe" not in calls
+    assert "evaluate_ate.py" in calls
+    assert "[resume-evaluation] kitti/00/depth-traditional" in result.stdout

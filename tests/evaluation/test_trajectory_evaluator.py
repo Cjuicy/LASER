@@ -40,6 +40,23 @@ def test_sim3_equivalent_trajectory_has_zero_ate_and_rpe():
     assert result.rpe_rotation_rmse_deg == pytest.approx(0.0, abs=1e-9)
 
 
+def test_trajectory_evaluator_canonicalizes_numerically_drifted_rotations():
+    truth_poses = _poses([(0, 0, 0), (1, 0, 0), (2, 0, 0)])
+    estimate_poses = truth_poses.clone()
+    estimate_poses[1, :3, :3] *= 1.00001
+    frame_ids = (0, 1, 2)
+
+    result = evaluate_trajectory(
+        TrajectoryEstimate(frame_ids, estimate_poses),
+        GroundTruthTrajectory(frame_ids, truth_poses),
+        TrajectoryEvaluationConfig(),
+    )
+
+    assert result.ate_rmse_m == pytest.approx(0.0, abs=1e-9)
+    assert result.rpe_translation_rmse_m == pytest.approx(0.0, abs=1e-9)
+    assert result.rpe_rotation_rmse_deg == pytest.approx(0.0, abs=1e-9)
+
+
 def test_trajectory_evaluator_associates_shared_frame_ids():
     estimate = TrajectoryEstimate(
         (1, 2, 3),

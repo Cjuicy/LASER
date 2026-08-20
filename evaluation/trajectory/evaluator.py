@@ -12,6 +12,7 @@ from evo.core.metrics import PoseRelation, Unit
 from evo.core.geometry import GeometryException
 from evo.core.trajectory import PoseTrajectory3D
 from evo.tools import file_interface
+from scipy.spatial.transform import Rotation
 
 from pipeline.artifacts import TrajectoryEstimate
 
@@ -67,7 +68,12 @@ def _matched_poses(
 
 
 def _evo_trajectory(poses: torch.Tensor, frame_ids: tuple[int, ...]):
-    matrices = poses.detach().cpu().to(torch.float64).numpy()
+    matrices = poses.detach().cpu().to(torch.float64).numpy().copy()
+    # Preserve the legacy matrix -> quaternion semantics before evo's strict
+    # SO(3) check, removing only accumulated floating-point rotation drift.
+    matrices[:, :3, :3] = Rotation.from_matrix(
+        matrices[:, :3, :3]
+    ).as_matrix()
     return PoseTrajectory3D(
         poses_se3=matrices,
         timestamps=np.asarray(frame_ids, dtype=np.float64),

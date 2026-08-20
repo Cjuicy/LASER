@@ -577,6 +577,17 @@ def compact_ate(
     return result
 
 
+def validate_ate_artifact(
+    artifact: str | Path,
+    identity: Mapping[str, object],
+) -> Path:
+    from pipeline.artifacts import load_trajectory_estimate
+
+    _validate_artifact_identity(artifact, identity)
+    load_trajectory_estimate(artifact)
+    return Path(artifact)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -802,6 +813,10 @@ def build_parser() -> argparse.ArgumentParser:
     compact_trajectory.add_argument("--output", required=True)
     _add_identity_arguments(compact_trajectory, evaluation_choices=("ate",))
 
+    artifact_ok = subparsers.add_parser("artifact-ok")
+    artifact_ok.add_argument("--artifact", required=True)
+    _add_identity_arguments(artifact_ok, evaluation_choices=("ate",))
+
     result_ok = subparsers.add_parser("result-ok")
     result_ok.add_argument("--path", required=True)
     _add_identity_arguments(result_ok)
@@ -873,6 +888,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 evaluator_result=arguments.evaluator_result,
                 output=arguments.output,
                 identity=_identity_from_arguments(arguments),
+            )
+        )
+    elif arguments.command == "artifact-ok":
+        print(
+            validate_ate_artifact(
+                arguments.artifact,
+                _identity_from_arguments(arguments),
             )
         )
     elif arguments.command == "result-ok":

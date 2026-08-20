@@ -60,6 +60,19 @@ result_valid() {
     --method "${method}" >/dev/null 2>&1
 }
 
+artifact_valid() {
+  local artifact_path="$1"
+  local sequence="$2"
+  local method="$3"
+  [[ "${DRY_RUN}" != "1" && -d "${artifact_path}" ]] || return 1
+  run_laser_python "${UTILITY}" artifact-ok \
+    --artifact "${artifact_path}" \
+    --evaluation ate \
+    --dataset kitti \
+    --scene "${sequence}" \
+    --method "${method}" >/dev/null 2>&1
+}
+
 mkdir -p "${METRIC_ROOT}" "${LOG_ROOT}" "${WORK_ROOT}"
 sequences=(00 01 02 03 04 05 06 07 08 09 10)
 if [[ -n "${DRY_RUN_KITTI_SEQUENCE_LIST}" ]]; then
@@ -113,30 +126,34 @@ for sequence in "${sequences[@]}"; do
     log_path="${LOG_ROOT}/${sequence}/${method}.log"
     mkdir -p "$(dirname "${log_path}")"
 
-    # A failed run is kept for inspection. Starting a later retry discards only
-    # that stale campaign-owned method directory so the core CLI can recreate it.
-    if [[ "${DRY_RUN}" != "1" && -d "${method_root}" ]]; then
-      run_laser_python "${UTILITY}" cleanup-artifact \
-        --path "${method_root}" \
-        --allowed-root "${ARTIFACT_ROOT}"
-    fi
+    if artifact_valid "${artifact_dir}" "${sequence}" "${method}"; then
+      printf '[resume-evaluation] kitti/%s/%s\n' "${sequence}" "${method}"
+    else
+      # A failed reconstruction is kept for inspection. Starting a later retry
+      # discards only that stale campaign-owned method directory.
+      if [[ "${DRY_RUN}" != "1" && -d "${method_root}" ]]; then
+        run_laser_python "${UTILITY}" cleanup-artifact \
+          --path "${method_root}" \
+          --allowed-root "${ARTIFACT_ROOT}"
+      fi
 
-    run_laser_python "${UTILITY}" run-reconstruction-loop-safe \
-      --config configs/reconstruction/pi3_laser.yaml \
-      --set "input.image_dir=${image_dir}" \
-      --set input.sample_stride=1 \
-      --set "model.checkpoint=${PI3_CHECKPOINT}" \
-      --set window.size=75 \
-      --set window.overlap=30 \
-      --set registration.confidence_keep_ratio=0.5 \
-      --set "prediction_cache.root=${scene_cache}" \
-      --set prediction_cache.mode=auto \
-      --set output.scene_name=artifact \
-      --set "output.cache_dir=${method_root}/legacy_cache" \
-      --set "output.result_dir=${method_root}" \
-      --set "loop.detection.salad_checkpoint=${SALAD_CHECKPOINT}" \
-      --set "loop.detection.dino_checkpoint=${DINO_CHECKPOINT}" \
-      "${method_arguments[@]}" 2>&1 | tee -a "${log_path}"
+      run_laser_python "${UTILITY}" run-reconstruction-loop-safe \
+        --config configs/reconstruction/pi3_laser.yaml \
+        --set "input.image_dir=${image_dir}" \
+        --set input.sample_stride=1 \
+        --set "model.checkpoint=${PI3_CHECKPOINT}" \
+        --set window.size=75 \
+        --set window.overlap=30 \
+        --set registration.confidence_keep_ratio=0.5 \
+        --set "prediction_cache.root=${scene_cache}" \
+        --set prediction_cache.mode=auto \
+        --set output.scene_name=artifact \
+        --set "output.cache_dir=${method_root}/legacy_cache" \
+        --set "output.result_dir=${method_root}" \
+        --set "loop.detection.salad_checkpoint=${SALAD_CHECKPOINT}" \
+        --set "loop.detection.dino_checkpoint=${DINO_CHECKPOINT}" \
+        "${method_arguments[@]}" 2>&1 | tee -a "${log_path}"
+    fi
 
     run_laser_python evaluate_ate.py \
       --artifact "${artifact_dir}" \
