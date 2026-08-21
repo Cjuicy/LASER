@@ -162,6 +162,8 @@ class DiagnosticsSummary:
             "window_count",
         ):
             _finite_number(getattr(self, name), name, minimum=0, integer=True)
+        if self.unique_frame_count > self.window_frame_observation_count:
+            raise ValueError("unique_frame_count exceeds observations")
         if not isinstance(self.region_count, DistributionSummary):
             raise ValueError("region_count must be a DistributionSummary")
         _validate_distribution_semantics(
@@ -366,8 +368,6 @@ class DiagnosticsSummary:
                 raise ValueError("keyframe index histogram does not match records")
             if sum(self.fallback_reason_histogram.values()) > self.window_frame_observation_count:
                 raise ValueError("fallback histogram count is invalid")
-            if self.unique_frame_count > self.window_frame_observation_count:
-                raise ValueError("unique frame count exceeds observations")
             assert self.applied_frame_count is not None
             if self.applied_frame_count > self.window_frame_observation_count:
                 raise ValueError("applied_frame_count exceeds observations")

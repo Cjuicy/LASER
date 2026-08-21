@@ -229,6 +229,18 @@ def test_disabled_persisted_refinement_fields_are_rejected_on_read_and_resume(
         load_valid_completed_run(path, record.identity_seed)
 
 
+def test_disabled_persisted_unique_frame_count_cannot_exceed_observations(tmp_path):
+    record = make_success_record()
+    path = write_run_record(tmp_path / "run.json", record)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["diagnostics"]["unique_frame_count"] = 3
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="unique_frame_count"):
+        read_run_record(path)
+    with pytest.raises(ValueError, match="unique_frame_count"):
+        load_valid_completed_run(path, record.identity_seed)
+
+
 @pytest.mark.parametrize(
     "mutate, match",
     [
