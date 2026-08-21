@@ -14,7 +14,11 @@ from typing import Callable, Mapping
 import numpy as np
 
 from .config import DatasetKind, EvaluationKind
-from .scenes import ResolvedFrameSelection, ResolvedScene
+from .scenes import (
+    ResolvedFrameSelection,
+    ResolvedScene,
+    _read_kitti_pose_rows,
+)
 
 
 STAGING_SCHEMA_VERSION = 1
@@ -236,6 +240,52 @@ def _source_file_record(path: Path | None, approved: Path, label: str) -> dict[s
     return {"source_path": str(resolved), "source_sha256": _sha256_file(resolved)}
 
 
+def _pointcloud_dependency_records(scene: ResolvedScene) -> list[dict[str, str]]:
+    """Hash every non-image source that can affect point-map preparation."""
+
+    approved = scene.approved_data_root.resolve(strict=False)
+    records: list[dict[str, str]] = []
+    seen: set[Path] = set()
+
+    def add(path: Path, label: str) -> None:
+        if not path.is_file():
+            raise FileNotFoundError(f"point-cloud source dependency is missing: {path}")
+        resolved = path.resolve(strict=True)
+        if resolved in seen:
+            return
+        record = _source_file_record(resolved, approved, label)
+        assert record is not None
+        record["role"] = label
+        records.append(record)
+        seen.add(resolved)
+
+    if scene.prepared_gt_path is not None:
+        parent = scene.prepared_gt_path.resolve(strict=True).parent
+        for name in ("source_frame_ids.npy", "frame_ids.npy"):
+            sibling = parent / name
+            if sibling.is_file():
+                add(sibling, f"external GT {name}")
+        return records
+
+    for frame_id, image_path in zip(
+        scene.selection.source_frame_ids, scene.source_images, strict=True
+    ):
+        image = image_path.resolve(strict=True)
+        if scene.dataset is DatasetKind.NRGBD:
+            scene_dir = image.parent.parent
+            add(scene_dir / "poses.txt", "NeuralRGBD poses")
+            add(scene_dir / "depth" / f"depth{frame_id}.png", "NeuralRGBD depth")
+        elif scene.dataset is DatasetKind.SEVEN_SCENES:
+            scene_dir = image.parent
+            base = scene_dir / f"frame-{frame_id:06d}"
+            add(base.with_suffix(".pose.txt"), "7-Scenes pose")
+            add(base.with_suffix(".depth.png"), "7-Scenes depth")
+            projected = base.with_suffix(".depth.proj.png")
+            if projected.is_file():
+                add(projected, "7-Scenes projected depth")
+    return records
+
+
 def preview_staging_manifest(scene: ResolvedScene) -> tuple[dict[str, object], str]:
     """Build the source-only manifest payload and its stable digest."""
 
@@ -267,21 +317,9 @@ def preview_staging_manifest(scene: ResolvedScene) -> tuple[dict[str, object], s
     )
     if gt_record is not None:
         payload["prepared_gt_source"] = gt_record
+    if scene.evaluation_kind is EvaluationKind.POINTCLOUD:
+        payload["pointcloud_dependencies"] = _pointcloud_dependency_records(scene)
     return payload, _canonical_sha256(payload)
-
-
-def _read_kitti_pose_rows(path: Path) -> np.ndarray:
-    try:
-        values = np.loadtxt(path, dtype=np.float64)
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"KITTI poses are invalid: {path}") from exc
-    array = np.asarray(values, dtype=np.float64)
-    if array.size == 0 or array.size % 12:
-        raise ValueError("KITTI poses must contain rows of 12 values")
-    array = array.reshape(-1, 12)
-    if not np.isfinite(array).all():
-        raise ValueError("KITTI poses must contain finite values")
-    return array
 
 
 def _validate_external_gt(
@@ -472,6 +510,7 @@ def _raw_sevenscenes_gt(
         return _validate_raw_dataset_output(scene, data)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _validate_raw_dataset_output(
@@ -500,6 +539,10 @@ def _validate_raw_dataset_output(
     valid_mask = np.asarray(data["valid_mask"])
     if point_maps.ndim != 4 or point_maps.shape[-1] != 3:
         raise ValueError("point-map GT must have shape (N,H,W,3) for all frames")
+    if point_maps.shape[0] != len(requested):
+        raise ValueError(
+            "point-map GT leading dimension must match requested frame IDs"
+        )
     if scene.expected_gt_shape != (392, 518) or point_maps.shape[1:3] != (392, 518):
         raise ValueError("point-map GT spatial shape does not match (392, 518)")
     if valid_mask.shape != point_maps.shape[:3]:
@@ -561,9 +604,25 @@ def _manifest_error(message: str, path: Path | None = None) -> ValueError:
     return ValueError(f"{message}: {path}")
 
 
+def _required_generated_files(manifest: Mapping[str, object]) -> set[str]:
+    try:
+        dataset = DatasetKind(manifest["dataset"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _manifest_error("staging manifest mismatch") from exc
+    required = {"source_frame_ids.npy"}
+    if dataset is DatasetKind.KITTI:
+        required.add("poses.txt")
+    elif dataset in {DatasetKind.SEVEN_SCENES, DatasetKind.NRGBD}:
+        required.add("ground_truth.npz")
+    return required
+
+
 def _validate_manifest_files(directory: Path, manifest: Mapping[str, object]) -> None:
     files = manifest.get("files")
     if not isinstance(files, dict):
+        raise _manifest_error("staging file hash mismatch", directory / "staging.json")
+    required = _required_generated_files(manifest)
+    if set(files) != required:
         raise _manifest_error("staging file hash mismatch", directory / "staging.json")
     for relative, expected in files.items():
         if not isinstance(relative, str) or not isinstance(expected, str):
@@ -618,6 +677,11 @@ def load_valid_staging(
     if actual_base != expected_base:
         raise _manifest_error("staging manifest mismatch", manifest_path)
     _validate_manifest_files(directory, manifest)
+    required_files = _required_generated_files(manifest)
+    expected_entries = {"images", "staging.json", *required_files}
+    actual_entries = {entry.name for entry in directory.iterdir()}
+    if actual_entries != expected_entries:
+        raise _manifest_error("staging file hash mismatch", directory)
 
     source_ids = manifest.get("source_frame_ids")
     images = manifest.get("images")
@@ -706,6 +770,42 @@ def _write_staged_poses(scene: ResolvedScene, directory: Path) -> Path | None:
     return _atomic_path(target, writer)
 
 
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_staging_no_clobber(temporary: Path, final: Path) -> bool:
+    """Reserve final atomically, then publish children without overwriting."""
+
+    try:
+        os.mkdir(final)
+    except FileExistsError:
+        return False
+
+    if any(final.iterdir()):
+        raise ValueError(f"staging publish winner is not empty: {final}")
+    entries = sorted(
+        temporary.iterdir(),
+        key=lambda item: (item.name == "staging.json", item.name),
+    )
+    for entry in entries:
+        destination = final / entry.name
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(f"staging publish winner changed during publish: {destination}")
+        os.replace(entry, destination)
+    os.rmdir(temporary)
+    _fsync_directory(final)
+    _fsync_directory(final.parent)
+    return True
+
+
 def stage_scene(scene: ResolvedScene, campaign_root: str | Path) -> StagedScene:
     """Build or safely reuse one campaign-owned staged scene."""
 
@@ -751,12 +851,12 @@ def stage_scene(scene: ResolvedScene, campaign_root: str | Path) -> StagedScene:
         manifest["files"] = generated
         _atomic_json(temporary / "staging.json", manifest)
 
-        if final.exists() or final.is_symlink():
+        published = _publish_staging_no_clobber(temporary, final)
+        if not published:
             # Another process won the atomic publication race.  Never replace
             # or clean an unknown directory; validate the winner instead.
             guarded_remove(temporary, root)
             return load_valid_staging(final, payload)
-        os.replace(temporary, final)
         temporary = Path()
         return load_valid_staging(final, payload)
     finally:

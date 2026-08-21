@@ -246,18 +246,38 @@ def _discover_kitti_images(image_dir: Path) -> tuple[Path, ...]:
     return images
 
 
-def _load_kitti_poses(path: Path) -> np.ndarray:
+def _read_kitti_pose_rows(path: Path) -> np.ndarray:
+    """Read KITTI poses while preserving physical line boundaries."""
+
     try:
-        values = np.loadtxt(path, dtype=np.float64)
-    except (OSError, ValueError) as exc:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
         raise ValueError(f"KITTI poses are invalid: {path}") from exc
-    array = np.asarray(values, dtype=np.float64)
-    if array.size == 0 or array.size % 12:
-        raise ValueError("KITTI poses must contain rows of 12 values")
-    array = array.reshape(-1, 12)
+    rows: list[list[float]] = []
+    for line_number, line in enumerate(lines, start=1):
+        content = line.split("#", 1)[0].strip()
+        if not content:
+            continue
+        tokens = content.split()
+        if len(tokens) != 12:
+            raise ValueError(
+                "KITTI poses must contain 12 values per physical row "
+                f"(line {line_number})"
+            )
+        try:
+            rows.append([float(token) for token in tokens])
+        except ValueError as exc:
+            raise ValueError(f"KITTI poses are invalid: {path}") from exc
+    if not rows:
+        raise ValueError("KITTI poses must contain at least one physical row")
+    array = np.asarray(rows, dtype=np.float64)
     if not np.isfinite(array).all():
         raise ValueError("KITTI poses must contain finite values")
     return array
+
+
+def _load_kitti_poses(path: Path) -> np.ndarray:
+    return _read_kitti_pose_rows(path)
 
 
 def _resolve_mapped_scene(
@@ -277,7 +297,7 @@ def _resolve_mapped_scene(
         (DatasetKind.NRGBD, "complete_kitchen"): 122,
     }
     expected_length = approved_lengths.get((scene_config.dataset, scene_config.scene))
-    if expected_length is not None and selected.stop == expected_length and len(ids) != expected_length:
+    if expected_length is not None and len(ids) != expected_length:
         raise ValueError(
             f"point-cloud sequence {scene_config.scene} must contain exactly "
             f"{expected_length} mapped frames"
@@ -433,6 +453,7 @@ __all__ = [
     "KittiLayout",
     "ResolvedFrameSelection",
     "ResolvedScene",
+    "_read_kitti_pose_rows",
     "apply_frame_selection",
     "resolve_kitti_layout",
     "resolve_scene",

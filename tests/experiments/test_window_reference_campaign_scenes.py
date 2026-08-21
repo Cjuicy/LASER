@@ -23,11 +23,13 @@ from experiments.window_reference_campaign.scenes import (
     resolve_scene,
 )
 from experiments.window_reference_campaign.staging import (
+    _validate_raw_dataset_output,
     guarded_remove,
     prepare_pointcloud_gt,
     require_descendant,
     stage_scene,
 )
+import experiments.window_reference_campaign.staging as staging_module
 
 
 def _png(path: Path, colour: int = 0) -> Path:
@@ -102,7 +104,7 @@ def test_resolve_scene_reads_only_named_sequence_map_entry(tmp_path):
     np.savetxt(root / "poses.txt", np.tile(np.eye(4), (21, 1)))
     sequence_map = tmp_path / "map.json"
     sequence_map.write_text(
-        json.dumps({"thin_geometry": [0, 10, 20], "broken": {"not": "a vector"}}),
+        json.dumps({"thin_geometry": list(range(0, 400, 10)), "broken": {"not": "a vector"}}),
         encoding="utf-8",
     )
     config_path = Path(__file__).resolve().parents[2] / "configs/experiments/window_reference_campaign.yaml"
@@ -287,6 +289,236 @@ def test_pointcloud_gt_rejects_disagreeing_frame_id_sources(tmp_path):
 
     with pytest.raises(ValueError, match="frame ID sources disagree"):
         stage_scene(scene, tmp_path / "campaign")
+
+
+def test_staging_requires_exact_generated_file_manifest_and_physical_set(tmp_path):
+    scene = _kitti_scene(tmp_path)
+    staged = stage_scene(scene, tmp_path / "campaign")
+    manifest_path = Path(staged.manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].pop("poses.txt")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="staging file hash mismatch"):
+        stage_scene(scene, tmp_path / "campaign")
+
+
+def test_staging_rejects_required_file_deleted_even_when_manifest_records_it(tmp_path):
+    scene = _kitti_scene(tmp_path)
+    staged = stage_scene(scene, tmp_path / "campaign")
+    manifest_path = Path(staged.manifest_path)
+    Path(staged.poses_path).unlink()
+
+    with pytest.raises(ValueError, match="staging file hash mismatch"):
+        stage_scene(scene, tmp_path / "campaign")
+
+
+def test_staging_rejects_unexpected_generated_file_entry(tmp_path):
+    scene = _kitti_scene(tmp_path)
+    staged = stage_scene(scene, tmp_path / "campaign")
+    manifest_path = Path(staged.manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    extra = manifest_path.parent / "unexpected.bin"
+    extra.write_bytes(b"unexpected")
+    manifest["files"]["unexpected.bin"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="staging file hash mismatch"):
+        stage_scene(scene, tmp_path / "campaign")
+
+
+def test_external_sibling_frame_id_mutation_invalidates_existing_staging(tmp_path):
+    scene = _pointcloud_scene(tmp_path, ids=(0, 10, 20), requested=(10, 20))
+    prepared = scene.prepared_gt_path
+    assert prepared is not None
+    prepared.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        prepared,
+        point_maps=np.ones((3, 392, 518, 3), dtype=np.float32),
+        valid_mask=np.ones((3, 392, 518), dtype=bool),
+    )
+    sibling = prepared.parent / "source_frame_ids.npy"
+    np.save(sibling, np.array([0, 10, 20], dtype=np.int64))
+    stage_scene(scene, tmp_path / "campaign")
+    np.save(sibling, np.array([0, 11, 20], dtype=np.int64))
+
+    with pytest.raises(ValueError, match="staging manifest mismatch"):
+        stage_scene(scene, tmp_path / "campaign")
+
+
+def _raw_nrgbd_scene(tmp_path: Path) -> ResolvedScene:
+    root = tmp_path / "raw-data"
+    scene_dir = root / "NeuralRGBD/selected"
+    image = _png(scene_dir / "images/img0.png", 2)
+    _png(scene_dir / "depth/depth0.png", 1)
+    # Replace the RGB fixture with an actual 16-bit depth image.
+    from PIL import Image
+
+    Image.fromarray(np.full((480, 640), 1000, dtype=np.uint16)).save(
+        scene_dir / "depth/depth0.png"
+    )
+    np.savetxt(scene_dir / "poses.txt", np.eye(4))
+    return ResolvedScene(
+        scene_id="raw-nrgbd",
+        dataset=DatasetKind.NRGBD,
+        scene="selected",
+        slice_id="f000000-000001-s1",
+        approved_data_root=root.resolve(),
+        source_images=(image,),
+        selection=ResolvedFrameSelection(0, 1, 1, (0,)),
+        evaluation_kind=EvaluationKind.POINTCLOUD,
+        poses_path=None,
+        prepared_gt_path=None,
+        frame_index_map=None,
+        expected_gt_shape=(392, 518),
+    )
+
+
+@pytest.mark.parametrize("dependency", ["depth", "poses"])
+def test_raw_nrgbd_dependency_mutation_invalidates_existing_staging(tmp_path, dependency):
+    scene = _raw_nrgbd_scene(tmp_path)
+    stage_scene(scene, tmp_path / "campaign")
+    if dependency == "depth":
+        _png(scene.source_images[0].parent.parent / "depth/depth0.png", 9)
+        from PIL import Image
+
+        Image.fromarray(np.full((480, 640), 2000, dtype=np.uint16)).save(
+            scene.source_images[0].parent.parent / "depth/depth0.png"
+        )
+    else:
+        np.savetxt(scene.source_images[0].parent.parent / "poses.txt", np.eye(4) * 2)
+
+    with pytest.raises(ValueError, match="staging manifest mismatch"):
+        stage_scene(scene, tmp_path / "campaign")
+
+
+def test_raw_sevenscenes_projected_depth_mutation_invalidates_existing_staging(tmp_path):
+    root = tmp_path / "raw-data"
+    scene_dir = root / "7-Scenes/chess/seq-03"
+    image = _png(scene_dir / "frame-000000.color.png", 2)
+    from PIL import Image
+
+    Image.fromarray(np.full((480, 640), 1000, dtype=np.uint16)).save(
+        scene_dir / "frame-000000.depth.png"
+    )
+    Image.fromarray(np.full((480, 640), 1000, dtype=np.uint16)).save(
+        scene_dir / "frame-000000.depth.proj.png"
+    )
+    np.savetxt(scene_dir / "frame-000000.pose.txt", np.eye(4))
+    scene = ResolvedScene(
+        scene_id="raw-7scenes",
+        dataset=DatasetKind.SEVEN_SCENES,
+        scene="chess/seq-03",
+        slice_id="f000000-000001-s1",
+        approved_data_root=root.resolve(),
+        source_images=(image,),
+        selection=ResolvedFrameSelection(0, 1, 1, (0,)),
+        evaluation_kind=EvaluationKind.POINTCLOUD,
+        poses_path=None,
+        prepared_gt_path=None,
+        frame_index_map=None,
+        expected_gt_shape=(392, 518),
+    )
+    stage_scene(scene, tmp_path / "campaign")
+    Image.fromarray(np.full((480, 640), 2000, dtype=np.uint16)).save(
+        scene_dir / "frame-000000.depth.proj.png"
+    )
+
+    with pytest.raises(ValueError, match="staging manifest mismatch"):
+        stage_scene(scene, tmp_path / "campaign")
+
+
+def test_resolve_scene_rejects_short_approved_map_for_nonstandard_slice(tmp_path):
+    root = tmp_path / "NeuralRGBD/thin_geometry"
+    for frame_id in (0, 10, 20):
+        _png(root / "images" / f"img{frame_id}.png", frame_id)
+        _png(root / "depth" / f"depth{frame_id}.png", frame_id)
+    np.savetxt(root / "poses.txt", np.tile(np.eye(4), (21, 1)))
+    sequence_map = tmp_path / "short-map.json"
+    sequence_map.write_text(json.dumps({"thin_geometry": [0, 10, 20]}), encoding="utf-8")
+    config_path = Path(__file__).resolve().parents[2] / "configs/experiments/window_reference_campaign.yaml"
+    loaded = load_campaign_config(config_path, CampaignOverrides(preset="pointcloud-small", data_root=tmp_path))
+    scene_config = replace(loaded.config.scenes["nrgbd-thin-geometry"], frame_index_map=str(sequence_map))
+    config = replace(
+        loaded.config,
+        scenes={**loaded.config.scenes, "nrgbd-thin-geometry": scene_config},
+        selected_scenes=(PresetSceneConfig("nrgbd-thin-geometry", 0, 3, 1),),
+    )
+
+    with pytest.raises(ValueError, match="exactly 40 mapped frames"):
+        resolve_scene(config, config.selected_scenes[0])
+
+
+def test_resolve_scene_rejects_physical_kitti_24_column_pose_row(tmp_path):
+    image_dir = tmp_path / "KITTI/04/image_2"
+    _png(image_dir / "0.png")
+    _png(image_dir / "1.png")
+    poses = image_dir.parent / "poses.txt"
+    poses.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(poses, np.arange(24, dtype=float).reshape(1, 24))
+    loaded = load_campaign_config(
+        Path(__file__).resolve().parents[2] / "configs/experiments/window_reference_campaign.yaml",
+        CampaignOverrides(preset="kitti-smoke", data_root=tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="12 values per physical row"):
+        resolve_scene(loaded.config, loaded.config.selected_scenes[0])
+
+
+def test_staging_rejects_physical_kitti_24_column_pose_row(tmp_path):
+    root = tmp_path / "data"
+    images = tuple(_png(root / "04/image_2" / f"{index:06d}.png", index) for index in range(2))
+    np.savetxt(root / "04/poses.txt", np.arange(24, dtype=float).reshape(1, 24))
+    scene = ResolvedScene(
+        scene_id="kitti-bad-pose",
+        dataset=DatasetKind.KITTI,
+        scene="04",
+        slice_id="f000000-000002-s1",
+        approved_data_root=root.resolve(),
+        source_images=images,
+        selection=ResolvedFrameSelection(0, 2, 1, (0, 1)),
+        evaluation_kind=EvaluationKind.INTERNAL_TRAJECTORY,
+        poses_path=(root / "04/poses.txt").resolve(),
+        prepared_gt_path=None,
+        frame_index_map=None,
+        expected_gt_shape=None,
+    )
+
+    with pytest.raises(ValueError, match="12 values per physical row"):
+        stage_scene(scene, tmp_path / "campaign")
+
+
+def test_raw_dataset_output_requires_pointmap_leading_dimension_to_match_ids(tmp_path):
+    scene = _pointcloud_scene(tmp_path, ids=(0, 10, 20), requested=(10, 20))
+    data = {
+        "ind": np.array([10, 20], dtype=np.int64),
+        "image_paths": [str(path) for path in scene.source_images],
+        "pointclouds": np.zeros((1, 392, 518, 3), dtype=np.float32),
+        "valid_mask": np.ones((1, 392, 518), dtype=bool),
+    }
+
+    with pytest.raises(ValueError, match="leading dimension"):
+        _validate_raw_dataset_output(scene, data)
+
+
+def test_publish_race_never_clobbers_concurrent_invalid_final(tmp_path, monkeypatch):
+    scene = _kitti_scene(tmp_path)
+    root = (tmp_path / "campaign").resolve()
+    final = root / "prepared/kitti" / scene.slice_id
+    original_mkdir = staging_module.os.mkdir
+
+    def race_mkdir(path, mode=0o777, *args, **kwargs):
+        if Path(path) == final:
+            original_mkdir(path, mode, *args, **kwargs)
+            (final / "sentinel").write_text("winner", encoding="utf-8")
+            raise FileExistsError(path)
+        return original_mkdir(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(staging_module.os, "mkdir", race_mkdir)
+    with pytest.raises(ValueError, match="staging"):
+        stage_scene(scene, root)
+    assert (final / "sentinel").read_text(encoding="utf-8") == "winner"
+    assert not (final / "images").exists()
 
 
 def test_owned_path_helpers_reject_escape_and_only_remove_owned_descendants(tmp_path):
