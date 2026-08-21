@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -485,8 +488,9 @@ def _raw_sevenscenes_gt(
     ids = np.asarray(scene.selection.source_frame_ids, dtype=np.int64)
     workspace = workspace.resolve(strict=False)
     workspace.mkdir(parents=True, exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix=".sevenscenes-depth-", dir=str(workspace)))
+    scratch: Path | None = None
     try:
+        scratch = Path(tempfile.mkdtemp(prefix=".sevenscenes-depth-", dir=str(workspace)))
         scratch_scene = scratch / scene.scene
         for frame_id in ids.tolist():
             base = f"frame-{frame_id:06d}"
@@ -509,8 +513,12 @@ def _raw_sevenscenes_gt(
         data = data_set.get_data(sequence_name=scene.scene, ids=ids)
         return _validate_raw_dataset_output(scene, data)
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-        shutil.rmtree(workspace, ignore_errors=True)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+        try:
+            workspace.rmdir()
+        except OSError:
+            pass
 
 
 def _validate_raw_dataset_output(
@@ -771,36 +779,76 @@ def _write_staged_poses(scene: ResolvedScene, directory: Path) -> Path | None:
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
 
-def _publish_staging_no_clobber(temporary: Path, final: Path) -> bool:
-    """Reserve final atomically, then publish children without overwriting."""
+def _atomic_rename_noreplace(source: Path, destination: Path) -> bool:
+    """Atomically rename one complete directory without replacing a winner."""
 
+    source = Path(source)
+    destination = Path(destination)
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError(f"staging publish source is not a directory: {source}")
+
+    if sys.platform == "darwin":
+        function_name = "renameatx_np"
+        flags = 0x00000004  # RENAME_EXCL
+        at_fdcwd = -2
+    elif sys.platform.startswith("linux"):
+        function_name = "renameat2"
+        flags = 0x00000001  # RENAME_NOREPLACE
+        at_fdcwd = -100
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            f"atomic no-replace directory rename is unsupported on {sys.platform}",
+        )
+
+    library = ctypes.CDLL(None, use_errno=True)
     try:
-        os.mkdir(final)
-    except FileExistsError:
-        return False
-
-    if any(final.iterdir()):
-        raise ValueError(f"staging publish winner is not empty: {final}")
-    entries = sorted(
-        temporary.iterdir(),
-        key=lambda item: (item.name == "staging.json", item.name),
+        rename = getattr(library, function_name)
+    except AttributeError as exc:
+        raise OSError(
+            errno.ENOTSUP,
+            f"atomic no-replace directory rename is unavailable on {sys.platform}",
+        ) from exc
+    rename.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename.restype = ctypes.c_int
+    result = rename(
+        at_fdcwd,
+        os.fsencode(source),
+        at_fdcwd,
+        os.fsencode(destination),
+        flags,
     )
-    for entry in entries:
-        destination = final / entry.name
-        if destination.exists() or destination.is_symlink():
-            raise ValueError(f"staging publish winner changed during publish: {destination}")
-        os.replace(entry, destination)
-    os.rmdir(temporary)
+    if result == 0:
+        return True
+
+    error = ctypes.get_errno() or errno.EIO
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        return False
+    raise OSError(
+        error,
+        f"atomic no-replace directory rename failed: {source} -> {destination}",
+    )
+
+
+def _publish_staging_no_clobber(temporary: Path, final: Path) -> bool:
+    """Publish one complete temporary directory without replacing a winner."""
+
+    _fsync_directory(temporary)
+    if not _atomic_rename_noreplace(temporary, final):
+        return False
     _fsync_directory(final)
     _fsync_directory(final.parent)
     return True
@@ -856,6 +904,8 @@ def stage_scene(scene: ResolvedScene, campaign_root: str | Path) -> StagedScene:
             # Another process won the atomic publication race.  Never replace
             # or clean an unknown directory; validate the winner instead.
             guarded_remove(temporary, root)
+            if final.is_symlink() or not final.is_dir():
+                raise ValueError(f"staging path is not an owned directory: {final}")
             return load_valid_staging(final, payload)
         temporary = Path()
         return load_valid_staging(final, payload)

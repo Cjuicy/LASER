@@ -24,6 +24,7 @@ from experiments.window_reference_campaign.scenes import (
 )
 from experiments.window_reference_campaign.staging import (
     _validate_raw_dataset_output,
+    _raw_sevenscenes_gt,
     guarded_remove,
     prepare_pointcloud_gt,
     require_descendant,
@@ -392,7 +393,7 @@ def test_raw_nrgbd_dependency_mutation_invalidates_existing_staging(tmp_path, de
         stage_scene(scene, tmp_path / "campaign")
 
 
-def test_raw_sevenscenes_projected_depth_mutation_invalidates_existing_staging(tmp_path):
+def _raw_sevenscenes_scene(tmp_path: Path) -> tuple[ResolvedScene, Path]:
     root = tmp_path / "raw-data"
     scene_dir = root / "7-Scenes/chess/seq-03"
     image = _png(scene_dir / "frame-000000.color.png", 2)
@@ -405,7 +406,7 @@ def test_raw_sevenscenes_projected_depth_mutation_invalidates_existing_staging(t
         scene_dir / "frame-000000.depth.proj.png"
     )
     np.savetxt(scene_dir / "frame-000000.pose.txt", np.eye(4))
-    scene = ResolvedScene(
+    return ResolvedScene(
         scene_id="raw-7scenes",
         dataset=DatasetKind.SEVEN_SCENES,
         scene="chess/seq-03",
@@ -418,7 +419,11 @@ def test_raw_sevenscenes_projected_depth_mutation_invalidates_existing_staging(t
         prepared_gt_path=None,
         frame_index_map=None,
         expected_gt_shape=(392, 518),
-    )
+    ), scene_dir
+
+
+def test_raw_sevenscenes_projected_depth_mutation_invalidates_existing_staging(tmp_path):
+    scene, scene_dir = _raw_sevenscenes_scene(tmp_path)
     stage_scene(scene, tmp_path / "campaign")
     Image.fromarray(np.full((480, 640), 2000, dtype=np.uint16)).save(
         scene_dir / "frame-000000.depth.proj.png"
@@ -501,24 +506,119 @@ def test_raw_dataset_output_requires_pointmap_leading_dimension_to_match_ids(tmp
         _validate_raw_dataset_output(scene, data)
 
 
+def test_publish_never_exposes_partial_final_directory(tmp_path, monkeypatch):
+    scene = _kitti_scene(tmp_path)
+    root = (tmp_path / "campaign").resolve()
+    final = root / "prepared/kitti" / scene.slice_id
+    snapshots: list[tuple[str, ...]] = []
+    original_replace = staging_module.os.replace
+
+    def observe_replace(source, destination):
+        result = original_replace(source, destination)
+        if Path(destination).parent == final:
+            snapshots.append(tuple(sorted(entry.name for entry in final.iterdir())))
+        return result
+
+    monkeypatch.setattr(staging_module.os, "replace", observe_replace)
+    staged = stage_scene(scene, root)
+
+    assert staged.manifest_path.parent == final
+    assert snapshots == []
+    assert {entry.name for entry in final.iterdir()} == {
+        "images",
+        "source_frame_ids.npy",
+        "poses.txt",
+        "staging.json",
+    }
+
+
+def test_publish_failure_does_not_leave_partial_final_or_temporary_directory(
+    tmp_path, monkeypatch
+):
+    scene = _kitti_scene(tmp_path)
+    root = (tmp_path / "campaign").resolve()
+    final = root / "prepared/kitti" / scene.slice_id
+
+    def fail_publish(_temporary, _destination):
+        raise OSError("injected atomic publish failure")
+
+    monkeypatch.setattr(
+        staging_module,
+        "_atomic_rename_noreplace",
+        fail_publish,
+        raising=False,
+    )
+    with pytest.raises(OSError, match="injected atomic publish failure"):
+        stage_scene(scene, root)
+
+    assert not final.exists()
+    assert not list(final.parent.glob(f"{scene.slice_id}.tmp-*"))
+
+
 def test_publish_race_never_clobbers_concurrent_invalid_final(tmp_path, monkeypatch):
     scene = _kitti_scene(tmp_path)
     root = (tmp_path / "campaign").resolve()
     final = root / "prepared/kitti" / scene.slice_id
-    original_mkdir = staging_module.os.mkdir
 
-    def race_mkdir(path, mode=0o777, *args, **kwargs):
-        if Path(path) == final:
-            original_mkdir(path, mode, *args, **kwargs)
-            (final / "sentinel").write_text("winner", encoding="utf-8")
-            raise FileExistsError(path)
-        return original_mkdir(path, mode, *args, **kwargs)
+    def race_publish(_temporary, destination):
+        destination.mkdir(parents=True)
+        (destination / "sentinel").write_text("winner", encoding="utf-8")
+        return False
 
-    monkeypatch.setattr(staging_module.os, "mkdir", race_mkdir)
+    monkeypatch.setattr(
+        staging_module,
+        "_atomic_rename_noreplace",
+        race_publish,
+        raising=False,
+    )
     with pytest.raises(ValueError, match="staging"):
         stage_scene(scene, root)
     assert (final / "sentinel").read_text(encoding="utf-8") == "winner"
     assert not (final / "images").exists()
+
+
+def test_publish_race_with_preexisting_empty_final_keeps_winner_empty(tmp_path, monkeypatch):
+    scene = _kitti_scene(tmp_path)
+    root = (tmp_path / "campaign").resolve()
+    final = root / "prepared/kitti" / scene.slice_id
+
+    def empty_winner(_temporary, destination):
+        destination.mkdir(parents=True)
+        return False
+
+    monkeypatch.setattr(
+        staging_module,
+        "_atomic_rename_noreplace",
+        empty_winner,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="staging"):
+        stage_scene(scene, root)
+
+    assert final.is_dir()
+    assert tuple(final.iterdir()) == ()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_raw_sevenscenes_cleanup_preserves_caller_workspace_sentinel(tmp_path, failure):
+    scene, scene_dir = _raw_sevenscenes_scene(tmp_path)
+    workspace = tmp_path / "caller-workspace"
+    workspace.mkdir()
+    sentinel = workspace / "preexisting-sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    if failure:
+        (scene_dir / "frame-000000.depth.png").unlink()
+        (scene_dir / "frame-000000.depth.proj.png").unlink()
+
+    if failure:
+        with pytest.raises(FileNotFoundError):
+            _raw_sevenscenes_gt(scene, workspace)
+    else:
+        _raw_sevenscenes_gt(scene, workspace)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert workspace.is_dir()
+    assert not list(workspace.glob(".sevenscenes-depth-*"))
 
 
 def test_owned_path_helpers_reject_escape_and_only_remove_owned_descendants(tmp_path):
