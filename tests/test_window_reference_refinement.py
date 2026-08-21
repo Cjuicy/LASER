@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 import torch
 
+import inference_engine.segmentation.window_reference as window_reference
+
 from inference_engine.segmentation import (
     SegmentationResult,
     build_window_reference_refiner,
@@ -20,6 +22,7 @@ from inference_engine.segmentation.window_reference import (
     _merge_vote_edges,
     _project_pair,
     _select_references,
+    _tensor_numpy,
 )
 from pipeline.config import load_pipeline_config
 
@@ -462,7 +465,7 @@ def test_enabled_refiner_compacts_bool_nonkeyframe_fallback_labels():
     )
 
 
-def test_enabled_refiner_reports_conflict_only_when_all_eligible_unions_conflict(
+def test_enabled_refiner_accepts_direct_weighted_edge_with_weak_dissent(
     monkeypatch,
 ):
     height, width = 5, 2
@@ -542,16 +545,287 @@ def test_enabled_refiner_reports_conflict_only_when_all_eligible_unions_conflict
         overrides=(
             "segmentation.window_reference.sampling_stride=1",
             "segmentation.window_reference.min_region_correspondences=1",
+            "segmentation.window_reference.min_reference_score=0.1",
         ),
     )
 
-    np.testing.assert_array_equal(refined[2].labels, results[2].labels)
+    np.testing.assert_array_equal(refined[2].labels, np.zeros_like(target_labels))
     assert refined[2].labels.dtype == np.intp
-    assert refined[2].diagnostics["window_reference_fallback"] == "conflict_only"
-    assert refined[2].diagnostics["window_reference_accepted_edges"] == 0
-    assert refined[2].diagnostics["window_reference_conflict_edges"] == 1
+    assert refined[2].diagnostics["window_reference_fallback"] == "none"
+    assert refined[2].diagnostics["window_reference_accepted_edges"] == 1
+    assert refined[2].diagnostics["window_reference_conflict_edges"] == 0
     assert refined[2].diagnostics["window_reference_candidate_edges"] == 1
-    assert refined[2].diagnostics["window_reference_regions_after"] == 2
+    assert refined[2].diagnostics["window_reference_regions_after"] == 1
+
+
+def test_enabled_refiner_accepts_weighted_direct_merge_with_weak_separate_vote(
+    monkeypatch,
+):
+    """A passing weighted edge is not vetoed by its own weak dissent."""
+
+    height, width = 5, 2
+    intrinsic = torch.eye(3)
+    rows, columns = np.indices((height, width))
+    points = np.stack(
+        [columns.astype(np.float64), rows.astype(np.float64), np.ones((height, width))],
+        axis=-1,
+    )
+    point_maps = torch.from_numpy(np.stack([points, points, points]))
+    camera_poses = torch.eye(4).repeat(3, 1, 1)
+    confidence = torch.zeros((3, height, width))
+    target_labels = np.repeat(np.arange(2, dtype=np.int32)[None, :], height, axis=0)
+    source_zero = np.zeros((height, width), dtype=np.intp)
+    source_one = np.zeros((height, width), dtype=np.intp)
+    source_one.flat[1] = 1
+    results = [
+        SegmentationResult(source_zero, {"method": "fixture", "region_count": 1}),
+        SegmentationResult(source_one, {"method": "fixture", "region_count": 2}),
+        SegmentationResult(target_labels, {"method": "fixture", "region_count": 2}),
+    ]
+    target_by_region = {
+        region: np.flatnonzero(target_labels.reshape(-1) == region)
+        for region in range(2)
+    }
+
+    def projection(assignments, *, score):
+        source_indices = []
+        target_indices = []
+        for target_region, source_index, full in assignments:
+            target_region_indices = target_by_region[target_region]
+            if not full:
+                target_region_indices = target_region_indices[:1]
+            target_indices.append(target_region_indices)
+            source_indices.append(
+                np.full(target_region_indices.shape, source_index, dtype=np.int64)
+            )
+        source_indices = np.concatenate(source_indices)
+        target_indices = np.concatenate(target_indices)
+        return _PairProjection(
+            source_indices,
+            target_indices,
+            np.ones(target_indices.shape, dtype=np.float64),
+            score=score,
+            projected_samples=int(target_indices.size),
+        )
+
+    selected = _ReferenceSelection(
+        indices=(0, 1),
+        best_scores=np.array([0.0, 0.0, 1.0]),
+        pair_projections=(
+            (
+                0,
+                2,
+                projection(((0, 0, True), (1, 0, True)), score=1.0),
+            ),
+            (
+                1,
+                2,
+                projection(((0, 0, True), (1, 1, True)), score=0.2),
+            ),
+        ),
+        coverage_ratio=1.0,
+    )
+    monkeypatch.setattr(
+        "inference_engine.segmentation.window_reference._select_references",
+        lambda **kwargs: selected,
+    )
+
+    refined = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=intrinsic,
+        overrides=(
+            "segmentation.window_reference.sampling_stride=1",
+            "segmentation.window_reference.min_region_correspondences=1",
+        ),
+    )
+
+    np.testing.assert_array_equal(refined[2].labels, np.zeros_like(target_labels))
+    assert refined[2].diagnostics["window_reference_accepted_edges"] == 1
+    assert refined[2].diagnostics["window_reference_conflict_edges"] == 0
+
+
+def test_enabled_refiner_blocks_transitive_conflict_after_weighted_direct_merge(
+    monkeypatch,
+):
+    """A later union cannot extend a component with an earlier mixed signature."""
+
+    height, width = 3, 3
+    intrinsic = torch.eye(3)
+    rows, columns = np.indices((height, width))
+    points = np.stack(
+        [columns.astype(np.float64), rows.astype(np.float64), np.ones((height, width))],
+        axis=-1,
+    )
+    point_maps = torch.from_numpy(np.stack([points] * 4))
+    camera_poses = torch.eye(4).repeat(4, 1, 1)
+    confidence = torch.zeros((4, height, width))
+    target_labels = np.repeat(np.arange(3, dtype=np.int32)[None, :], height, axis=0)
+    source_labels = [
+        np.repeat(np.array([[0, 1, 1]], dtype=np.intp), height, axis=0),
+        np.repeat(np.array([[0, 0, 0]], dtype=np.intp), height, axis=0),
+        np.repeat(np.array([[0, 0, 1]], dtype=np.intp), height, axis=0),
+    ]
+    results = [
+        SegmentationResult(labels, {"method": "fixture", "region_count": 3})
+        for labels in (*source_labels, target_labels)
+    ]
+    target_indices = np.arange(target_labels.size, dtype=np.int64)
+    source0_projection = _PairProjection(
+        target_indices,
+        target_indices,
+        np.ones(target_indices.shape, dtype=np.float64),
+        score=0.1,
+        projected_samples=int(target_indices.size),
+    )
+    source1_projection = _PairProjection(
+        target_indices,
+        target_indices,
+        np.ones(target_indices.shape, dtype=np.float64),
+        score=1.0,
+        projected_samples=int(target_indices.size),
+    )
+    source2_target = np.concatenate(
+        [target_indices, np.array([2, 2, 2], dtype=np.int64)]
+    )
+    source2_source = np.concatenate(
+        [target_indices, np.array([8, 8, 0], dtype=np.int64)]
+    )
+    source2_projection = _PairProjection(
+        source2_source,
+        source2_target,
+        np.ones(source2_target.shape, dtype=np.float64),
+        score=0.3,
+        projected_samples=int(source2_target.size),
+    )
+    projections = (
+        (0, 3, source0_projection),
+        (1, 3, source1_projection),
+        (2, 3, source2_projection),
+    )
+    selected = _ReferenceSelection(
+        indices=(0, 1, 2),
+        best_scores=np.array([0.0, 0.0, 0.0, 1.0]),
+        pair_projections=projections,
+        coverage_ratio=1.0,
+    )
+    monkeypatch.setattr(
+        "inference_engine.segmentation.window_reference._select_references",
+        lambda **kwargs: selected,
+    )
+
+    refined = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=intrinsic,
+        overrides=(
+            "segmentation.window_reference.sampling_stride=1",
+            "segmentation.window_reference.min_region_correspondences=1",
+            "segmentation.window_reference.min_reference_score=0.05",
+        ),
+    )
+
+    np.testing.assert_array_equal(
+        refined[3].labels,
+        np.repeat(np.array([[0, 0, 1]], dtype=np.intp), height, axis=0),
+    )
+    assert refined[3].diagnostics["window_reference_accepted_edges"] == 1
+    assert refined[3].diagnostics["window_reference_conflict_edges"] == 1
+
+
+def test_tensor_numpy_honors_requested_dtype_and_converts_bfloat16_to_float32():
+    points = _tensor_numpy(torch.ones((1, 2, 3), dtype=torch.float64), dtype=np.float32)
+    poses = _tensor_numpy(torch.eye(4, dtype=torch.float32), dtype=np.float64)
+    assert points.dtype == np.dtype(np.float32)
+    assert poses.dtype == np.dtype(np.float64)
+    if hasattr(torch, "bfloat16"):
+        bfloat_points = _tensor_numpy(
+            torch.ones((1, 2, 3), dtype=torch.bfloat16),
+            dtype=np.float32,
+        )
+        assert bfloat_points.dtype == np.dtype(np.float32)
+
+
+def test_selection_discards_pair_correspondence_arrays_after_scoring():
+    pair = _PairProjection(
+        np.array([0], dtype=np.int64),
+        np.array([0], dtype=np.int64),
+        np.array([1.0], dtype=np.float64),
+        score=1.0,
+        projected_samples=1,
+    )
+    config = _segmentation_config().window_reference
+    selection = _select_references(
+        qualities=np.array([0.9, 0.8]),
+        frame_count=2,
+        evaluate=lambda source, target: pair,
+        config=config,
+    )
+
+    assert selection.pair_projections
+    for _, _, summary in selection.pair_projections:
+        assert not isinstance(summary, _PairProjection)
+        assert not hasattr(summary, "source_flat_indices")
+        assert not hasattr(summary, "target_flat_indices")
+        assert not hasattr(summary, "correspondence_weights")
+
+
+def test_dominant_mapping_groups_evidence_once(monkeypatch):
+    grouped = getattr(window_reference, "_aggregate_region_evidence", None)
+    assert grouped is not None
+    calls = []
+
+    def wrapped(*args, **kwargs):
+        calls.append(1)
+        return grouped(*args, **kwargs)
+
+    monkeypatch.setattr(window_reference, "_aggregate_region_evidence", wrapped)
+    labels = np.repeat(np.arange(64, dtype=np.intp)[:, None], 2, axis=1)
+    evidence = [
+        (int(pixel), int(label), 1.0)
+        for pixel, label in enumerate(labels.flat)
+    ]
+    mapping = _dominant_region_mappings(
+        labels,
+        evidence,
+        sampling_stride=1,
+        min_region_correspondences=1,
+        min_region_coverage=0.1,
+        min_region_purity=0.8,
+    )
+
+    assert len(mapping) == labels.max() + 1
+    assert calls == [1]
+
+
+def test_low_score_selected_pair_keeps_projection_diagnostics_without_merge():
+    results, point_maps, camera_poses, confidence, intrinsic = _two_region_identity_fixture()
+    point_maps = point_maps.clone()
+    point_maps[1, 1, 1, 2] = 2.0
+    original_labels = results[1].labels.copy()
+
+    refined = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=intrinsic,
+        overrides=(
+            "segmentation.window_reference.sampling_stride=1",
+            "segmentation.window_reference.min_reference_score=0.95",
+        ),
+    )
+
+    np.testing.assert_array_equal(refined[1].labels, original_labels)
+    assert refined[1].diagnostics["window_reference_fallback"] == (
+        "insufficient_support"
+    )
+    assert refined[1].diagnostics["window_reference_projected_samples"] > 0
+    assert refined[1].diagnostics["window_reference_depth_rejected_samples"] > 0
 
 
 def test_intrinsic_compatibility_uses_full_matrix_including_skew():

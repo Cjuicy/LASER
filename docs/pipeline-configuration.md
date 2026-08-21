@@ -68,7 +68,7 @@ The complete configuration is:
 | `segmentation.window_reference.sampling_stride` | `4` | positive integer (`>= 1`) | Pixel stride for sparse projection and visibility checks; larger values reduce CPU work. |
 | `segmentation.window_reference.max_keyframes` | `4` | positive integer (`>= 1`) | Maximum number of adaptively selected reference frames; smaller values reduce CPU work. |
 | `segmentation.window_reference.relative_depth_tolerance` | `0.05` | finite float in `(0, inf)` | Relative depth agreement required for a projected sample. |
-| `segmentation.window_reference.min_reference_score` | `0.30` | finite float in `(0, 1]` | Minimum frame quality score for reference selection. |
+| `segmentation.window_reference.min_reference_score` | `0.30` | finite float in `(0, 1]` | Minimum directed pair score `S(k→t)` for a reference-to-target projection to count as reliable evidence; it is not a frame-quality threshold. |
 | `segmentation.window_reference.stop_coverage_ratio` | `0.90` | finite float in `(0, 1]` | Stop selecting references once this coverage is reached. |
 | `segmentation.window_reference.min_coverage_gain` | `0.03` | finite float in `[0, 1]` | Minimum additional coverage contributed by a reference. |
 | `segmentation.window_reference.min_region_correspondences` | `8` | positive integer (`>= 1`) | Minimum sparse correspondences supporting a region mapping. |
@@ -77,8 +77,13 @@ The complete configuration is:
 | `segmentation.window_reference.merge_vote_threshold` | `0.80` | finite float in `(0, 1]` | Vote threshold for accepting an adjacent-region merge. |
 
 The refiner runs on the CPU process device and is deliberately bounded by
-`sampling_stride` and `max_keyframes`; use a larger stride or fewer keyframes
-when CPU budget matters. It is a merge-only stage: labels are compacted after
+`sampling_stride` and the final selected-reference ceiling
+`min(max_keyframes, window frame count)`; `max_keyframes` limits the number of
+references retained for the final refinement, not the number of candidates
+considered. If candidates are repeatedly rejected for insufficient coverage
+gain, the selection projection work can approach the worst-case `N²` directed
+pair evaluations (without allocating an all-pairs tensor). Use a larger stride
+or fewer keyframes when CPU budget matters. It is a merge-only stage: labels are compacted after
 accepted merges, and no region is ever split. A single-frame window, missing or
 invalid intrinsics, invalid/non-finite geometry, incompatible geometry, no
 usable reference, or insufficient/conflicting support falls back to the

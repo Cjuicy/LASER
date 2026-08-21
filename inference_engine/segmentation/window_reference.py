@@ -103,7 +103,20 @@ def _fallback_results(
 def _tensor_numpy(value: object, *, dtype: np.dtype) -> np.ndarray:
     try:
         if isinstance(value, torch.Tensor):
-            return value.detach().to(device="cpu", dtype=torch.float64).numpy().copy()
+            requested = np.dtype(dtype)
+            torch_dtype = {
+                np.dtype(np.float16): torch.float16,
+                np.dtype(np.float32): torch.float32,
+                np.dtype(np.float64): torch.float64,
+            }.get(requested)
+            if torch_dtype is None:
+                raise TypeError(f"unsupported tensor dtype: {requested}")
+            return (
+                value.detach()
+                .to(device="cpu", dtype=torch_dtype)
+                .numpy()
+                .copy()
+            )
         return np.asarray(value, dtype=dtype).copy()
     except (TypeError, ValueError, RuntimeError) as exc:
         raise ValueError("window reference tensors must be numeric") from exc
@@ -243,12 +256,79 @@ class _PairProjection:
 
 
 @dataclass(frozen=True)
+class _PairSummary:
+    """Scalar pair evidence retained after adaptive selection scoring."""
+
+    score: float = 0.0
+    coverage: float = 0.0
+    geometry_ratio: float = 0.0
+    mean_confidence: float = 0.0
+    projected_samples: int = 0
+    occluded_samples: int = 0
+    depth_rejected_samples: int = 0
+    target_invalid_samples: int = 0
+    out_of_bounds_samples: int = 0
+    nonpositive_depth_samples: int = 0
+    invalid_source_samples: int = 0
+
+
+def _pair_summary(projection: object) -> _PairSummary:
+    return _PairSummary(
+        score=_projection_score(projection),
+        coverage=float(getattr(projection, "coverage", 0.0)),
+        geometry_ratio=float(getattr(projection, "geometry_ratio", 0.0)),
+        mean_confidence=float(getattr(projection, "mean_confidence", 0.0)),
+        projected_samples=int(getattr(projection, "projected_samples", 0)),
+        occluded_samples=int(getattr(projection, "occluded_samples", 0)),
+        depth_rejected_samples=int(
+            getattr(projection, "depth_rejected_samples", 0)
+        ),
+        target_invalid_samples=int(getattr(projection, "target_invalid_samples", 0)),
+        out_of_bounds_samples=int(getattr(projection, "out_of_bounds_samples", 0)),
+        nonpositive_depth_samples=int(
+            getattr(projection, "nonpositive_depth_samples", 0)
+        ),
+        invalid_source_samples=int(getattr(projection, "invalid_source_samples", 0)),
+    )
+
+
+@dataclass(frozen=True)
 class _RegionMapping:
     source_label: int
     unique_hits: int
     coverage: float
     purity: float
     support: float
+
+
+def _aggregate_region_evidence(
+    labels: np.ndarray,
+    evidence: Iterable[tuple[int, int, float]],
+) -> tuple[dict[int, dict[int, float]], dict[int, set[int]]]:
+    """Group sparse evidence once by target region and source label."""
+
+    pair_weights_by_region: dict[int, dict[int, float]] = {}
+    target_hits: dict[int, set[int]] = {}
+    flat_size = int(labels.size)
+    for item in evidence:
+        try:
+            target_pixel, source_label, weight = item
+            target_pixel = int(target_pixel)
+            source_label = int(source_label)
+            weight = float(weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "region evidence must contain pixel, label, weight"
+            ) from exc
+        if target_pixel < 0 or target_pixel >= flat_size:
+            continue
+        if not np.isfinite(weight) or weight < 0.0:
+            continue
+        target_region = int(labels.flat[target_pixel])
+        target_hits.setdefault(target_region, set()).add(target_pixel)
+        source_weights = pair_weights_by_region.setdefault(target_region, {})
+        source_weights[source_label] = source_weights.get(source_label, 0.0) + weight
+    return pair_weights_by_region, target_hits
 
 
 def _dominant_region_mappings(
@@ -272,38 +352,17 @@ def _dominant_region_mappings(
         int(label): int(count)
         for label, count in zip(*np.unique(labels, return_counts=True), strict=True)
     }
-    pair_weights: dict[tuple[int, int], float] = {}
-    target_hits: dict[int, set[int]] = {}
-    flat_size = int(labels.size)
-    for item in evidence:
-        try:
-            target_pixel, source_label, weight = item
-            target_pixel = int(target_pixel)
-            source_label = int(source_label)
-            weight = float(weight)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "region evidence must contain pixel, label, weight"
-            ) from exc
-        if target_pixel < 0 or target_pixel >= flat_size:
-            continue
-        if not np.isfinite(weight) or weight < 0.0:
-            continue
-        target_region = int(labels.flat[target_pixel])
-        target_hits.setdefault(target_region, set()).add(target_pixel)
-        key = (target_region, source_label)
-        pair_weights[key] = pair_weights.get(key, 0.0) + weight
+    pair_weights_by_region, target_hits = _aggregate_region_evidence(
+        labels,
+        evidence,
+    )
 
     mappings: dict[int, _RegionMapping] = {}
     for target_region, area in region_area.items():
         hits = len(target_hits.get(target_region, ()))
         if hits < min_region_correspondences:
             continue
-        source_weights = {
-            source_label: weight
-            for (mapped_region, source_label), weight in pair_weights.items()
-            if mapped_region == target_region
-        }
+        source_weights = pair_weights_by_region.get(target_region, {})
         total_weight = float(sum(source_weights.values()))
         if total_weight <= 0.0 or not np.isfinite(total_weight):
             continue
@@ -336,6 +395,7 @@ class _MergeEdge:
     merge_evidence: float
     separate_evidence: float
     ratio: float
+    separate_references: tuple[int, ...] = ()
 
 
 def _adjacent_region_edges(labels: np.ndarray) -> tuple[tuple[int, int], ...]:
@@ -360,7 +420,10 @@ def _adjacent_region_edges(labels: np.ndarray) -> tuple[tuple[int, int], ...]:
 
 def _merge_vote_edges(
     target_labels: np.ndarray,
-    reference_mappings: Iterable[tuple[float, Mapping[int, _RegionMapping]]],
+    reference_mappings: Iterable[
+        tuple[float, Mapping[int, _RegionMapping]]
+        | tuple[int, float, Mapping[int, _RegionMapping]]
+    ],
     *,
     merge_vote_threshold: float,
 ) -> tuple[_MergeEdge, ...]:
@@ -368,14 +431,22 @@ def _merge_vote_edges(
 
     merge_totals: dict[tuple[int, int], float] = {}
     separate_totals: dict[tuple[int, int], float] = {}
-    for pair_score, mappings in reference_mappings:
+    separate_references: dict[tuple[int, int], set[int]] = {}
+    adjacent_edges = _adjacent_region_edges(target_labels)
+    for fallback_index, item in enumerate(reference_mappings):
+        if len(item) == 3:
+            reference_index, pair_score, mappings = item
+        else:
+            reference_index = fallback_index
+            pair_score, mappings = item
+        reference_index = int(reference_index)
         try:
             score = float(pair_score)
         except (TypeError, ValueError):
             continue
         if not np.isfinite(score) or score <= 0.0:
             continue
-        for label_pair in _adjacent_region_edges(target_labels):
+        for label_pair in adjacent_edges:
             mapping_a = mappings.get(label_pair[0])
             mapping_b = mappings.get(label_pair[1])
             if mapping_a is None or mapping_b is None:
@@ -389,9 +460,11 @@ def _merge_vote_edges(
                 else separate_totals
             )
             totals[label_pair] = totals.get(label_pair, 0.0) + evidence
+            if mapping_a.source_label != mapping_b.source_label:
+                separate_references.setdefault(label_pair, set()).add(reference_index)
 
     eligible: list[_MergeEdge] = []
-    for label_pair in _adjacent_region_edges(target_labels):
+    for label_pair in adjacent_edges:
         merge_evidence = float(merge_totals.get(label_pair, 0.0))
         separate_evidence = float(separate_totals.get(label_pair, 0.0))
         if merge_evidence <= 0.0:
@@ -406,6 +479,9 @@ def _merge_vote_edges(
                 merge_evidence=merge_evidence,
                 separate_evidence=separate_evidence,
                 ratio=ratio,
+                separate_references=tuple(
+                    sorted(separate_references.get(label_pair, ()))
+                ),
             )
         )
     eligible.sort(
@@ -429,9 +505,17 @@ def _merge_region_components(
     if region_count < 0:
         raise ValueError("region_count must be non-negative")
     parent = list(range(region_count))
-    component_signatures = {
-        region: dict(signatures.get(region, {})) for region in range(region_count)
-    }
+    component_signatures: dict[int, dict[int, set[int]]] = {}
+    for region in range(region_count):
+        normalized: dict[int, set[int]] = {}
+        for reference, source_label in signatures.get(region, {}).items():
+            if isinstance(source_label, (set, frozenset, tuple, list)):
+                labels = {int(label) for label in source_label}
+            else:
+                labels = {int(source_label)}
+            if labels:
+                normalized[int(reference)] = labels
+        component_signatures[region] = normalized
 
     def find(region: int) -> int:
         root = region
@@ -464,18 +548,28 @@ def _merge_region_components(
             continue
         left_signature = component_signatures[left_root]
         right_signature = component_signatures[right_root]
-        if any(
-            reference in right_signature
-            and right_signature[reference] != source_label
-            for reference, source_label in left_signature.items()
-        ):
+        incompatible = False
+        for reference in left_signature.keys() & right_signature.keys():
+            left_labels = left_signature[reference]
+            right_labels = right_signature[reference]
+            if len(left_labels) > 1 or len(right_labels) > 1:
+                incompatible = True
+                break
+            if left_labels != right_labels and reference not in edge.separate_references:
+                incompatible = True
+                break
+        if incompatible:
             conflict_edges += 1
             continue
         root = min(left_root, right_root)
         child = max(left_root, right_root)
         parent[child] = root
-        merged_signature = dict(left_signature)
-        merged_signature.update(right_signature)
+        merged_signature = {
+            reference: set(labels)
+            for reference, labels in left_signature.items()
+        }
+        for reference, labels in right_signature.items():
+            merged_signature.setdefault(reference, set()).update(labels)
         component_signatures[root] = merged_signature
         component_signatures[child] = {}
         accepted_edges += 1
@@ -606,7 +700,7 @@ def _select_references(
     )
     selected_order = [first]
     rejected_indices: list[int] = []
-    reliable_projections: list[tuple[int, int, object]] = []
+    reliable_summaries: list[tuple[int, int, _PairSummary]] = []
     evaluated_pairs = 0
     max_keyframes = min(int(config.max_keyframes), frame_count)
 
@@ -620,7 +714,8 @@ def _select_references(
             score = _projection_score(projection)
             best_scores[target] = max(best_scores[target], score)
             if score >= config.min_reference_score:
-                reliable_projections.append((source, target, projection))
+                reliable_summaries.append((source, target, _pair_summary(projection)))
+            del projection
 
     def current_coverage() -> float:
         covered = best_scores >= config.min_reference_score
@@ -654,7 +749,7 @@ def _select_references(
         )
 
         candidate_scores = np.zeros(frame_count, dtype=np.float64)
-        candidate_projections: list[tuple[int, int, object]] = []
+        candidate_summaries: list[tuple[int, int, _PairSummary]] = []
         for target in range(frame_count):
             if target == candidate:
                 continue
@@ -662,7 +757,11 @@ def _select_references(
             evaluated_pairs += 1
             score = _projection_score(projection)
             candidate_scores[target] = score
-            candidate_projections.append((candidate, target, projection))
+            if score >= config.min_reference_score:
+                candidate_summaries.append(
+                    (candidate, target, _pair_summary(projection))
+                )
+            del projection
 
         selected_set = set(selected_order)
         eligible_targets = [
@@ -688,17 +787,17 @@ def _select_references(
             continue
 
         selected_order.append(candidate)
-        for source, target, projection in candidate_projections:
+        for source, target, summary in candidate_summaries:
             score = candidate_scores[target]
             best_scores[target] = max(best_scores[target], score)
             if score >= config.min_reference_score:
-                reliable_projections.append((source, target, projection))
+                reliable_summaries.append((source, target, summary))
         coverage_ratio = current_coverage()
 
     indices = tuple(sorted(selected_order))
     diagnostics = {
         "evaluated_pairs": evaluated_pairs,
-        "reliable_pairs": len(reliable_projections),
+        "reliable_pairs": len(reliable_summaries),
         "selected_count": len(indices),
         "rejected_count": len(rejected_indices),
         "coverage_ratio": coverage_ratio,
@@ -706,7 +805,7 @@ def _select_references(
     return _ReferenceSelection(
         indices=indices,
         best_scores=best_scores,
-        pair_projections=tuple(reliable_projections),
+        pair_projections=tuple(reliable_summaries),
         rejected_indices=tuple(rejected_indices),
         coverage_ratio=coverage_ratio,
         diagnostics=diagnostics,
@@ -1074,9 +1173,9 @@ class WindowReferenceRefiner:
         if intrinsic is None:
             return _fallback_results(results, "invalid_intrinsic")
 
-        points = _tensor_numpy(point_maps, dtype=np.float64)
+        points = _tensor_numpy(point_maps, dtype=np.float32)
         poses = _tensor_numpy(camera_poses, dtype=np.float64)
-        logits = _tensor_numpy(confidence, dtype=np.float64)
+        logits = _tensor_numpy(confidence, dtype=np.float32)
         valid_points = np.all(np.isfinite(points), axis=-1) & (
             points[..., 2] > 1e-6
         )
@@ -1147,7 +1246,10 @@ class WindowReferenceRefiner:
 
         selected_indices = set(selection.indices)
         keyframes = ",".join(str(index) for index in selection.indices)
-        projections_by_target: dict[int, list[tuple[int, object]]] = {}
+        # Tests and low-level callers may provide already-built projections.  The
+        # normal selector only returns scalar summaries, so the enabled path below
+        # reprojects selected pairs one at a time and releases each array after use.
+        supplied_projections_by_target: dict[int, list[tuple[int, object]]] = {}
         for source, target, projection in selection.pair_projections:
             source = int(source)
             target = int(target)
@@ -1155,8 +1257,16 @@ class WindowReferenceRefiner:
                 source in selected_indices
                 and source != target
                 and 0 <= target < frame_count
+                and all(
+                    hasattr(projection, name)
+                    for name in (
+                        "source_flat_indices",
+                        "target_flat_indices",
+                        "correspondence_weights",
+                    )
+                )
             ):
-                projections_by_target.setdefault(target, []).append(
+                supplied_projections_by_target.setdefault(target, []).append(
                     (source, projection)
                 )
 
@@ -1165,26 +1275,34 @@ class WindowReferenceRefiner:
             initial_labels = np.asarray(results[target].labels)
             regions_before = int(np.unique(initial_labels).size)
             is_keyframe = target in selected_indices
-            target_projections = sorted(
-                projections_by_target.get(target, ()),
-                key=lambda item: item[0],
-            )
-            projected_samples = sum(
-                int(getattr(projection, "projected_samples", 0))
-                for _, projection in target_projections
-            )
-            occluded_samples = sum(
-                int(getattr(projection, "occluded_samples", 0))
-                for _, projection in target_projections
-            )
-            depth_rejected_samples = sum(
-                int(getattr(projection, "depth_rejected_samples", 0))
-                for _, projection in target_projections
-            )
-
             mappings: list[tuple[int, float, dict[int, _RegionMapping]]] = []
-            if not is_keyframe:
-                for source, projection in target_projections:
+            projected_samples = 0
+            occluded_samples = 0
+            depth_rejected_samples = 0
+
+            supplied = supplied_projections_by_target.get(target)
+            if supplied is not None:
+                projection_items: Iterable[tuple[int, object]] = sorted(
+                    supplied,
+                    key=lambda item: item[0],
+                )
+            else:
+                projection_items = (
+                    (source, evaluate(source, target))
+                    for source in sorted(selected_indices)
+                    if source != target
+                )
+
+            for source, projection in projection_items:
+                projected_samples += int(
+                    getattr(projection, "projected_samples", 0)
+                )
+                occluded_samples += int(getattr(projection, "occluded_samples", 0))
+                depth_rejected_samples += int(
+                    getattr(projection, "depth_rejected_samples", 0)
+                )
+                pair_score = _projection_score(projection)
+                if not is_keyframe and pair_score >= self.window_reference.min_reference_score:
                     source_labels = np.asarray(results[source].labels)
                     region_mappings = _projection_region_mappings(
                         source_labels=source_labels,
@@ -1200,14 +1318,15 @@ class WindowReferenceRefiner:
                     mappings.append(
                         (
                             source,
-                            _projection_score(projection),
+                            pair_score,
                             region_mappings,
                         )
                     )
+                del projection
 
             reference_votes = [
-                (pair_score, region_mappings)
-                for _, pair_score, region_mappings in mappings
+                (source, pair_score, region_mappings)
+                for source, pair_score, region_mappings in mappings
             ]
             candidate_edges = (
                 _merge_vote_edges(
