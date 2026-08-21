@@ -52,6 +52,7 @@ from .results import (
     RunRecord,
     RunStatus,
     RunTimings,
+    atomic_json,
     load_valid_completed_run,
     read_run_record,
     write_run_record,
@@ -659,6 +660,73 @@ def _execution_from_record_for_injected_validator(
     )
 
 
+def _identity_key(seed: RunIdentitySeed, run_id: str) -> tuple[str, str, str, str]:
+    return (
+        seed.dataset,
+        seed.scene,
+        f"f{seed.frame_start:06d}-{seed.frame_stop:06d}-s{seed.frame_stride}",
+        run_id,
+    )
+
+
+def _load_cleanup_errors(path: Path) -> list[dict[str, str]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("errors"), list):
+        return []
+    errors: list[dict[str, str]] = []
+    for item in payload["errors"]:
+        if not isinstance(item, Mapping):
+            continue
+        run_id = item.get("run_id")
+        cleanup_path = item.get("path")
+        message = item.get("message")
+        if all(isinstance(value, str) and value for value in (run_id, cleanup_path, message)):
+            errors.append({"run_id": run_id, "path": cleanup_path, "message": message})
+    return errors
+
+
+def _remember_cleanup_error(
+    errors: list[dict[str, str]],
+    *,
+    run_id: str,
+    path: Path,
+    exc: Exception,
+) -> None:
+    cleanup_path = str(path)
+    errors[:] = [
+        item
+        for item in errors
+        if item.get("run_id") != run_id or item.get("path") != cleanup_path
+    ]
+    errors.append({
+        "run_id": run_id,
+        "path": cleanup_path,
+        "message": _redact_message(str(exc) or type(exc).__name__),
+    })
+
+
+def _forget_cleanup_error(
+    errors: list[dict[str, str]], *, run_id: str, path: Path
+) -> None:
+    cleanup_path = str(path)
+    errors[:] = [
+        item
+        for item in errors
+        if item.get("run_id") != run_id or item.get("path") != cleanup_path
+    ]
+
+
+def _write_cleanup_errors(root: Path, errors: Sequence[Mapping[str, str]]) -> None:
+    target = root / "cleanup_errors.json"
+    if errors:
+        atomic_json(target, {"errors": list(errors)})
+    elif target.exists() or target.is_symlink():
+        guarded_remove(target, root)
+
+
 def _same_scene_key(records: Sequence[RunRecord], scene_key: tuple[str, str]) -> str | None:
     key: str | None = None
     for record in records:
@@ -682,7 +750,7 @@ def run_campaign(
     keep_artifacts: bool,
     dependencies: RunnerDependencies | None = None,
 ) -> CampaignOutcome:
-    """Run the plan serially, preserving every attempt and compact record."""
+    """Run scenes serially, publishing each scene before staging the next."""
 
     if not isinstance(loaded, LoadedCampaignConfig):
         raise ValueError("campaign run requires LoadedCampaignConfig")
@@ -707,9 +775,6 @@ def run_campaign(
     source_commit, source_dirty = _source_metadata(loaded.config.repository_root)
     checkpoint_sha256 = sha256_file(loaded.config.storage.checkpoint)
 
-    # Stage every scene before any run is executed.  This makes the source
-    # manifest and identity seeds stable for the entire serial campaign and
-    # allows all resume identities to be checked before a new reconstruction.
     scene_order: list[str] = []
     scene_plans: dict[str, list[PlannedRun]] = {}
     for planned in plan.runs:
@@ -717,18 +782,74 @@ def run_campaign(
             scene_order.append(planned.scene_id)
             scene_plans[planned.scene_id] = []
         scene_plans[planned.scene_id].append(planned)
-    staged_by_scene: dict[str, StagedScene] = {}
-    expected: dict[tuple[str, str, str, str], tuple[PlannedRun, StagedScene, RunIdentitySeed]] = {}
+
+    records: list[RunRecord] = []
+    existing: dict[tuple[str, str, str, str], RunRecord] = {}
+    skipped_ids: list[str] = []
+    expected: dict[
+        tuple[str, str, str, str], tuple[PlannedRun, StagedScene, RunIdentitySeed]
+    ] = {}
     expected_seeds: dict[tuple[str, str, str, str], RunIdentitySeed] = {}
+    expected_order: dict[tuple[str, str, str, str], int] = {}
+    cleanup_errors = _load_cleanup_errors(root / "cleanup_errors.json")
+
+    def record_order(record: RunRecord) -> int:
+        return expected_order.get(
+            _identity_key(record.identity_seed, record.run_id),
+            len(expected_order),
+        )
+
+    def publish_summary() -> None:
+        write_summaries(records, expected_seeds, root)
+
+    def persist_cleanup_errors() -> None:
+        _write_cleanup_errors(root, cleanup_errors)
+
+    def try_remove(run_id: str, path: Path) -> None:
+        try:
+            require_descendant(path, root)
+            if path.exists() or path.is_symlink():
+                guarded_remove(path, root)
+        except Exception as exc:
+            _remember_cleanup_error(
+                cleanup_errors,
+                run_id=run_id,
+                path=path,
+                exc=exc,
+            )
+        else:
+            _forget_cleanup_error(cleanup_errors, run_id=run_id, path=path)
+
+    def validate_execution(
+        request: RunRequest,
+        execution: PipelineExecution,
+        seed: RunIdentitySeed,
+    ) -> tuple[str, str]:
+        if execution.artifact_dir != request.artifact_dir:
+            raise ValueError("pipeline artifact directory does not match request")
+        validated_key, validated_digest = deps.validate_artifact(
+            request.artifact_dir, seed
+        )
+        if validated_key != execution.prediction_key:
+            raise ValueError("validated artifact prediction key differs from execution")
+        if validated_digest != execution.artifact_manifest_sha256:
+            raise ValueError("validated artifact digest differs from execution")
+        return validated_key, validated_digest
+
+    stop = False
     for scene_id in scene_order:
         scene = resolved_scenes.get(scene_id)
         if not isinstance(scene, ResolvedScene):
             raise ValueError(f"resolved scene is missing: {scene_id}")
+
+        # A scene owns its prepared directory for the entire scene run, then
+        # it is cleaned before the next scene is staged.
         staged = deps.stage_scene(scene, root)
         if not isinstance(staged, StagedScene):
             raise ValueError("stage_scene dependency returned an invalid scene")
         require_descendant(staged.manifest_path.parent, root)
-        staged_by_scene[scene_id] = staged
+
+        scene_expected: list[tuple[PlannedRun, tuple[str, str, str, str], RunIdentitySeed]] = []
         for planned in scene_plans[scene_id]:
             seed = build_identity_seed(
                 loaded=loaded,
@@ -741,83 +862,51 @@ def run_campaign(
                 source_dirty=source_dirty,
                 checkpoint_sha256=checkpoint_sha256,
             )
-            key = (
-                seed.dataset,
-                seed.scene,
-                f"f{seed.frame_start:06d}-{seed.frame_stop:06d}-s{seed.frame_stride}",
-                planned.variant.run_id,
-            )
+            key = _identity_key(seed, planned.variant.run_id)
             expected[key] = (planned, staged, seed)
             expected_seeds[key] = seed
+            expected_order[key] = len(expected_order)
+            scene_expected.append((planned, key, seed))
 
-    existing: dict[tuple[str, str, str, str], RunRecord] = {}
-    skipped: list[RunRecord] = []
-    skipped_ids: list[str] = []
-    for key, (planned, _staged, seed) in expected.items():
-        run_dir = _run_directory(root, planned)
-        require_descendant(run_dir, root)
-        path = run_dir / "run.json"
-        if not path.is_file():
-            continue
-        try:
-            record = read_run_record(path)
-        except ValueError:
-            # A malformed/incomplete record is recoverable by a new numbered
-            # attempt; no immutable success was proven.
-            continue
-        if record.status is RunStatus.SUCCEEDED:
-            try:
-                exact = load_valid_completed_run(path, seed)
-            except ValueError as exc:
-                raise ValueError(
-                    f"existing completed run identity mismatch at {path}; "
-                    "use a new output root or campaign ID"
-                ) from exc
-            if not resume:
-                raise ValueError(
-                    f"completed run already exists at {path}; use a new output root or campaign ID"
-                )
-            existing[key] = exact
-            skipped.append(exact)
-            skipped_ids.append(planned.variant.run_id)
-        else:
-            # Failed records are retryable, but only when their compact
-            # identity still belongs to this planned run.  A malformed or
-            # cross-run failure must not authorize evaluation-only reuse of
-            # an artifact left at this path.
-            if record.run_id != planned.variant.run_id or record.identity_seed != seed:
+        # Resume validation is done only for this staged scene.  A later
+        # staging failure cannot prevent already-complete earlier scenes from
+        # publishing their summaries and cleanup.
+        for planned, seed_key, seed in scene_expected:
+            run_dir = _run_directory(root, planned)
+            require_descendant(run_dir, root)
+            path = run_dir / "run.json"
+            if not path.is_file():
                 continue
-            existing[key] = record
+            try:
+                record = read_run_record(path)
+            except ValueError:
+                continue
+            if record.status is RunStatus.SUCCEEDED:
+                try:
+                    exact = load_valid_completed_run(path, seed)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"existing completed run identity mismatch at {path}; "
+                        "use a new output root or campaign ID"
+                    ) from exc
+                if not resume:
+                    raise ValueError(
+                        f"completed run already exists at {path}; use a new output root or campaign ID"
+                    )
+                existing[seed_key] = exact
+                records.append(exact)
+                skipped_ids.append(planned.variant.run_id)
+                if not keep_artifacts:
+                    try_remove(
+                        planned.variant.run_id,
+                        run_dir / "artifact",
+                    )
+            elif (
+                record.run_id == planned.variant.run_id
+                and record.identity_seed == seed
+            ):
+                existing[seed_key] = record
 
-    # Validate all skipped shared identities before the first new call.
-    skipped_by_scene: dict[tuple[str, str], list[RunRecord]] = {}
-    for record in skipped:
-        scene_key = (record.identity_seed.dataset, record.identity_seed.scene)
-        skipped_by_scene.setdefault(scene_key, []).append(record)
-    for scene_key, records_for_scene in skipped_by_scene.items():
-        _same_scene_key(records_for_scene, scene_key)
-
-    expected_order = {key: index for index, key in enumerate(expected)}
-
-    def record_order(record: RunRecord) -> int:
-        seed = record.identity_seed
-        key = (
-            seed.dataset,
-            seed.scene,
-            f"f{seed.frame_start:06d}-{seed.frame_stop:06d}-s{seed.frame_stride}",
-            record.run_id,
-        )
-        return expected_order.get(key, len(expected_order))
-
-    records: list[RunRecord] = list(skipped)
-    records.sort(key=record_order)
-
-    def publish_summary() -> None:
-        write_summaries(records, expected_seeds, root)
-
-    stop = False
-    for scene_id in scene_order:
-        staged = staged_by_scene[scene_id]
         scene_key = (staged.dataset.value, staged.scene)
         scene_records = [
             record
@@ -826,17 +915,15 @@ def run_campaign(
         ]
         known_key = _same_scene_key(scene_records, scene_key)
         first_pending = True
-        window_count = _expected_window_count(staged, loaded)
-        for planned in scene_plans[scene_id]:
-            seed_key = next(
-                key for key, (item, _staged, _seed) in expected.items() if item is planned
-            )
-            seed = expected_seeds[seed_key]
+        expected_window_count = _expected_window_count(staged, loaded)
+
+        for planned, seed_key, seed in scene_expected:
             prior = existing.get(seed_key)
             if prior is not None and prior.status is RunStatus.SUCCEEDED:
                 continue
             if stop:
                 continue
+
             run_dir = _run_directory(root, planned)
             require_descendant(run_dir, root)
             attempt, attempt_dir = next_attempt(run_dir)
@@ -849,7 +936,7 @@ def run_campaign(
                 first_pending=first_pending,
                 known_prediction_key=known_key,
                 cache_root=cache_root,
-                window_count=window_count,
+                window_count=expected_window_count,
             )
             request = RunRequest(
                 planned=planned,
@@ -867,23 +954,29 @@ def run_campaign(
             evaluation_s: float | None = None
             execution: PipelineExecution | None = None
             artifact_digest: str | None = None
+            execution_validated = False
             evaluation_completed = False
             post_execution_validation = False
-            cleanup_started = False
+            window_count = 0
             try:
-                # A failed evaluation leaves a validated artifact in place;
-                # resume only re-enters evaluation for that exact artifact.
+                # A retained artifact can resume either an evaluator failure
+                # or a later compact-publication failure.
                 if (
                     prior is not None
                     and prior.status is RunStatus.FAILED
-                    and prior.failure_stage is FailureStage.EVALUATION
+                    and prior.failure_stage
+                    in {FailureStage.EVALUATION, FailureStage.COMPACTION}
                     and prior.artifact_manifest_sha256 is not None
                     and artifact_dir.is_dir()
                 ):
                     try:
-                        artifact_key, artifact_digest = deps.validate_artifact(artifact_dir, seed)
-                        if artifact_digest != prior.artifact_manifest_sha256:
-                            raise ValueError("validated artifact digest differs from failed record")
+                        artifact_key, validated_digest = deps.validate_artifact(
+                            artifact_dir, seed
+                        )
+                        if validated_digest != prior.artifact_manifest_sha256:
+                            raise ValueError(
+                                "validated artifact digest differs from failed record"
+                            )
                         if known_key is not None and artifact_key != known_key:
                             raise ValueError(
                                 "validated artifact prediction key disagrees with scene"
@@ -901,16 +994,28 @@ def run_campaign(
                                 request,
                                 prior,
                                 artifact_key,
-                                artifact_digest,
+                                validated_digest,
                             )
+                        if execution.artifact_dir != request.artifact_dir:
+                            raise ValueError(
+                                "retained artifact directory does not match request"
+                            )
+                        if execution.prediction_key != artifact_key:
+                            raise ValueError(
+                                "retained artifact prediction key differs from validator"
+                            )
+                        if execution.artifact_manifest_sha256 != validated_digest:
+                            raise ValueError(
+                                "retained artifact digest differs from validator"
+                            )
+                        artifact_digest = validated_digest
+                        execution_validated = True
                         reconstruction_s = prior.timings.reconstruction_s
                         known_key = artifact_key
                     except Exception:
                         guarded_remove(artifact_dir, root)
+
                 if execution is None:
-                    # Reconstruction owns a no-replace artifact directory.
-                    # Remove only a stale campaign-owned directory before
-                    # asking it to publish a fresh one.
                     if artifact_dir.exists() or artifact_dir.is_symlink():
                         guarded_remove(artifact_dir, root)
                     recon_started = deps.monotonic()
@@ -920,13 +1025,25 @@ def run_campaign(
                         reconstruction_s = max(0.0, deps.monotonic() - recon_started)
                     if not isinstance(execution, PipelineExecution):
                         raise ValueError("execute_pipeline returned an invalid execution")
-                    artifact_digest = execution.artifact_manifest_sha256
+                    post_execution_validation = True
+                    validated_key, artifact_digest = validate_execution(
+                        request, execution, seed
+                    )
+                    if validated_key != execution.prediction_key:
+                        raise ValueError(
+                            "validated artifact prediction key differs from execution"
+                        )
+                    execution_validated = True
+
                 post_execution_validation = True
                 if execution.prediction_key != known_key and known_key is not None:
                     raise ValueError("prediction key disagrees with completed scene records")
-                post_execution_validation = False
                 known_key = execution.prediction_key
+                # Cache the validated count once.  Failure handling below uses
+                # this value and never parses the malformed payload again.
+                window_count = _diagnostic_window_count(execution.diagnostics_payload)
                 first_pending = False
+                post_execution_validation = False
                 evaluation_started = deps.monotonic()
                 try:
                     evaluation = deps.evaluate_artifact(request, execution, loaded)
@@ -953,7 +1070,7 @@ def run_campaign(
                     started_at=started_at,
                     finished_at=_format_timestamp(deps.utc_now()),
                     frame_count=execution.frame_count,
-                    window_count=_diagnostic_window_count(execution.diagnostics_payload),
+                    window_count=window_count,
                     cache_policy=cache_mode.value,
                     cache_stats=execution.cache_stats,
                     timings=RunTimings(reconstruction_s, evaluation_s),
@@ -963,16 +1080,13 @@ def run_campaign(
                     artifact_manifest_sha256=artifact_digest,
                     error=None,
                 )
+                # Publication is the immutable success boundary.  Cleanup is
+                # deliberately outside this try block and cannot rewrite it.
                 write_run_record(run_dir / "run.json", record)
-                # Re-read the compact record before deleting any validated
-                # artifact.  This makes cleanup recoverable if publication
-                # fails or a record is malformed.
-                if not keep_artifacts:
-                    load_valid_completed_run(run_dir / "run.json", seed)
-                    cleanup_started = True
-                    guarded_remove(artifact_dir, root)
+                load_valid_completed_run(run_dir / "run.json", seed)
                 records = [
-                    item for item in records
+                    item
+                    for item in records
                     if not (
                         item.identity_seed == seed
                         and item.run_id == planned.variant.run_id
@@ -981,11 +1095,7 @@ def run_campaign(
                 records.append(record)
                 existing[seed_key] = record
             except Exception as exc:
-                # Preserve the best known timing/cache/artifact context while
-                # keeping all control-flow exceptions at the run boundary.
-                if cleanup_started:
-                    stage = FailureStage.CLEANUP
-                elif execution is None:
+                if execution is None:
                     stage = FailureStage.RECONSTRUCTION
                 elif post_execution_validation:
                     stage = FailureStage.COMPACTION
@@ -993,8 +1103,6 @@ def run_campaign(
                     stage = FailureStage.COMPACTION
                 else:
                     stage = FailureStage.EVALUATION
-                if execution is not None and artifact_digest is None:
-                    artifact_digest = execution.artifact_manifest_sha256
                 failed = _failed_record(
                     request,
                     seed,
@@ -1004,23 +1112,21 @@ def run_campaign(
                     exc,
                     finished_at=_format_timestamp(deps.utc_now()),
                     frame_count=0 if execution is None else execution.frame_count,
-                    window_count=(
-                        0
-                        if execution is None
-                        else _diagnostic_window_count(execution.diagnostics_payload)
-                    ),
+                    window_count=window_count,
                     cache_stats=None if execution is None else execution.cache_stats,
                     reconstruction_s=reconstruction_s,
                     evaluation_s=evaluation_s,
                     artifact_manifest_sha256=(
                         artifact_digest
-                        if stage in {FailureStage.EVALUATION, FailureStage.COMPACTION}
+                        if execution_validated
+                        and stage in {FailureStage.EVALUATION, FailureStage.COMPACTION}
                         else None
                     ),
                 )
                 write_run_record(run_dir / "run.json", failed)
                 records = [
-                    item for item in records
+                    item
+                    for item in records
                     if not (
                         item.identity_seed == seed
                         and item.run_id == planned.variant.run_id
@@ -1032,30 +1138,45 @@ def run_campaign(
                 if failure_policy is FailurePolicy.FAIL_FAST:
                     stop = True
                     break
+
+            if not keep_artifacts and existing.get(seed_key) is not None:
+                latest = existing[seed_key]
+                if latest.status is RunStatus.SUCCEEDED:
+                    try_remove(planned.variant.run_id, artifact_dir)
+
         publish_summary()
-        if stop:
-            break
-        # Clean only after this scene's requested records are all valid
-        # successes and all share one prediction key.
         current = [
-            item for item in records
+            item
+            for item in records
             if (item.identity_seed.dataset, item.identity_seed.scene) == scene_key
         ]
-        if len(current) == len(scene_plans[scene_id]) and all(
-            item.status is RunStatus.SUCCEEDED for item in current
+        if (
+            not stop
+            and len(current) == len(scene_plans[scene_id])
+            and all(item.status is RunStatus.SUCCEEDED for item in current)
         ):
             _same_scene_key(current, scene_key)
-            guarded_remove(_scene_cache_root(root, scene_plans[scene_id][0]), root)
-            guarded_remove(staged.manifest_path.parent, root)
+            scene_cleanup_id = f"scene:{scene_id}"
+            try_remove(
+                scene_cleanup_id,
+                _scene_cache_root(root, scene_plans[scene_id][0]),
+            )
+            try_remove(scene_cleanup_id, staged.manifest_path.parent)
+        persist_cleanup_errors()
+        if stop:
+            break
 
-    publish_summary()
-    failures = tuple(record for record in records if record.status is RunStatus.FAILED)
     records.sort(key=record_order)
+    publish_summary()
+    persist_cleanup_errors()
+    failures = tuple(record for record in records if record.status is RunStatus.FAILED)
     return CampaignOutcome(
         records=tuple(records),
         failures=failures,
         skipped_run_ids=tuple(skipped_ids),
-        exit_code=1 if failures or len(records) < len(plan.runs) else 0,
+        exit_code=1
+        if failures or len(records) < len(plan.runs) or cleanup_errors
+        else 0,
     )
 
 
