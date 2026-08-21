@@ -872,6 +872,111 @@ def preflight_campaign(
     checks: list[PreflightCheck] = []
     warnings: list[str] = []
     errors: list[str] = []
+    synthetic_only = bool(getattr(plan, "runs", ())) and all(
+        getattr(item.dataset, "value", item.dataset) == "synthetic"
+        for item in plan.runs
+    )
+    if synthetic_only:
+        # Synthetic checks intentionally avoid model imports, checkpoint/data
+        # existence, and CUDA.  Keep the storage and source provenance checks
+        # so the same campaign-owned output boundary is exercised.
+        version = dependencies.python_version
+        python_detail = {
+            "version": ".".join(str(item) for item in version),
+            "required": "3.11 for real campaigns",
+            "synthetic": True,
+        }
+        if version[:2] != (3, 11):
+            _check(checks, "python", "warning", python_detail)
+            warnings.append("synthetic campaign does not import the PI3 runtime")
+        else:
+            _check(checks, "python", "ok", python_detail)
+        repository = Path(loaded.config.repository_root)
+        git = _check_git(repository, dependencies, checks, warnings, errors)
+        free = _check_storage(loaded, dependencies, checks, warnings, errors)
+        from .matrix import build_identity_seed
+        from .scenes import resolve_scene
+
+        planned_by_scene: dict[str, list[Any]] = {}
+        for planned in plan.runs:
+            planned_by_scene.setdefault(planned.scene_id, []).append(planned)
+        selected = {item.scene_id: item for item in loaded.config.selected_scenes}
+        sentinel = hashlib.sha256(
+            b"LASER-window-reference-synthetic-checkpoint-v1"
+        ).hexdigest()
+        seed_hashes: list[str] = []
+        for scene_id, planned_items in planned_by_scene.items():
+            resolved = resolve_scene(loaded.config, selected[scene_id])
+            payload = {
+                "schema_version": 2,
+                "dataset": "synthetic",
+                "scene_id": resolved.scene_id,
+                "scene": resolved.scene,
+                "slice_id": resolved.slice_id,
+                "source_frame_ids": list(resolved.selection.source_frame_ids),
+                "selection": {
+                    "start": resolved.selection.start,
+                    "stop": resolved.selection.stop,
+                    "stride": resolved.selection.stride,
+                },
+                "synthetic_fixture": "window-reference-v1",
+            }
+            manifest_digest = hashlib.sha256(
+                (json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+            ).hexdigest()
+            _check(
+                checks,
+                f"scene:{scene_id}",
+                "ok",
+                {
+                    "dataset": "synthetic",
+                    "scene": resolved.scene,
+                    "source_image_count": len(resolved.source_images),
+                    "staging_preview_only": True,
+                    "synthetic": True,
+                },
+            )
+            for planned in planned_items:
+                seed = build_identity_seed(
+                    loaded=loaded,
+                    planned=planned,
+                    frame_start=resolved.selection.start,
+                    frame_stop=resolved.selection.stop,
+                    frame_stride=resolved.selection.stride,
+                    staged_manifest_sha256=manifest_digest,
+                    source_commit=git.commit,
+                    source_dirty=git.dirty,
+                    checkpoint_sha256=sentinel,
+                )
+                seed_payload = json.dumps(
+                    seed.to_payload(), sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+                seed_hashes.append(hashlib.sha256(seed_payload.encode()).hexdigest())
+            _check(
+                checks,
+                f"identity:{scene_id}",
+                "ok",
+                {"seed_count": len(planned_items), "unique": True, "synthetic": True},
+            )
+        _check(
+            checks,
+            "cuda",
+            "ok",
+            {"synthetic": True, "gpu_ready": False, "not_applicable": True},
+        )
+        status = "error" if errors else ("ok_with_warnings" if warnings else "ok")
+        return PreflightReport(
+            1,
+            status,
+            allow_no_gpu,
+            tuple(checks),
+            tuple(warnings),
+            tuple(errors),
+            git,
+            sentinel,
+            free,
+            tuple(seed_hashes),
+        )
     _check_python(dependencies, checks, errors)
     _check_imports(dependencies, checks, errors)
     repository = Path(loaded.config.repository_root)

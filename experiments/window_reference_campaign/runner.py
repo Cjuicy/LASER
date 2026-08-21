@@ -32,6 +32,7 @@ from pipeline.runner import PipelineDependencies, PipelineRunner
 
 from .config import (
     CachePolicy,
+    DatasetKind,
     EvaluationKind,
     FailurePolicy,
     LoadedCampaignConfig,
@@ -131,6 +132,69 @@ class RunRequest:
     log_path: Path
 
 
+def _synthetic_stage_payload(scene: ResolvedScene) -> dict[str, object]:
+    if scene.dataset is not DatasetKind.SYNTHETIC:
+        raise ValueError("synthetic staging requires a synthetic scene")
+    return {
+        "schema_version": 2,
+        "dataset": "synthetic",
+        "scene_id": scene.scene_id,
+        "scene": scene.scene,
+        "slice_id": scene.slice_id,
+        "source_frame_ids": list(scene.selection.source_frame_ids),
+        "selection": {
+            "start": scene.selection.start,
+            "stop": scene.selection.stop,
+            "stride": scene.selection.stride,
+        },
+        "synthetic_fixture": "window-reference-v1",
+    }
+
+
+def synthetic_staging_manifest_sha256(scene: ResolvedScene) -> str:
+    """Return the digest of the deterministic synthetic staging manifest."""
+
+    payload = _synthetic_stage_payload(scene)
+    encoded = json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _stage_synthetic_scene(scene: ResolvedScene, campaign_root: Path) -> StagedScene:
+    """Publish a tiny campaign-owned manifest without touching external data."""
+
+    root = Path(campaign_root).resolve(strict=False)
+    staging_root = root / "work" / "staging" / "synthetic" / scene.scene_id
+    require_descendant(staging_root, root)
+    image_dir = staging_root / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = staging_root / "manifest.json"
+    payload = _synthetic_stage_payload(scene)
+    atomic_json(manifest_path, payload)
+    staged = StagedScene(
+        scene_id=scene.scene_id,
+        dataset=scene.dataset,
+        scene=scene.scene,
+        slice_id=scene.slice_id,
+        image_dir=image_dir,
+        source_frame_ids=scene.selection.source_frame_ids,
+        selection=scene.selection,
+        evaluation_kind=EvaluationKind.NONE,
+        poses_path=None,
+        pointcloud_gt_path=None,
+        manifest_path=manifest_path,
+        manifest_sha256=sha256_file(manifest_path),
+    )
+    if staged.manifest_sha256 != synthetic_staging_manifest_sha256(scene):
+        raise ValueError("synthetic staging manifest digest is unstable")
+    return staged
+
+
+def stage_scene_for_dataset(scene: ResolvedScene, campaign_root: Path) -> StagedScene:
+    if scene.dataset is DatasetKind.SYNTHETIC:
+        return _stage_synthetic_scene(scene, campaign_root)
+    return default_stage_scene(scene, campaign_root)
+
+
 def _default_evaluate_artifact(
     request: RunRequest,
     execution: PipelineExecution,
@@ -164,9 +228,11 @@ class RunnerDependencies:
         # Defaults are assigned lazily here to keep the dataclass's public
         # fields injectable without adding a test-only constructor.
         if self.execute_pipeline is None:
-            object.__setattr__(self, "execute_pipeline", execute_pipeline)
+            object.__setattr__(self, "execute_pipeline", execute_pipeline_for_dataset)
         if self.evaluate_artifact is None:
             object.__setattr__(self, "evaluate_artifact", _default_evaluate_artifact)
+        if self.stage_scene is default_stage_scene:
+            object.__setattr__(self, "stage_scene", stage_scene_for_dataset)
         if self.validate_artifact is None:
             object.__setattr__(self, "validate_artifact", validate_artifact_for_seed)
         if self.monotonic is None:
@@ -384,6 +450,19 @@ def execute_pipeline(
     )
 
 
+def execute_pipeline_for_dataset(
+    request: RunRequest,
+    loaded: LoadedCampaignConfig,
+) -> PipelineExecution:
+    """Dispatch synthetic runs without constructing PI3 or CUDA state."""
+
+    if request.planned.dataset is DatasetKind.SYNTHETIC:
+        from .synthetic import execute_synthetic
+
+        return execute_synthetic(request, loaded)
+    return execute_pipeline(request, loaded)
+
+
 def _mapping_value(mapping: Mapping[str, object], path: str) -> object:
     current: object = mapping
     for part in path.split("."):
@@ -404,7 +483,7 @@ def _resolved_config_payload(path: Path) -> Mapping[str, object]:
     return payload
 
 
-def validate_artifact_for_seed(
+def _validate_real_artifact_for_seed(
     artifact_dir: Path,
     seed: RunIdentitySeed,
 ) -> tuple[str, str]:
@@ -484,6 +563,21 @@ def validate_artifact_for_seed(
     ):
         raise ValueError("artifact frame count does not match identity")
     return prediction_key, sha256_file(manifest_path)
+
+
+def validate_artifact_for_seed(
+    artifact_dir: Path,
+    seed: RunIdentitySeed,
+) -> tuple[str, str]:
+    """Dispatch compact artifact validation by dataset kind."""
+
+    if not isinstance(seed, RunIdentitySeed):
+        raise ValueError("artifact validation requires RunIdentitySeed")
+    if seed.dataset == DatasetKind.SYNTHETIC.value:
+        from .synthetic import validate_synthetic_artifact
+
+        return validate_synthetic_artifact(artifact_dir, seed)
+    return _validate_real_artifact_for_seed(artifact_dir, seed)
 
 
 def _source_metadata(repository_root: Path) -> tuple[str, bool]:
@@ -778,10 +872,23 @@ def run_campaign(
         except (TypeError, ValueError) as exc:
             raise ValueError("failure_policy is invalid") from exc
     deps = dependencies or RunnerDependencies()
-    root = loaded.config.campaign_root.resolve(strict=False)
+    configured_root = Path(loaded.config.campaign_root)
+    if configured_root.is_symlink():
+        raise ValueError("campaign root must not be a symlink")
+    if configured_root.exists() and not configured_root.is_dir():
+        raise ValueError("campaign root must be a directory")
+    root = configured_root.resolve(strict=False)
     root.mkdir(parents=True, exist_ok=True)
     source_commit, source_dirty = _source_metadata(loaded.config.repository_root)
-    checkpoint_sha256 = sha256_file(loaded.config.storage.checkpoint)
+    synthetic_only = bool(plan.runs) and all(
+        planned.dataset is DatasetKind.SYNTHETIC for planned in plan.runs
+    )
+    if synthetic_only:
+        from .synthetic import synthetic_checkpoint_sha256
+
+        checkpoint_sha256 = synthetic_checkpoint_sha256()
+    else:
+        checkpoint_sha256 = sha256_file(loaded.config.storage.checkpoint)
 
     scene_order: list[str] = []
     scene_plans: dict[str, list[PlannedRun]] = {}
@@ -808,7 +915,14 @@ def run_campaign(
         )
 
     def publish_summary() -> None:
-        write_summaries(records, expected_seeds, root)
+        paths = write_summaries(records, expected_seeds, root / "summary")
+        # Preserve the Task 1–6 root-level summary JSON compatibility while
+        # publishing the complete six-file summary directory for the CLI.
+        try:
+            summary_payload = json.loads(paths.summary_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("summary JSON could not be read after publication") from exc
+        atomic_json(root / "summary.json", summary_payload)
 
     def persist_cleanup_errors() -> None:
         _write_cleanup_errors(root, cleanup_errors)
@@ -924,6 +1038,11 @@ def run_campaign(
         known_key = _same_scene_key(scene_records, scene_key)
         first_pending = True
         expected_window_count = _expected_window_count(staged, loaded)
+        if (
+            staged.dataset is DatasetKind.SYNTHETIC
+            and deps.execute_pipeline is execute_pipeline_for_dataset
+        ):
+            expected_window_count = 2
 
         for planned, seed_key, seed in scene_expected:
             prior = existing.get(seed_key)
@@ -989,21 +1108,33 @@ def run_campaign(
                             raise ValueError(
                                 "validated artifact prediction key disagrees with scene"
                             )
-                        try:
-                            execution = _execution_from_artifact(
+                        if (
+                            seed.dataset == DatasetKind.SYNTHETIC.value
+                            and deps.validate_artifact is validate_artifact_for_seed
+                        ):
+                            from .synthetic import load_synthetic_execution
+
+                            execution = load_synthetic_execution(
                                 artifact_dir,
-                                artifact_key,
+                                seed,
                                 prior.cache_stats,
                             )
-                        except Exception:
-                            if deps.validate_artifact is validate_artifact_for_seed:
-                                raise
-                            execution = _execution_from_record_for_injected_validator(
-                                request,
-                                prior,
-                                artifact_key,
-                                validated_digest,
-                            )
+                        else:
+                            try:
+                                execution = _execution_from_artifact(
+                                    artifact_dir,
+                                    artifact_key,
+                                    prior.cache_stats,
+                                )
+                            except Exception:
+                                if deps.validate_artifact is validate_artifact_for_seed:
+                                    raise
+                                execution = _execution_from_record_for_injected_validator(
+                                    request,
+                                    prior,
+                                    artifact_key,
+                                    validated_digest,
+                                )
                         if execution.artifact_dir != request.artifact_dir:
                             raise ValueError(
                                 "retained artifact directory does not match request"
@@ -1165,10 +1296,14 @@ def run_campaign(
         ):
             _same_scene_key(current, scene_key)
             scene_cleanup_id = f"scene:{scene_id}"
-            try_remove(
-                scene_cleanup_id,
-                _scene_cache_root(root, scene_plans[scene_id][0]),
-            )
+            # Keep the tiny synthetic cache so subsequent matrix variants can
+            # exercise the ordinary auto->readonly policy boundary.  Real
+            # scenes retain the historical cleanup behavior.
+            if staged.dataset is not DatasetKind.SYNTHETIC:
+                try_remove(
+                    scene_cleanup_id,
+                    _scene_cache_root(root, scene_plans[scene_id][0]),
+                )
             try_remove(scene_cleanup_id, staged.manifest_path.parent)
         persist_cleanup_errors()
         if stop:
@@ -1196,10 +1331,13 @@ __all__ = [
     "RunnerDependencies",
     "cache_entry_complete",
     "execute_pipeline",
+    "execute_pipeline_for_dataset",
     "next_attempt",
     "run_directory",
     "run_campaign",
     "scene_cache_root",
     "select_cache_mode",
+    "stage_scene_for_dataset",
+    "synthetic_staging_manifest_sha256",
     "validate_artifact_for_seed",
 ]

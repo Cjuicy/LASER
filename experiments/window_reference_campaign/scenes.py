@@ -372,6 +372,38 @@ def resolve_scene(config: CampaignConfig, selected: PresetSceneConfig) -> Resolv
         scene_config = config.scenes[selected.scene_id]
     except KeyError as exc:
         raise ValueError(f"unknown selected scene: {selected.scene_id}") from exc
+    if scene_config.dataset is DatasetKind.SYNTHETIC:
+        # Synthetic campaigns intentionally do not require a data directory;
+        # the runner owns their fixture and staging manifest.  Keep the
+        # resolved source paths deterministic for identity/debug payloads.
+        data_root = Path(config.storage.data_root).resolve(strict=False)
+        frame_total = max(4, selected.stop or (selected.start + 4))
+        selection = apply_frame_selection(
+            tuple(range(frame_total)),
+            selected,
+            start_override=None,
+            max_frames=None,
+            stride_override=None,
+        )
+        source_images = tuple(
+            data_root / "__synthetic__" / f"frame-{frame_id:06d}.png"
+            for frame_id in selection.source_frame_ids
+        )
+        return ResolvedScene(
+            scene_id=scene_config.scene_id,
+            dataset=scene_config.dataset,
+            scene=scene_config.scene,
+            slice_id=_slice_id(selected),
+            approved_data_root=data_root,
+            source_images=source_images,
+            selection=selection,
+            evaluation_kind=EvaluationKind.NONE,
+            poses_path=None,
+            prepared_gt_path=None,
+            frame_index_map=None,
+            expected_gt_shape=None,
+        )
+
     data_root, source_root = _source_root(config, scene_config)
 
     poses_path: Path | None = None
@@ -403,20 +435,6 @@ def resolve_scene(config: CampaignConfig, selected: PresetSceneConfig) -> Resolv
             config, scene_config, selected, data_root, source_root
         )
         evaluation = EvaluationKind.POINTCLOUD
-    elif scene_config.dataset is DatasetKind.SYNTHETIC:
-        # Synthetic fixtures are resolved as an ordinary ordered image source;
-        # no external point-cloud or trajectory evaluator is attached.
-        image_dir = _safe_data_path(source_root / scene_config.scene, data_root, "synthetic scene", strict=True)
-        images = _discover_kitti_images(image_dir)
-        selection = apply_frame_selection(
-            tuple(range(len(images))),
-            selected,
-            start_override=None,
-            max_frames=None,
-            stride_override=None,
-        )
-        source_images = tuple(images[index] for index in selection.source_frame_ids)
-        evaluation = EvaluationKind.NONE
     else:  # pragma: no cover - enum exhaustiveness
         raise ValueError(f"unsupported dataset: {scene_config.dataset.value}")
 
