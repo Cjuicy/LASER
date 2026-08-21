@@ -549,6 +549,26 @@ def _diagnostics_from_payload(payload: object) -> DiagnosticsSummary | None:
         histogram = mapping["keyframe_index_histogram"]
         records = mapping["keyframe_index_records"]
         fallback = mapping["fallback_reason_histogram"]
+        if histogram is not None:
+            histogram_mapping = _require_mapping(
+                histogram, "keyframe_index_histogram"
+            )
+        else:
+            histogram_mapping = None
+        if records is not None:
+            if type(records) is not list:
+                raise ValueError("keyframe_index_records must be a JSON array")
+            if any(not isinstance(item, str) for item in records):
+                raise ValueError("keyframe_index_records must contain strings")
+            records_tuple = tuple(records)
+        else:
+            records_tuple = None
+        if fallback is not None:
+            fallback_mapping = _require_mapping(
+                fallback, "fallback_reason_histogram"
+            )
+        else:
+            fallback_mapping = None
         return DiagnosticsSummary(
             unique_frame_count=mapping["unique_frame_count"],
             window_frame_observation_count=mapping["window_frame_observation_count"],
@@ -557,8 +577,8 @@ def _diagnostics_from_payload(payload: object) -> DiagnosticsSummary | None:
             refinement_enabled=mapping["refinement_enabled"],
             refinement_state=mapping["refinement_state"],
             keyframe_count=_distribution_from_payload(mapping["keyframe_count"], "keyframe_count"),
-            keyframe_index_histogram=None if histogram is None else dict(_require_mapping(histogram, "keyframe_index_histogram")),
-            keyframe_index_records=None if records is None else tuple(records),
+            keyframe_index_histogram=None if histogram_mapping is None else dict(histogram_mapping),
+            keyframe_index_records=records_tuple,
             coverage_ratio=_distribution_from_payload(mapping["coverage_ratio"], "coverage_ratio"),
             regions_before=_distribution_from_payload(mapping["regions_before"], "regions_before"),
             regions_after=_distribution_from_payload(mapping["regions_after"], "regions_after"),
@@ -572,7 +592,7 @@ def _diagnostics_from_payload(payload: object) -> DiagnosticsSummary | None:
             depth_rejected_sample_total=mapping["depth_rejected_sample_total"],
             applied_frame_count=mapping["applied_frame_count"],
             applied_frame_rate=mapping["applied_frame_rate"],
-            fallback_reason_histogram=None if fallback is None else dict(_require_mapping(fallback, "fallback_reason_histogram")),
+            fallback_reason_histogram=None if fallback_mapping is None else dict(fallback_mapping),
         )
     except (KeyError, TypeError) as exc:
         raise ValueError("diagnostics payload is invalid") from exc
@@ -639,7 +659,7 @@ def _record_from_payload(payload: Mapping[str, object]) -> RunRecord:
             error=error,
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("run record payload is invalid") from exc
+        raise ValueError(f"run record payload is invalid: {exc}") from exc
     _validate_record(record)
     return record
 

@@ -72,6 +72,17 @@ def _freeze(value: object) -> object:
     return value
 
 
+def _parse_keyframes(raw: object) -> tuple[int, ...]:
+    if not isinstance(raw, str):
+        raise ValueError("window_reference_keyframes must be a string")
+    if raw == "":
+        return ()
+    tokens = tuple(raw.split(","))
+    if any(not _KEYFRAME_TOKEN.fullmatch(token) for token in tokens):
+        raise ValueError("window_reference_keyframes must contain decimal indices")
+    return tuple(int(token) for token in tokens)
+
+
 @dataclass(frozen=True)
 class DistributionSummary:
     count: int
@@ -153,6 +164,13 @@ class DiagnosticsSummary:
             _finite_number(getattr(self, name), name, minimum=0, integer=True)
         if not isinstance(self.region_count, DistributionSummary):
             raise ValueError("region_count must be a DistributionSummary")
+        _validate_distribution_semantics(
+            self.region_count,
+            "region_count",
+            expected_count=self.window_frame_observation_count,
+            integer_bounds=True,
+            minimum=0,
+        )
         if type(self.refinement_enabled) is not bool:
             raise ValueError("refinement_enabled must be a boolean")
         if self.refinement_state not in {"not_applicable", "fallback", "applied"}:
@@ -218,32 +236,51 @@ class DiagnosticsSummary:
             ):
                 if getattr(self, name) is not None:
                     raise ValueError("disabled refinement fields must be None")
+            if self.keyframe_index_histogram is not None:
+                raise ValueError("disabled refinement fields must be None")
+            if self.keyframe_index_records is not None:
+                raise ValueError("disabled refinement fields must be None")
 
         if self.keyframe_index_histogram is not None:
+            if not isinstance(self.keyframe_index_histogram, Mapping):
+                raise ValueError("keyframe index histogram must be a mapping")
             object.__setattr__(
                 self,
                 "keyframe_index_histogram",
                 MappingProxyType(
                     {
-                        str(key): int(
-                            _finite_number(value, "keyframe histogram value", minimum=0, integer=True)
+                        key: int(
+                            _validate_histogram_item(
+                                key, value, "keyframe_index_histogram"
+                            )
                         )
                         for key, value in self.keyframe_index_histogram.items()
                     }
                 ),
             )
         if self.keyframe_index_records is not None:
+            if type(self.keyframe_index_records) is not tuple:
+                raise ValueError("keyframe index records must be a tuple")
             if any(not isinstance(item, str) for item in self.keyframe_index_records):
                 raise ValueError("keyframe index records must be strings")
+            if any(_parse_keyframes(item) is None for item in self.keyframe_index_records):
+                raise ValueError("keyframe index records are invalid")
             object.__setattr__(self, "keyframe_index_records", tuple(self.keyframe_index_records))
         if self.fallback_reason_histogram is not None:
+            if not isinstance(self.fallback_reason_histogram, Mapping):
+                raise ValueError("fallback reason histogram must be a mapping")
             object.__setattr__(
                 self,
                 "fallback_reason_histogram",
                 MappingProxyType(
                     {
-                        str(key): int(
-                            _finite_number(value, "fallback histogram value", minimum=0, integer=True)
+                        key: int(
+                            _validate_histogram_item(
+                                key,
+                                value,
+                                "fallback_reason_histogram",
+                                require_nonempty=True,
+                            )
                         )
                         for key, value in self.fallback_reason_histogram.items()
                     }
@@ -273,6 +310,111 @@ class DiagnosticsSummary:
                 )
             )
             object.__setattr__(self, "applied_frame_rate", normalized)
+
+        if self.refinement_enabled:
+            assert self.keyframe_count is not None
+            assert self.coverage_ratio is not None
+            assert self.regions_before is not None
+            assert self.regions_after is not None
+            assert self.region_reduction_relative is not None
+            assert self.keyframe_index_histogram is not None
+            assert self.keyframe_index_records is not None
+            assert self.fallback_reason_histogram is not None
+            _validate_distribution_semantics(
+                self.keyframe_count,
+                "keyframe_count",
+                expected_count=self.window_frame_observation_count,
+                integer_bounds=True,
+                minimum=0,
+            )
+            _validate_distribution_semantics(
+                self.coverage_ratio,
+                "coverage_ratio",
+                expected_count=self.window_frame_observation_count,
+                minimum=0,
+                maximum=1,
+            )
+            _validate_distribution_semantics(
+                self.regions_before,
+                "regions_before",
+                expected_count=self.window_frame_observation_count,
+                integer_bounds=True,
+                minimum=0,
+            )
+            _validate_distribution_semantics(
+                self.regions_after,
+                "regions_after",
+                expected_count=self.window_frame_observation_count,
+                integer_bounds=True,
+                minimum=0,
+            )
+            _validate_distribution_semantics(
+                self.region_reduction_relative,
+                "region_reduction_relative",
+                expected_count=self.window_frame_observation_count,
+                minimum=0,
+                maximum=1,
+            )
+            if len(self.keyframe_index_records) != self.window_frame_observation_count:
+                raise ValueError("keyframe index records count is invalid")
+            histogram_from_records: dict[str, int] = {}
+            for record in self.keyframe_index_records:
+                for index in _parse_keyframes(record):
+                    key = str(index)
+                    histogram_from_records[key] = histogram_from_records.get(key, 0) + 1
+            if dict(self.keyframe_index_histogram) != histogram_from_records:
+                raise ValueError("keyframe index histogram does not match records")
+            if sum(self.fallback_reason_histogram.values()) > self.window_frame_observation_count:
+                raise ValueError("fallback histogram count is invalid")
+            if self.unique_frame_count > self.window_frame_observation_count:
+                raise ValueError("unique frame count exceeds observations")
+            assert self.applied_frame_count is not None
+            if self.applied_frame_count > self.window_frame_observation_count:
+                raise ValueError("applied_frame_count exceeds observations")
+
+
+def _validate_distribution_semantics(
+    value: DistributionSummary,
+    field: str,
+    *,
+    expected_count: int,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    integer_bounds: bool = False,
+) -> None:
+    if value.count != expected_count:
+        raise ValueError(f"{field} distribution count is invalid")
+    if value.minimum > value.mean or value.mean > value.maximum:
+        raise ValueError(f"{field} mean is outside its bounds")
+    if value.minimum > value.median or value.median > value.maximum:
+        raise ValueError(f"{field} median is outside its bounds")
+    for name in ("minimum", "maximum", "mean", "median"):
+        scalar = getattr(value, name)
+        if minimum is not None and scalar < minimum:
+            raise ValueError(f"{field} {name} must be >= {minimum}")
+        if maximum is not None and scalar > maximum:
+            raise ValueError(f"{field} {name} must be <= {maximum}")
+    if integer_bounds and (
+        not value.minimum.is_integer() or not value.maximum.is_integer()
+    ):
+        raise ValueError(f"{field} bounds must preserve integer semantics")
+
+
+def _validate_histogram_item(
+    key: object,
+    value: object,
+    field: str,
+    *,
+    require_nonempty: bool = False,
+) -> int:
+    if not isinstance(key, str):
+        raise ValueError(f"{field} keys must be strings")
+    if require_nonempty:
+        if not key:
+            raise ValueError(f"{field} keys must not be empty")
+    elif _KEYFRAME_TOKEN.fullmatch(key) is None:
+        raise ValueError(f"{field} keys must be decimal indices")
+    return int(_finite_number(value, f"{field} value", minimum=0, integer=True))
 
 
 def _integer(mapping: Mapping[str, object], key: str, *, minimum: int = 0) -> int:
@@ -339,17 +481,6 @@ def _validate_payload_headers(payload: Mapping[str, object]) -> tuple[Mapping[st
         raise ValueError("mode_scalars.window_count is required")
     _finite_number(mode_scalars["window_count"], "mode_scalars.window_count", minimum=0, integer=True)
     return _validated_observations(payload.get("segmentation_summaries"))
-
-
-def _parse_keyframes(raw: object) -> tuple[int, ...]:
-    if not isinstance(raw, str):
-        raise ValueError("window_reference_keyframes must be a string")
-    if raw == "":
-        return ()
-    tokens = tuple(raw.split(","))
-    if any(not _KEYFRAME_TOKEN.fullmatch(token) for token in tokens):
-        raise ValueError("window_reference_keyframes must contain decimal indices")
-    return tuple(int(token) for token in tokens)
 
 
 def _aggregate_enabled(

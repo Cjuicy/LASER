@@ -25,6 +25,7 @@ from experiments.window_reference_campaign.results import (
     RunStatus,
     RunTimings,
     load_valid_completed_run,
+    read_run_record,
     redact_argv,
     write_campaign_metadata,
     write_run_record,
@@ -164,6 +165,93 @@ def test_disabled_refinement_is_not_fallback_or_zero_keyframe_performance():
     assert summary.applied_frame_count is None
     assert summary.applied_frame_rate is None
     assert summary.fallback_reason_histogram is None
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("keyframe_index_histogram", {"0": 1}),
+        ("keyframe_index_records", ("0",)),
+    ],
+)
+def test_disabled_summary_rejects_refinement_only_fields(field, value):
+    values = dict(_summary(False).__dict__)
+    values[field] = value
+    with pytest.raises(ValueError, match="disabled refinement"):
+        DiagnosticsSummary(**values)
+
+
+def test_disabled_summary_round_trip_writes_null_refinement_fields(tmp_path):
+    record = make_success_record()
+    path = write_run_record(tmp_path / "run.json", record)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    diagnostics = payload["diagnostics"]
+    assert diagnostics["keyframe_index_histogram"] is None
+    assert diagnostics["keyframe_index_records"] is None
+    restored = read_run_record(path)
+    assert restored == record
+
+    paths = write_summaries(
+        (record,),
+        {
+            (
+                record.identity_seed.dataset,
+                record.identity_seed.scene,
+                "f000000-000002-s1",
+                record.run_id,
+            ): record.identity_seed,
+        },
+        tmp_path / "summary",
+    )
+    row = next(csv.DictReader(paths.diagnostics_csv.open(newline="", encoding="utf-8")))
+    assert row["keyframe_index_histogram"] == ""
+    assert row["keyframe_index_records"] == ""
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("keyframe_index_histogram", {"0": 1}),
+        ("keyframe_index_records", ["0"]),
+    ],
+)
+def test_disabled_persisted_refinement_fields_are_rejected_on_read_and_resume(
+    tmp_path, field, value
+):
+    record = make_success_record()
+    path = write_run_record(tmp_path / "run.json", record)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["diagnostics"][field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="disabled refinement"):
+        read_run_record(path)
+    with pytest.raises(ValueError, match="disabled refinement"):
+        load_valid_completed_run(path, record.identity_seed)
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda item: item["region_count"].update(minimum=-1), "region_count"),
+        (lambda item: item["keyframe_count"].update(minimum=-1), "keyframe_count"),
+        (lambda item: item["coverage_ratio"].update(maximum=2), "coverage_ratio"),
+        (lambda item: item["region_reduction_relative"].update(maximum=2), "region_reduction_relative"),
+        (lambda item: item.update(candidate_edge_total=-1), "candidate_edge_total"),
+        (lambda item: item.update(applied_frame_count=3), "applied_frame_count"),
+        (lambda item: item.update(keyframe_index_histogram={"bad": 1}), "keyframe_index_histogram"),
+        (lambda item: item.update(keyframe_index_records="0"), "keyframe_index_records"),
+    ],
+)
+def test_read_and_resume_reject_corrupt_persisted_diagnostics(tmp_path, mutate, match):
+    record = make_success_record(enabled=True)
+    path = write_run_record(tmp_path / "run.json", record)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mutate(payload["diagnostics"])
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        read_run_record(path)
+    with pytest.raises(ValueError, match=match):
+        load_valid_completed_run(path, record.identity_seed)
 
 
 def test_enabled_diagnostics_count_fallbacks_only_for_non_keyframes():
