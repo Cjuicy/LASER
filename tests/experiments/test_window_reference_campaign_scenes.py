@@ -433,6 +433,40 @@ def test_raw_sevenscenes_projected_depth_mutation_invalidates_existing_staging(t
         stage_scene(scene, tmp_path / "campaign")
 
 
+def test_raw_sevenscenes_keeps_preexisting_empty_workspace_after_success(tmp_path):
+    scene, _ = _raw_sevenscenes_scene(tmp_path)
+    workspace = tmp_path / "caller-workspace"
+    workspace.mkdir()
+
+    _raw_sevenscenes_gt(scene, workspace)
+
+    assert workspace.is_dir()
+    assert tuple(workspace.iterdir()) == ()
+
+
+def test_raw_sevenscenes_keeps_preexisting_empty_workspace_after_failure(tmp_path):
+    scene, scene_dir = _raw_sevenscenes_scene(tmp_path)
+    workspace = tmp_path / "caller-workspace"
+    workspace.mkdir()
+    (scene_dir / "frame-000000.depth.png").unlink()
+    (scene_dir / "frame-000000.depth.proj.png").unlink()
+
+    with pytest.raises(FileNotFoundError):
+        _raw_sevenscenes_gt(scene, workspace)
+
+    assert workspace.is_dir()
+    assert tuple(workspace.iterdir()) == ()
+
+
+def test_raw_sevenscenes_removes_workspace_created_by_this_call(tmp_path):
+    scene, _ = _raw_sevenscenes_scene(tmp_path)
+    workspace = tmp_path / "caller-workspace"
+
+    _raw_sevenscenes_gt(scene, workspace)
+
+    assert not workspace.exists()
+
+
 def test_resolve_scene_rejects_short_approved_map_for_nonstandard_slice(tmp_path):
     root = tmp_path / "NeuralRGBD/thin_geometry"
     for frame_id in (0, 10, 20):

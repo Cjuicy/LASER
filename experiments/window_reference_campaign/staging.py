@@ -487,7 +487,14 @@ def _raw_sevenscenes_gt(
     scene_dir = root / scene.scene
     ids = np.asarray(scene.selection.source_frame_ids, dtype=np.int64)
     workspace = workspace.resolve(strict=False)
-    workspace.mkdir(parents=True, exist_ok=True)
+    try:
+        workspace.mkdir(parents=True)
+    except FileExistsError:
+        if not workspace.is_dir():
+            raise
+        created_here = False
+    else:
+        created_here = True
     scratch: Path | None = None
     try:
         scratch = Path(tempfile.mkdtemp(prefix=".sevenscenes-depth-", dir=str(workspace)))
@@ -515,10 +522,11 @@ def _raw_sevenscenes_gt(
     finally:
         if scratch is not None:
             shutil.rmtree(scratch, ignore_errors=True)
-        try:
-            workspace.rmdir()
-        except OSError:
-            pass
+        if created_here:
+            try:
+                workspace.rmdir()
+            except OSError:
+                pass
 
 
 def _validate_raw_dataset_output(
