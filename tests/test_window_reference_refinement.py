@@ -10,6 +10,14 @@ from inference_engine.segmentation.window_reference import (
     _centered_axis,
     _confidence_mask_and_quality,
     _confidence_probability,
+    _RegionMapping,
+    _adjacent_region_edges,
+    _dominant_region_mappings,
+    _MergeEdge,
+    _PairProjection,
+    _ReferenceSelection,
+    _merge_region_components,
+    _merge_vote_edges,
     _project_pair,
     _select_references,
 )
@@ -66,6 +74,23 @@ def _identity_fixture(frame_count=2):
         )
         for _ in range(frame_count)
     ]
+    return results, point_maps, camera_poses, confidence, intrinsic
+
+
+def _two_region_identity_fixture():
+    results, point_maps, camera_poses, confidence, intrinsic = _identity_fixture()
+    target_labels = np.array(
+        [
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+        ],
+        dtype=np.intp,
+    )
+    results[1] = SegmentationResult(
+        target_labels,
+        {"method": "fixture", "region_count": 2, "custom": "kept"},
+    )
     return results, point_maps, camera_poses, confidence, intrinsic
 
 
@@ -290,6 +315,202 @@ def test_enabled_fallback_diagnostics_are_complete_finite_scalars():
         assert type(diagnostics[key]) is expected_type
         if expected_type is float:
             assert np.isfinite(diagnostics[key])
+
+
+def test_enabled_refiner_merges_adjacent_target_regions_and_preserves_keyframe():
+    results, point_maps, camera_poses, confidence, intrinsic = (
+        _two_region_identity_fixture()
+    )
+    original_labels = [result.labels.copy() for result in results]
+    original_diagnostics = [dict(result.diagnostics) for result in results]
+
+    overrides = (
+        "segmentation.window_reference.sampling_stride=1",
+        "segmentation.window_reference.min_region_correspondences=1",
+    )
+    first = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=intrinsic,
+        overrides=overrides,
+    )
+    second = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=intrinsic,
+        overrides=overrides,
+    )
+
+    np.testing.assert_array_equal(first[0].labels, original_labels[0])
+    np.testing.assert_array_equal(first[1].labels, np.zeros((3, 3), dtype=np.intp))
+    assert first[1].labels.dtype == np.intp
+    assert np.unique(first[1].labels).tolist() == [0]
+    np.testing.assert_array_equal(first[0].labels, second[0].labels)
+    np.testing.assert_array_equal(first[1].labels, second[1].labels)
+    assert [result.diagnostics for result in first] == [
+        result.diagnostics for result in second
+    ]
+
+    assert first[0].diagnostics["window_reference_is_keyframe"] is True
+    assert first[0].diagnostics["window_reference_applied"] is False
+    assert first[1].diagnostics["window_reference_is_keyframe"] is False
+    assert first[1].diagnostics["window_reference_applied"] is True
+    assert first[1].diagnostics["window_reference_fallback"] == "none"
+    assert first[1].diagnostics["window_reference_regions_before"] == 2
+    assert first[1].diagnostics["window_reference_regions_after"] == 1
+    assert first[1].diagnostics["region_count"] == 1
+    assert first[1].diagnostics["window_reference_accepted_edges"] == 1
+    assert first[1].diagnostics["window_reference_candidate_edges"] == 1
+    assert first[1].diagnostics["window_reference_keyframes"] == "0"
+    assert first[1].diagnostics["window_reference_keyframe_count"] == 1
+
+    expected_types = {
+        "window_reference_applied": bool,
+        "window_reference_keyframes": str,
+        "window_reference_keyframe_count": int,
+        "window_reference_is_keyframe": bool,
+        "window_reference_coverage_ratio": float,
+        "window_reference_regions_before": int,
+        "window_reference_regions_after": int,
+        "window_reference_candidate_edges": int,
+        "window_reference_accepted_edges": int,
+        "window_reference_conflict_edges": int,
+        "window_reference_projected_samples": int,
+        "window_reference_occluded_samples": int,
+        "window_reference_depth_rejected_samples": int,
+        "window_reference_fallback": str,
+    }
+    for result in first:
+        for key, expected_type in expected_types.items():
+            assert type(result.diagnostics[key]) is expected_type
+            if expected_type is float:
+                assert np.isfinite(result.diagnostics[key])
+
+    for result, labels, diagnostics in zip(
+        results, original_labels, original_diagnostics, strict=True
+    ):
+        np.testing.assert_array_equal(result.labels, labels)
+        assert dict(result.diagnostics) == diagnostics
+
+
+def test_enabled_refiner_uses_insufficient_support_fallback_without_splitting():
+    results, point_maps, camera_poses, confidence, intrinsic = (
+        _two_region_identity_fixture()
+    )
+    refined = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=intrinsic,
+        overrides=(
+            "segmentation.window_reference.sampling_stride=1",
+            "segmentation.window_reference.min_region_correspondences=9",
+        ),
+    )
+
+    np.testing.assert_array_equal(refined[1].labels, results[1].labels)
+    assert refined[1].diagnostics["window_reference_fallback"] == (
+        "insufficient_support"
+    )
+    assert refined[1].diagnostics["window_reference_regions_before"] == 2
+    assert refined[1].diagnostics["window_reference_regions_after"] == 2
+    assert refined[1].diagnostics["region_count"] == 2
+
+
+def test_enabled_refiner_reports_conflict_only_when_all_eligible_unions_conflict(
+    monkeypatch,
+):
+    height, width = 5, 2
+    intrinsic = torch.eye(3)
+    rows, columns = np.indices((height, width))
+    points = np.stack(
+        [columns.astype(np.float64), rows.astype(np.float64), np.ones((height, width))],
+        axis=-1,
+    )
+    point_maps = torch.from_numpy(np.stack([points, points, points]))
+    camera_poses = torch.eye(4).repeat(3, 1, 1)
+    confidence = torch.zeros((3, height, width))
+    target_labels = np.repeat(np.arange(2, dtype=np.intp)[None, :], height, axis=0)
+    source_zero = np.zeros((height, width), dtype=np.intp)
+    source_one = np.zeros((height, width), dtype=np.intp)
+    source_one.flat[1] = 1
+    results = [
+        SegmentationResult(source_zero, {"method": "fixture", "region_count": 1}),
+        SegmentationResult(source_one, {"method": "fixture", "region_count": 2}),
+        SegmentationResult(target_labels, {"method": "fixture", "region_count": 2}),
+    ]
+
+    target_by_region = {
+        region: np.flatnonzero(target_labels.reshape(-1) == region)
+        for region in range(2)
+    }
+
+    def projection(assignments, *, score):
+        source_indices = []
+        target_indices = []
+        for target_region, source_index, full in assignments:
+            target_region_indices = target_by_region[target_region]
+            if not full:
+                target_region_indices = target_region_indices[:1]
+            target_indices.append(target_region_indices)
+            source_indices.append(
+                np.full(target_region_indices.shape, source_index, dtype=np.int64)
+            )
+        source_indices = np.concatenate(source_indices)
+        target_indices = np.concatenate(target_indices)
+        return _PairProjection(
+            source_indices,
+            target_indices,
+            np.ones(target_indices.shape, dtype=np.float64),
+            score=score,
+            projected_samples=int(target_indices.size),
+        )
+
+    selected = _ReferenceSelection(
+        indices=(0, 1),
+        best_scores=np.array([0.0, 0.0, 1.0]),
+        pair_projections=(
+            (
+                0,
+                2,
+                projection(((0, 0, True), (1, 0, True)), score=1.0),
+            ),
+            (
+                1,
+                2,
+                projection(((0, 0, True), (1, 1, True)), score=0.2),
+            ),
+        ),
+        coverage_ratio=1.0,
+    )
+    monkeypatch.setattr(
+        "inference_engine.segmentation.window_reference._select_references",
+        lambda **kwargs: selected,
+    )
+
+    refined = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=intrinsic,
+        overrides=(
+            "segmentation.window_reference.sampling_stride=1",
+            "segmentation.window_reference.min_region_correspondences=1",
+        ),
+    )
+
+    np.testing.assert_array_equal(refined[2].labels, results[2].labels)
+    assert refined[2].diagnostics["window_reference_fallback"] == "conflict_only"
+    assert refined[2].diagnostics["window_reference_accepted_edges"] == 0
+    assert refined[2].diagnostics["window_reference_conflict_edges"] == 1
+    assert refined[2].diagnostics["window_reference_candidate_edges"] == 1
+    assert refined[2].diagnostics["window_reference_regions_after"] == 2
 
 
 def test_intrinsic_compatibility_uses_full_matrix_including_skew():
@@ -723,3 +944,147 @@ def test_projection_reports_perfect_pair_score_and_zero_denominators():
     assert empty_pair.geometry_ratio == pytest.approx(0.0)
     assert empty_pair.mean_confidence == pytest.approx(0.0)
     assert empty_pair.score == pytest.approx(0.0)
+
+
+def test_dominant_mapping_requires_unique_hit_minimum():
+    labels = np.zeros((2, 2), dtype=np.intp)
+    evidence = [(0, 7, 1.0), (1, 7, 1.0), (2, 7, 1.0)]
+
+    mapping = _dominant_region_mappings(
+        labels,
+        evidence,
+        sampling_stride=1,
+        min_region_correspondences=4,
+        min_region_coverage=0.1,
+        min_region_purity=0.8,
+    )
+
+    assert mapping == {}
+
+
+def test_dominant_mapping_uses_stride_coverage_and_support_minimum():
+    labels = np.zeros((2, 2), dtype=np.intp)
+    evidence = [(0, 7, 2.0)]
+
+    mapping = _dominant_region_mappings(
+        labels,
+        evidence,
+        sampling_stride=2,
+        min_region_correspondences=1,
+        min_region_coverage=1.0,
+        min_region_purity=0.1,
+    )
+
+    assert mapping[0].source_label == 7
+    assert mapping[0].coverage == pytest.approx(1.0)
+    assert mapping[0].purity == pytest.approx(1.0)
+    assert mapping[0].support == pytest.approx(1.0)
+
+
+def test_dominant_mapping_requires_purity_and_breaks_weight_ties_by_label():
+    labels = np.zeros((1, 4), dtype=np.intp)
+    evidence = [(0, 9, 1.0), (1, 9, 1.0), (2, 3, 2.0), (3, 3, 1.0)]
+
+    mapping = _dominant_region_mappings(
+        labels,
+        evidence,
+        sampling_stride=1,
+        min_region_correspondences=1,
+        min_region_coverage=0.1,
+        min_region_purity=0.8,
+    )
+
+    assert mapping == {}
+
+    tied = _dominant_region_mappings(
+        labels,
+        [(0, 9, 1.0), (1, 3, 1.0)],
+        sampling_stride=1,
+        min_region_correspondences=1,
+        min_region_coverage=0.1,
+        min_region_purity=0.5,
+    )
+    assert tied[0].source_label == 3
+    assert tied[0].purity == pytest.approx(0.5)
+
+
+def test_adjacent_region_edges_are_literal_four_connected_and_sorted():
+    labels = np.array(
+        [
+            [0, 0, 1],
+            [0, 2, 1],
+            [3, 3, 2],
+        ],
+        dtype=np.intp,
+    )
+
+    assert _adjacent_region_edges(labels) == (
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 2),
+        (2, 3),
+    )
+
+
+def test_merge_votes_are_weighted_and_abstain_on_unreliable_mapping():
+    labels = np.array([[0, 1]], dtype=np.intp)
+    reliable = {
+        0: _RegionMapping(5, 2, 1.0, 0.9, 0.9),
+        1: _RegionMapping(5, 2, 1.0, 0.9, 0.9),
+    }
+    disagreement = {
+        0: _RegionMapping(5, 2, 1.0, 0.9, 0.9),
+        1: _RegionMapping(6, 2, 1.0, 0.9, 0.9),
+    }
+
+    eligible = _merge_vote_edges(
+        labels,
+        [(1.0, reliable), (0.2, disagreement)],
+        merge_vote_threshold=0.80,
+    )
+
+    assert len(eligible) == 1
+    assert eligible[0].label_pair == (0, 1)
+    assert eligible[0].merge_evidence == pytest.approx(0.9)
+    assert eligible[0].separate_evidence == pytest.approx(0.18)
+    assert eligible[0].ratio == pytest.approx(0.9 / 1.08)
+
+    abstained = _merge_vote_edges(
+        labels,
+        [(1.0, {0: reliable[0]})],
+        merge_vote_threshold=0.0,
+    )
+    assert abstained == ()
+
+
+def test_component_union_keeps_nonadjacent_regions_separate_and_rejects_conflict():
+    labels = np.array([[0, 1, 2, 1, 0]], dtype=np.intp)
+    same_reference = {
+        0: _RegionMapping(4, 1, 1.0, 1.0, 1.0),
+        2: _RegionMapping(4, 1, 1.0, 1.0, 1.0),
+    }
+    assert _merge_vote_edges(
+        labels,
+        [(1.0, same_reference)],
+        merge_vote_threshold=0.8,
+    ) == ()
+
+    edges = (
+        # The first edge is accepted; the second conflicts on reference 0.
+        _MergeEdge((0, 1), 1.0, 0.0, 1.0),
+        _MergeEdge((1, 2), 0.9, 0.0, 0.9),
+    )
+    roots, accepted, conflicts = _merge_region_components(
+        3,
+        edges,
+        {
+            0: {0: 4},
+            1: {0: 4, 1: 8},
+            2: {0: 5, 1: 8},
+        },
+    )
+
+    np.testing.assert_array_equal(roots, [0, 0, 2])
+    assert accepted == 1
+    assert conflicts == 1

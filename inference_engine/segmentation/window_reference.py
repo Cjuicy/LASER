@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Iterable, Mapping, Protocol
 
 import numpy as np
 import torch
 
-from inference_engine.segmentation.base import SegmentationResult
+from inference_engine.segmentation.base import SegmentationResult, compact_labels
 from pipeline.config import ConfidenceQuantileMethod, SegmentationConfig
 
 
@@ -240,6 +240,292 @@ class _PairProjection:
             value = np.asarray(getattr(self, name), dtype=dtype).copy()
             value.setflags(write=False)
             object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True)
+class _RegionMapping:
+    source_label: int
+    unique_hits: int
+    coverage: float
+    purity: float
+    support: float
+
+
+def _dominant_region_mappings(
+    target_labels: np.ndarray,
+    evidence: Iterable[tuple[int, int, float]],
+    *,
+    sampling_stride: int,
+    min_region_correspondences: int,
+    min_region_coverage: float,
+    min_region_purity: float,
+) -> dict[int, _RegionMapping]:
+    """Return reliable dominant source labels for sparse target evidence."""
+
+    labels = np.asarray(target_labels)
+    if labels.ndim != 2:
+        raise ValueError("target_labels must be two-dimensional")
+    if sampling_stride <= 0 or min_region_correspondences <= 0:
+        raise ValueError("region mapping integer thresholds must be positive")
+
+    region_area = {
+        int(label): int(count)
+        for label, count in zip(*np.unique(labels, return_counts=True), strict=True)
+    }
+    pair_weights: dict[tuple[int, int], float] = {}
+    target_hits: dict[int, set[int]] = {}
+    flat_size = int(labels.size)
+    for item in evidence:
+        try:
+            target_pixel, source_label, weight = item
+            target_pixel = int(target_pixel)
+            source_label = int(source_label)
+            weight = float(weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "region evidence must contain pixel, label, weight"
+            ) from exc
+        if target_pixel < 0 or target_pixel >= flat_size:
+            continue
+        if not np.isfinite(weight) or weight < 0.0:
+            continue
+        target_region = int(labels.flat[target_pixel])
+        target_hits.setdefault(target_region, set()).add(target_pixel)
+        key = (target_region, source_label)
+        pair_weights[key] = pair_weights.get(key, 0.0) + weight
+
+    mappings: dict[int, _RegionMapping] = {}
+    for target_region, area in region_area.items():
+        hits = len(target_hits.get(target_region, ()))
+        if hits < min_region_correspondences:
+            continue
+        source_weights = {
+            source_label: weight
+            for (mapped_region, source_label), weight in pair_weights.items()
+            if mapped_region == target_region
+        }
+        total_weight = float(sum(source_weights.values()))
+        if total_weight <= 0.0 or not np.isfinite(total_weight):
+            continue
+        dominant_weight = max(source_weights.values())
+        dominant_label = min(
+            source_label
+            for source_label, weight in source_weights.items()
+            if weight == dominant_weight
+        )
+        coverage = float(
+            min(1.0, hits * float(sampling_stride**2) / float(area))
+        )
+        purity = float(dominant_weight / total_weight)
+        support = float(min(coverage, purity))
+        if coverage < min_region_coverage or purity < min_region_purity:
+            continue
+        mappings[target_region] = _RegionMapping(
+            source_label=int(dominant_label),
+            unique_hits=hits,
+            coverage=coverage,
+            purity=purity,
+            support=support,
+        )
+    return mappings
+
+
+@dataclass(frozen=True)
+class _MergeEdge:
+    label_pair: tuple[int, int]
+    merge_evidence: float
+    separate_evidence: float
+    ratio: float
+
+
+def _adjacent_region_edges(labels: np.ndarray) -> tuple[tuple[int, int], ...]:
+    labels = np.asarray(labels)
+    if labels.ndim != 2:
+        raise ValueError("labels must be two-dimensional")
+    pairs: list[np.ndarray] = []
+    for left, right in (
+        (labels[:, :-1], labels[:, 1:]),
+        (labels[:-1, :], labels[1:, :]),
+    ):
+        different = left != right
+        if np.any(different):
+            lower = np.minimum(left[different], right[different]).astype(np.int64)
+            higher = np.maximum(left[different], right[different]).astype(np.int64)
+            pairs.append(np.column_stack((lower, higher)))
+    if not pairs:
+        return ()
+    unique_pairs = np.unique(np.concatenate(pairs, axis=0), axis=0)
+    return tuple((int(pair[0]), int(pair[1])) for pair in unique_pairs)
+
+
+def _merge_vote_edges(
+    target_labels: np.ndarray,
+    reference_mappings: Iterable[tuple[float, Mapping[int, _RegionMapping]]],
+    *,
+    merge_vote_threshold: float,
+) -> tuple[_MergeEdge, ...]:
+    """Build sorted adjacent edges from reliable per-reference mappings."""
+
+    merge_totals: dict[tuple[int, int], float] = {}
+    separate_totals: dict[tuple[int, int], float] = {}
+    for pair_score, mappings in reference_mappings:
+        try:
+            score = float(pair_score)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(score) or score <= 0.0:
+            continue
+        for label_pair in _adjacent_region_edges(target_labels):
+            mapping_a = mappings.get(label_pair[0])
+            mapping_b = mappings.get(label_pair[1])
+            if mapping_a is None or mapping_b is None:
+                continue
+            support = min(float(mapping_a.support), float(mapping_b.support))
+            if not np.isfinite(support) or support <= 0.0:
+                continue
+            evidence = score * support
+            totals = (
+                merge_totals if mapping_a.source_label == mapping_b.source_label
+                else separate_totals
+            )
+            totals[label_pair] = totals.get(label_pair, 0.0) + evidence
+
+    eligible: list[_MergeEdge] = []
+    for label_pair in _adjacent_region_edges(target_labels):
+        merge_evidence = float(merge_totals.get(label_pair, 0.0))
+        separate_evidence = float(separate_totals.get(label_pair, 0.0))
+        if merge_evidence <= 0.0:
+            continue
+        denominator = merge_evidence + separate_evidence
+        ratio = float(merge_evidence / denominator)
+        if ratio < merge_vote_threshold:
+            continue
+        eligible.append(
+            _MergeEdge(
+                label_pair=label_pair,
+                merge_evidence=merge_evidence,
+                separate_evidence=separate_evidence,
+                ratio=ratio,
+            )
+        )
+    eligible.sort(
+        key=lambda edge: (
+            -edge.ratio,
+            -edge.merge_evidence,
+            edge.label_pair[0],
+            edge.label_pair[1],
+        )
+    )
+    return tuple(eligible)
+
+
+def _merge_region_components(
+    region_count: int,
+    edges: Iterable[_MergeEdge],
+    signatures: Mapping[int, Mapping[int, int]],
+) -> tuple[np.ndarray, int, int]:
+    """Union compatible region signatures and return roots and edge counts."""
+
+    if region_count < 0:
+        raise ValueError("region_count must be non-negative")
+    parent = list(range(region_count))
+    component_signatures = {
+        region: dict(signatures.get(region, {})) for region in range(region_count)
+    }
+
+    def find(region: int) -> int:
+        root = region
+        while parent[root] != root:
+            root = parent[root]
+        while parent[region] != region:
+            next_region = parent[region]
+            parent[region] = root
+            region = next_region
+        return root
+
+    ordered_edges = sorted(
+        edges,
+        key=lambda edge: (
+            -float(edge.ratio),
+            -float(edge.merge_evidence),
+            edge.label_pair[0],
+            edge.label_pair[1],
+        ),
+    )
+    accepted_edges = 0
+    conflict_edges = 0
+    for edge in ordered_edges:
+        left, right = edge.label_pair
+        if not (0 <= left < region_count and 0 <= right < region_count):
+            raise ValueError("merge edge region labels must be in bounds")
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            continue
+        left_signature = component_signatures[left_root]
+        right_signature = component_signatures[right_root]
+        if any(
+            reference in right_signature
+            and right_signature[reference] != source_label
+            for reference, source_label in left_signature.items()
+        ):
+            conflict_edges += 1
+            continue
+        root = min(left_root, right_root)
+        child = max(left_root, right_root)
+        parent[child] = root
+        merged_signature = dict(left_signature)
+        merged_signature.update(right_signature)
+        component_signatures[root] = merged_signature
+        component_signatures[child] = {}
+        accepted_edges += 1
+
+    roots = np.fromiter((find(region) for region in range(region_count)), dtype=np.intp)
+    return roots, accepted_edges, conflict_edges
+
+
+def _projection_region_mappings(
+    *,
+    source_labels: np.ndarray,
+    target_labels: np.ndarray,
+    projection: object,
+    sampling_stride: int,
+    min_region_correspondences: int,
+    min_region_coverage: float,
+    min_region_purity: float,
+) -> dict[int, _RegionMapping]:
+    source_flat = np.asarray(
+        getattr(projection, "source_flat_indices", ()), dtype=np.int64
+    ).reshape(-1)
+    target_flat = np.asarray(
+        getattr(projection, "target_flat_indices", ()), dtype=np.int64
+    ).reshape(-1)
+    weights = np.asarray(
+        getattr(projection, "correspondence_weights", ()), dtype=np.float64
+    ).reshape(-1)
+    if not (source_flat.size == target_flat.size == weights.size):
+        raise ValueError("pair projection arrays must have equal length")
+    source_labels = np.asarray(source_labels)
+    target_labels = np.asarray(target_labels)
+    evidence = (
+        (int(target_pixel), int(source_labels.flat[source_pixel]), float(weight))
+        for source_pixel, target_pixel, weight in zip(
+            source_flat,
+            target_flat,
+            weights,
+            strict=True,
+        )
+        if 0 <= int(source_pixel) < source_labels.size
+        and 0 <= int(target_pixel) < target_labels.size
+    )
+    return _dominant_region_mappings(
+        target_labels,
+        evidence,
+        sampling_stride=sampling_stride,
+        min_region_correspondences=min_region_correspondences,
+        min_region_coverage=min_region_coverage,
+        min_region_purity=min_region_purity,
+    )
 
 
 @dataclass(frozen=True)
@@ -807,6 +1093,7 @@ class WindowReferenceRefiner:
 
         selected_masks = []
         qualities = []
+        probabilities = []
         for frame_index in range(frame_count):
             mask, quality = _confidence_mask_and_quality(
                 points[frame_index],
@@ -816,14 +1103,184 @@ class WindowReferenceRefiner:
             )
             selected_masks.append(mask)
             qualities.append(quality)
-        del selected_masks, intrinsic, poses
+            probabilities.append(_confidence_probability(logits[frame_index]))
         if not any(quality > 0.0 for quality in qualities):
             return _fallback_results(results, "no_reference")
 
-        # Task 3 establishes the preparation and fallback boundary. Sparse
-        # projection, adaptive reference selection, and region merging are
-        # added by the following tasks.
-        return _fallback_results(results, "no_reference")
+        height, width = points.shape[1:3]
+        source_rows = _centered_axis(
+            height,
+            self.window_reference.sampling_stride,
+        )
+        source_columns = _centered_axis(
+            width,
+            self.window_reference.sampling_stride,
+        )
+
+        def evaluate(source: int, target: int) -> _PairProjection:
+            return _project_pair(
+                source_points=points[source],
+                target_points=points[target],
+                source_pose=poses[source],
+                target_pose=poses[target],
+                source_mask=selected_masks[source],
+                target_mask=selected_masks[target],
+                source_probability=probabilities[source],
+                target_probability=probabilities[target],
+                intrinsic=intrinsic,
+                source_rows=source_rows,
+                source_columns=source_columns,
+                sampling_stride=self.window_reference.sampling_stride,
+                relative_depth_tolerance=(
+                    self.window_reference.relative_depth_tolerance
+                ),
+            )
+
+        selection = _select_references(
+            qualities=np.asarray(qualities, dtype=np.float64),
+            frame_count=frame_count,
+            evaluate=evaluate,
+            config=self.window_reference,
+        )
+        if not selection.indices:
+            return _fallback_results(results, "no_reference")
+
+        selected_indices = set(selection.indices)
+        keyframes = ",".join(str(index) for index in selection.indices)
+        projections_by_target: dict[int, list[tuple[int, object]]] = {}
+        for source, target, projection in selection.pair_projections:
+            source = int(source)
+            target = int(target)
+            if (
+                source in selected_indices
+                and source != target
+                and 0 <= target < frame_count
+            ):
+                projections_by_target.setdefault(target, []).append(
+                    (source, projection)
+                )
+
+        refined_results: list[SegmentationResult] = []
+        for target in range(frame_count):
+            initial_labels = np.asarray(results[target].labels)
+            regions_before = int(np.unique(initial_labels).size)
+            is_keyframe = target in selected_indices
+            target_projections = sorted(
+                projections_by_target.get(target, ()),
+                key=lambda item: item[0],
+            )
+            projected_samples = sum(
+                int(getattr(projection, "projected_samples", 0))
+                for _, projection in target_projections
+            )
+            occluded_samples = sum(
+                int(getattr(projection, "occluded_samples", 0))
+                for _, projection in target_projections
+            )
+            depth_rejected_samples = sum(
+                int(getattr(projection, "depth_rejected_samples", 0))
+                for _, projection in target_projections
+            )
+
+            mappings: list[tuple[int, float, dict[int, _RegionMapping]]] = []
+            if not is_keyframe:
+                for source, projection in target_projections:
+                    source_labels = np.asarray(results[source].labels)
+                    region_mappings = _projection_region_mappings(
+                        source_labels=source_labels,
+                        target_labels=initial_labels,
+                        projection=projection,
+                        sampling_stride=self.window_reference.sampling_stride,
+                        min_region_correspondences=(
+                            self.window_reference.min_region_correspondences
+                        ),
+                        min_region_coverage=self.window_reference.min_region_coverage,
+                        min_region_purity=self.window_reference.min_region_purity,
+                    )
+                    mappings.append(
+                        (
+                            source,
+                            _projection_score(projection),
+                            region_mappings,
+                        )
+                    )
+
+            reference_votes = [
+                (pair_score, region_mappings)
+                for _, pair_score, region_mappings in mappings
+            ]
+            candidate_edges = (
+                _merge_vote_edges(
+                    initial_labels,
+                    reference_votes,
+                    merge_vote_threshold=self.window_reference.merge_vote_threshold,
+                )
+                if not is_keyframe
+                else ()
+            )
+            signatures: dict[int, dict[int, int]] = {
+                int(region): {}
+                for region in np.unique(initial_labels)
+            }
+            for source, _, region_mappings in mappings:
+                for region, region_mapping in region_mappings.items():
+                    signatures[int(region)][source] = region_mapping.source_label
+            roots, accepted_edges, conflict_edges = (
+                _merge_region_components(
+                    regions_before,
+                    candidate_edges,
+                    signatures,
+                )
+                if not is_keyframe
+                else (
+                    np.arange(regions_before, dtype=np.intp),
+                    0,
+                    0,
+                )
+            )
+
+            if is_keyframe:
+                output_labels = initial_labels.copy()
+                fallback = "none"
+            elif accepted_edges:
+                output_labels = compact_labels(roots[initial_labels]).astype(
+                    np.intp,
+                    copy=False,
+                )
+                fallback = "none"
+            else:
+                output_labels = initial_labels.copy()
+                fallback = (
+                    "conflict_only"
+                    if conflict_edges > 0
+                    else "insufficient_support"
+                )
+            regions_after = int(np.unique(output_labels).size)
+            diagnostics = {
+                **dict(results[target].diagnostics),
+                "window_reference_applied": bool(accepted_edges > 0),
+                "window_reference_keyframes": keyframes,
+                "window_reference_keyframe_count": int(len(selection.indices)),
+                "window_reference_is_keyframe": bool(is_keyframe),
+                "window_reference_coverage_ratio": float(
+                    np.clip(selection.coverage_ratio, 0.0, 1.0)
+                ),
+                "window_reference_regions_before": regions_before,
+                "window_reference_regions_after": regions_after,
+                "window_reference_candidate_edges": int(len(candidate_edges)),
+                "window_reference_accepted_edges": int(accepted_edges),
+                "window_reference_conflict_edges": int(conflict_edges),
+                "window_reference_projected_samples": int(projected_samples),
+                "window_reference_occluded_samples": int(occluded_samples),
+                "window_reference_depth_rejected_samples": int(
+                    depth_rejected_samples
+                ),
+                "window_reference_fallback": fallback,
+                "region_count": regions_after,
+            }
+            refined_results.append(SegmentationResult(output_labels, diagnostics))
+
+        return refined_results
 
 
 def build_window_reference_refiner(
