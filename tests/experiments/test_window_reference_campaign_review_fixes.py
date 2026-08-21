@@ -14,7 +14,7 @@ from evaluation.pointcloud.config import PointCloudEvaluationConfig
 from evaluation.pointcloud.evaluator import evaluate_point_maps
 from evaluation.pointcloud.geometry_metrics import BackendResult
 from pipeline.artifacts import PointMapEstimate
-from pipeline.config import ReconstructionMode
+from pipeline.config import ReconstructionMode, SegmentationMethod
 
 import experiments.window_reference_campaign.evaluation as campaign_evaluation
 from experiments.window_reference_campaign.config import DatasetKind, EvaluationKind
@@ -30,6 +30,7 @@ from experiments.window_reference_campaign.staging import (
     preview_staging_manifest,
     stage_scene,
 )
+from experiments.window_reference_campaign.synthetic import build_synthetic_fixture
 
 
 class _LiteralBackend:
@@ -90,6 +91,43 @@ def test_staged_scene_rejects_mixed_evaluation_payload(tmp_path):
             dataset=DatasetKind.KITTI,
             poses_path=poses,
         )
+
+
+@pytest.mark.parametrize(
+    "method",
+    [SegmentationMethod.DEPTH, SegmentationMethod.GEOMETRY, SegmentationMethod.ATOMIC],
+)
+def test_synthetic_rejection_pose_is_se3_and_diagnostics_are_deterministic(method):
+    first = build_synthetic_fixture(method)
+    second = build_synthetic_fixture(method)
+
+    rejection_poses = first.rejection_poses
+    rotation = rejection_poses[:, :3, :3]
+    identity = torch.eye(3, dtype=rotation.dtype).expand_as(rotation)
+    torch.testing.assert_close(
+        rotation @ rotation.transpose(-1, -2), identity, rtol=0.0, atol=1e-6
+    )
+    torch.testing.assert_close(
+        torch.linalg.det(rotation),
+        torch.ones(rotation.shape[0], dtype=rotation.dtype),
+        rtol=0.0,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        rejection_poses[:, 3, :],
+        torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=rejection_poses.dtype).expand(
+            rejection_poses.shape[0], -1
+        ),
+        rtol=0.0,
+        atol=1e-6,
+    )
+    assert rejection_poses[1, 2, 3].item() == pytest.approx(4.0)
+    assert [item.diagnostics for item in first.merge_results] == [
+        item.diagnostics for item in second.merge_results
+    ]
+    assert [item.diagnostics for item in first.rejection_results] == [
+        item.diagnostics for item in second.rejection_results
+    ]
 
 
 def test_runner_default_dependency_dispatches_real_none_evaluator(tmp_path):

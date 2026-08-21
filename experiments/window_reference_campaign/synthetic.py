@@ -58,13 +58,20 @@ def synthetic_checkpoint_sha256() -> str:
 class SyntheticFixture:
     point_maps: torch.Tensor
     camera_poses: torch.Tensor
+    rejection_poses: torch.Tensor
     confidence: torch.Tensor
     reference_intrinsic: torch.Tensor
     merge_results: tuple[SegmentationResult, ...]
     rejection_results: tuple[SegmentationResult, ...]
 
     def __post_init__(self) -> None:
-        for name in ("point_maps", "camera_poses", "confidence", "reference_intrinsic"):
+        for name in (
+            "point_maps",
+            "camera_poses",
+            "rejection_poses",
+            "confidence",
+            "reference_intrinsic",
+        ):
             value = getattr(self, name)
             if not isinstance(value, torch.Tensor):
                 raise ValueError(f"synthetic {name} must be a tensor")
@@ -74,6 +81,8 @@ class SyntheticFixture:
             raise ValueError("synthetic point_maps must have shape (4, 33, 33, 3)")
         if self.camera_poses.shape != (_FRAME_COUNT, 4, 4):
             raise ValueError("synthetic camera_poses must have shape (4, 4, 4)")
+        if self.rejection_poses.shape != (_FRAME_COUNT, 4, 4):
+            raise ValueError("synthetic rejection_poses must have shape (4, 4, 4)")
         if self.confidence.shape != (_FRAME_COUNT, _HEIGHT, _WIDTH):
             raise ValueError("synthetic confidence must have shape (4, 33, 33)")
         if self.reference_intrinsic.shape != (3, 3):
@@ -179,15 +188,13 @@ def build_synthetic_fixture(method: SegmentationMethod) -> SyntheticFixture:
     ))
 
     # The rejection case scales complete rays on the right side, preserving
-    # their projection while changing their depth.  The anisotropic camera
-    # transform plus a small Z offset maps sparse rays onto the same target
-    # pixels, creating many-to-one winners and measurable depth rejection.
+    # their projection while changing their depth.  A separate rigid camera
+    # translation maps sparse rays onto competing target pixels, creating
+    # many-to-one winners and measurable depth rejection.
     rejection_points = point_maps.clone()
     rejection_points[2:, :, 17:, :] *= 2.0
     rejection_poses = camera_poses.clone()
-    rejection_poses[2, 0, 0] = 5.0
-    rejection_poses[2, 1, 1] = 5.0
-    rejection_poses[2, 2, 3] = 0.01
+    rejection_poses[1, 2, 3] = 4.0
     rejection_results = tuple(_refiner(method).refine(
         _results(method),
         point_maps=rejection_points,
@@ -199,6 +206,7 @@ def build_synthetic_fixture(method: SegmentationMethod) -> SyntheticFixture:
     return SyntheticFixture(
         point_maps=point_maps,
         camera_poses=camera_poses,
+        rejection_poses=rejection_poses,
         confidence=confidence,
         reference_intrinsic=intrinsic,
         merge_results=merge_results,

@@ -203,7 +203,8 @@ def test_disabled_summary_round_trip_writes_null_refinement_fields(tmp_path):
         },
         tmp_path / "summary",
     )
-    row = next(csv.DictReader(paths.diagnostics_csv.open(newline="", encoding="utf-8")))
+    with paths.diagnostics_csv.open(newline="", encoding="utf-8") as stream:
+        row = next(csv.DictReader(stream))
     assert row["keyframe_index_histogram"] == ""
     assert row["keyframe_index_records"] == ""
 
@@ -519,10 +520,8 @@ def test_summary_writes_required_atomic_csv_and_json(tmp_path):
         "completed_runs"
     ] == 6
     assert json.loads(paths.failures_json.read_text()) == {"failures": []}
-    diagnostics = {
-        row["run_id"]: row
-        for row in csv.DictReader(paths.diagnostics_csv.open(newline="", encoding="utf-8"))
-    }
+    with paths.diagnostics_csv.open(newline="", encoding="utf-8") as stream:
+        diagnostics = {row["run_id"]: row for row in csv.DictReader(stream)}
     assert diagnostics["depth__wr-off"]["unique_frame_count"] == "2"
     assert diagnostics["depth__wr-off"]["window_frame_observation_count"] == "2"
     assert "official" not in paths.trajectory_csv.read_text(encoding="utf-8").lower()
