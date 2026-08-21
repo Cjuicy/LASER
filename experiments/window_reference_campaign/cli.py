@@ -143,8 +143,9 @@ def _handle_plan(args: argparse.Namespace) -> int:
     # Keep all project imports below command dispatch so importing this module
     # remains safe in a process that intentionally blocks torch.
     previous_import_mode = os.environ.get("LASER_WINDOW_REFERENCE_IMPORT_LIGHT")
-    if args.dry_run:
-        os.environ["LASER_WINDOW_REFERENCE_IMPORT_LIGHT"] = "1"
+    # Every plan is a metadata-only operation.  In particular, publishing a
+    # normal plan.json must not pull in the Torch-backed pipeline enum module.
+    os.environ["LASER_WINDOW_REFERENCE_IMPORT_LIGHT"] = "1"
     try:
         from .config import load_campaign_config
         from .matrix import build_plan, plan_payload
@@ -387,7 +388,7 @@ def _handle_run(args: argparse.Namespace) -> int:
 
 
 def _expected_summary_seeds(loaded, plan):
-    from .matrix import build_identity_seed
+    from .matrix import build_identity_seed, identity_slice_id
     from .runner import _source_metadata
     from .scenes import resolve_scene
     from .staging import preview_staging_manifest
@@ -432,7 +433,11 @@ def _expected_summary_seeds(loaded, plan):
         key = (
             planned.dataset.value,
             planned.scene,
-            planned.slice_id,
+            identity_slice_id(
+                resolved.selection.start,
+                resolved.selection.stop,
+                resolved.selection.stride,
+            ),
             planned.variant.run_id,
         )
         expected[key] = seed
@@ -464,9 +469,8 @@ def _handle_summarize(args: argparse.Namespace) -> int:
                 if (
                     item.dataset.value,
                     item.scene,
-                    item.slice_id,
                     item.variant.run_id,
-                ) == key
+                ) == (key[0], key[1], key[3])
             )
             path = root / planned.relative_run_dir / "run.json"
             if not path.is_file():

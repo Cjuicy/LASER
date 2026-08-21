@@ -44,6 +44,7 @@ from .matrix import (
     RunIdentitySeed,
     build_identity_seed,
     complete_identity,
+    identity_slice_id,
 )
 from .results import (
     RUN_SCHEMA_VERSION,
@@ -781,7 +782,7 @@ def _identity_key(seed: RunIdentitySeed, run_id: str) -> tuple[str, str, str, st
     return (
         seed.dataset,
         seed.scene,
-        f"f{seed.frame_start:06d}-{seed.frame_stop:06d}-s{seed.frame_stride}",
+        identity_slice_id(seed.frame_start, seed.frame_stop, seed.frame_stride),
         run_id,
     )
 

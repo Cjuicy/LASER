@@ -454,6 +454,8 @@ class RuntimeConfig:
         if self.process_device != "cpu":
             raise ValueError("runtime.process_device must be cpu")
         _require_int(self.jobs, "runtime.jobs", minimum=1)
+        if self.jobs != 1:
+            raise ValueError("runtime.jobs must be exactly 1")
         _require_int(self.gpu, "runtime.gpu", minimum=0)
         if not isinstance(self.cache_policy, CachePolicy):
             raise ValueError("runtime.cache_policy is invalid")
@@ -486,6 +488,8 @@ class StorageConfig:
             if not isinstance(getattr(self, name), Path):
                 raise ValueError(f"storage.{name} must be a path")
         _require_float(self.minimum_free_gb, "storage.minimum_free_gb", minimum=0.0)
+        if float(self.minimum_free_gb) != 20.0:
+            raise ValueError("storage.minimum_free_gb must be exactly 20.0")
         _require_bool(self.keep_artifacts, "storage.keep_artifacts")
 
     def to_payload(self) -> dict[str, object]:

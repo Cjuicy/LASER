@@ -256,6 +256,21 @@ def _slice_id(start: int, stop: int | None, stride: int) -> str:
     return f"f{start:06d}-{stop_label}-s{stride}"
 
 
+def identity_slice_id(frame_start: int, frame_stop: int, frame_stride: int) -> str:
+    """Return the concrete slice key persisted in run identities and summaries."""
+
+    if (
+        type(frame_start) is not int
+        or type(frame_stop) is not int
+        or type(frame_stride) is not int
+        or frame_start < 0
+        or frame_stop <= frame_start
+        or frame_stride < 1
+    ):
+        raise ValueError("identity slice coordinates are invalid")
+    return f"f{frame_start:06d}-{frame_stop:06d}-s{frame_stride}"
+
+
 def build_plan(loaded: LoadedCampaignConfig) -> CampaignPlan:
     if not isinstance(loaded, LoadedCampaignConfig):
         raise ValueError("plan requires LoadedCampaignConfig")
@@ -389,5 +404,6 @@ __all__ = [
     "complete_identity",
     "expand_matrix",
     "identity_sha256",
+    "identity_slice_id",
     "plan_payload",
 ]

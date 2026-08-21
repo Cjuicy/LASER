@@ -18,7 +18,7 @@ from typing import Mapping, Sequence
 from inference_engine.prediction_cache.store import PredictionStoreStats
 
 from .diagnostics import DiagnosticsSummary, DistributionSummary
-from .matrix import RunIdentity, RunIdentitySeed, complete_identity
+from .matrix import RunIdentity, RunIdentitySeed, complete_identity, identity_slice_id
 
 
 RUN_SCHEMA_VERSION = 1
@@ -741,7 +741,7 @@ def write_campaign_metadata(path: str | Path, payload: Mapping[str, object]) -> 
 
 
 def _slice_id(seed: RunIdentitySeed) -> str:
-    return f"f{seed.frame_start:06d}-{seed.frame_stop:06d}-s{seed.frame_stride}"
+    return identity_slice_id(seed.frame_start, seed.frame_stop, seed.frame_stride)
 
 
 def _identity_axis(record: RunRecord) -> dict[str, object]:

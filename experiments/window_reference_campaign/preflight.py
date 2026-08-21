@@ -139,6 +139,28 @@ def build_bootstrap_actions(
                 True,
             )
         )
+        actions.append(
+            BootstrapAction(
+                "pi3-default-path",
+                (
+                    "bash",
+                    "-c",
+                    (
+                        "set -eu; "
+                        "mkdir -p weights/PI3; "
+                        "if test -L weights/PI3/model.safetensors; then "
+                        "echo 'weights/PI3/model.safetensors must not be a symlink' >&2; exit 1; "
+                        "elif test -e weights/PI3/model.safetensors; then "
+                        "test -f weights/PI3/model.safetensors; "
+                        "elif test -f weights/model.safetensors; then "
+                        "ln weights/model.safetensors weights/PI3/model.safetensors; "
+                        "else echo 'weights/model.safetensors is missing' >&2; exit 1; fi"
+                    ),
+                ),
+                root,
+                True,
+            )
+        )
 
     protected = tuple(word.casefold() for word in _PROTECTED_WORDS)
     relative_files = ("requirements.txt", "setup.py", "scripts/download_weights.sh")
@@ -315,33 +337,6 @@ class PreflightDependencies:
         for name in ("import_module", "git_state", "cuda_state", "disk_usage"):
             if not callable(getattr(self, name)):
                 raise ValueError(f"preflight dependency {name} must be callable")
-
-    @classmethod
-    def for_tests(
-        cls,
-        *,
-        python_version: tuple[int, int, int] = (3, 11, 0),
-        git: GitState | None = None,
-        cuda: CudaState | None = None,
-        free_bytes: int = 100 * 1024**3,
-    ) -> "PreflightDependencies":
-        """Build deterministic boundary doubles without importing heavy modules."""
-
-        modules = {
-            name: type("SentinelModule", (), {"__version__": "fixture"})()
-            for name in (*_REQUIRED_IMPORTS, *_SYNTHETIC_REQUIRED_IMPORTS)
-        }
-        git_value = git or GitState("1" * 40, False)
-        cuda_value = cuda or CudaState(False, 0, None, None, None)
-        usage = DiskUsage(100 * 1024**3, 100 * 1024**3 - free_bytes, free_bytes)
-        return cls(
-            python_version=python_version,
-            import_module=lambda name: modules[name],
-            git_state=lambda _: git_value,
-            cuda_state=lambda _: cuda_value,
-            disk_usage=lambda _: usage,
-        )
-
 
 def _default_git_state(repository: Path) -> GitState:
     try:
@@ -647,6 +642,18 @@ def _check_scenes_and_identities(
                 "blocked",
                 {"blocked_by": "campaign scene/staging imports", "error": str(exc)},
             )
+            _check(
+                checks,
+                f"staging-preview:{selected.scene_id}",
+                "blocked",
+                {"blocked_by": scene_name, "staging_preview_only": True},
+            )
+            _check(
+                checks,
+                f"identity:{selected.scene_id}",
+                "blocked",
+                {"blocked_by": scene_name, "seed_count": 0, "unique": False},
+            )
         errors.append(f"scene and staging checks are blocked by imports: {exc}")
         return ()
 
@@ -684,14 +691,21 @@ def _check_scenes_and_identities(
                 raise FileNotFoundError("one or more selected source images are missing")
             if resolved.evaluation_kind.value == "pointcloud":
                 if resolved.prepared_gt_path is None:
-                    raise ValueError(
-                        "point-map GT is not prepared; raw dataset preparation is blocked in preflight"
+                    # ``stage_scene`` owns the optional raw-dataset conversion.
+                    # Preflight stays read-only: scene resolution and the
+                    # staging preview validate every RGB/depth/pose partner,
+                    # then report that conversion is pending.
+                    pointmap_detail = {
+                        "preparation": "pending",
+                        "source_frame_count": len(resolved.selection.source_frame_ids),
+                        "expected_spatial_shape": list(resolved.expected_gt_shape or (392, 518)),
+                    }
+                else:
+                    pointmap_detail = _validate_pointmap(
+                        resolved.prepared_gt_path.resolve(strict=True),
+                        resolved.expected_gt_shape or (392, 518),
+                        resolved.selection.source_frame_ids,
                     )
-                pointmap_detail = _validate_pointmap(
-                    resolved.prepared_gt_path.resolve(strict=True),
-                    resolved.expected_gt_shape or (392, 518),
-                    resolved.selection.source_frame_ids,
-                )
             else:
                 pointmap_detail = None
             _manifest_payload, manifest_sha = preview_staging_manifest(resolved)
@@ -732,6 +746,12 @@ def _check_scenes_and_identities(
                 f"staging-preview:{scene_id}",
                 "blocked",
                 {"blocked_by": scene_name, "staging_preview_only": True},
+            )
+            _check(
+                checks,
+                f"identity:{scene_id}",
+                "blocked",
+                {"blocked_by": scene_name, "seed_count": 0, "unique": False},
             )
             continue
 
@@ -874,7 +894,7 @@ def _check_cuda(
         "selected_device": selected,
         "device_name": state.device_name,
         "bfloat16_supported": state.bfloat16_supported,
-        "gpu_ready": bool(in_range),
+        "gpu_ready": bool(in_range and state.bfloat16_supported is True),
     }
     if not in_range:
         message = f"CUDA selected device {selected} is unavailable or out of range"

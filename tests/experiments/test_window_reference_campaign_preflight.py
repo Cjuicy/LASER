@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import experiments.window_reference_campaign.preflight as preflight
+
 from experiments.window_reference_campaign.config import (
     CampaignOverrides,
     load_campaign_config,
@@ -61,18 +63,30 @@ def make_preflight_fixture(tmp_path: Path, *, preset: str = "kitti-smoke"):
 
 
 def _dependencies(*, cuda_available: bool) -> PreflightDependencies:
-    return PreflightDependencies.for_tests(
-        python_version=(3, 11, 15),
-        git=GitState("1" * 40, False),
-        cuda=CudaState(
-            available=cuda_available,
-            device_count=1 if cuda_available else 0,
-            selected_device=0 if cuda_available else None,
-            device_name="fixture-gpu" if cuda_available else None,
-            bfloat16_supported=True if cuda_available else None,
-        ),
-        free_bytes=100 * 1024**3,
+    modules = {
+        name: type("SentinelModule", (), {"__version__": "fixture"})()
+        for name in (*preflight._REQUIRED_IMPORTS, *preflight._SYNTHETIC_REQUIRED_IMPORTS)
+    }
+    git = GitState("1" * 40, False)
+    cuda = CudaState(
+        available=cuda_available,
+        device_count=1 if cuda_available else 0,
+        selected_device=0 if cuda_available else None,
+        device_name="fixture-gpu" if cuda_available else None,
+        bfloat16_supported=True if cuda_available else None,
     )
+    usage = DiskUsage(100 * 1024**3, 0, 100 * 1024**3)
+    return PreflightDependencies(
+        python_version=(3, 11, 15),
+        import_module=lambda name: modules[name],
+        git_state=lambda _: git,
+        cuda_state=lambda _: cuda,
+        disk_usage=lambda _: usage,
+    )
+
+
+def test_preflight_dependencies_have_no_production_test_builder():
+    assert not hasattr(PreflightDependencies, "for_tests")
 
 
 def test_bootstrap_dry_run_works_when_torch_and_omegaconf_imports_are_blocked(tmp_path):
@@ -117,6 +131,23 @@ def test_bootstrap_actions_never_download_protected_datasets(tmp_path):
     lowered = commands.lower()
     for forbidden in ("kitti", "7-scenes", "7scenes", "neuralrgbd", "cookie", "password", "token"):
         assert forbidden not in lowered
+
+
+def test_bootstrap_default_weight_path_bridges_public_download_to_pi3_contract(tmp_path):
+    source = tmp_path / "weights" / "model.safetensors"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"fixture-weight")
+    actions = build_bootstrap_actions(
+        tmp_path,
+        python_executable=sys.executable,
+        external_checkpoint=None,
+    )
+    bridge = next(action for action in actions if action.label == "pi3-default-path")
+    subprocess.run(bridge.argv, cwd=bridge.cwd, check=True)
+    target = tmp_path / "weights" / "PI3" / "model.safetensors"
+    assert target.is_file()
+    assert not target.is_symlink()
+    assert target.read_bytes() == source.read_bytes()
 
 
 def test_run_bootstrap_prints_shell_quoted_commands_and_executes_in_order(tmp_path, capsys):
@@ -273,6 +304,47 @@ def test_validate_pointmap_rejects_non_vector_sibling_frame_ids(tmp_path):
         _validate_pointmap(pointmap, (2, 3), (10, 20))
 
 
+def test_preflight_accepts_raw_pointcloud_partners_and_marks_gt_preparation_pending(tmp_path):
+    data_root = tmp_path / "data"
+    scene_root = data_root / "NeuralRGBD" / "thin_geometry"
+    (scene_root / "images").mkdir(parents=True)
+    (scene_root / "depth").mkdir(parents=True)
+    frame_ids = tuple(range(0, 391, 10))
+    for frame_id in frame_ids:
+        Image.new("RGB", (8, 6), color=(frame_id % 255, 0, 0)).save(
+            scene_root / "images" / f"img{frame_id}.png"
+        )
+        Image.new("I;16", (8, 6)).save(
+            scene_root / "depth" / f"depth{frame_id}.png"
+        )
+    np.savetxt(scene_root / "poses.txt", np.tile(np.eye(4), (391, 1)))
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"fixture-checkpoint")
+    loaded = load_campaign_config(
+        CONFIG,
+        CampaignOverrides(
+            preset="pointcloud-small",
+            scene_ids=("nrgbd-thin-geometry",),
+            data_root=data_root,
+            checkpoint=checkpoint,
+            output_root=tmp_path / "outputs",
+        ),
+    )
+    report = preflight_campaign(
+        loaded,
+        build_plan(loaded),
+        allow_no_gpu=True,
+        dependencies=_dependencies(cuda_available=False),
+    )
+    assert report.errors == ()
+    scene = next(
+        check for check in report.checks if check.name == "scene:nrgbd-thin-geometry"
+    )
+    assert scene.status == "ok"
+    assert scene.detail["pointmap"]["preparation"] == "pending"
+    assert scene.detail["pointmap"]["source_frame_count"] == len(frame_ids)
+
+
 def test_allow_no_gpu_succeeds_but_records_not_gpu_ready(tmp_path):
     loaded, plan = make_preflight_fixture(tmp_path)
     report = preflight_campaign(
@@ -322,7 +394,9 @@ def test_allow_no_gpu_does_not_downgrade_import_or_bfloat16_errors(tmp_path):
     assert any("required import torch" in error for error in report.errors)
     assert any("required import open3d" in error for error in report.errors)
     assert any("bfloat16" in error for error in report.errors)
-    assert next(check for check in report.checks if check.name == "cuda").status == "error"
+    cuda = next(check for check in report.checks if check.name == "cuda")
+    assert cuda.status == "error"
+    assert cuda.detail["gpu_ready"] is False
 
 
 def test_preflight_collects_all_required_import_failures(tmp_path):
@@ -365,6 +439,11 @@ def test_allow_no_gpu_does_not_hide_missing_checkpoint_or_dataset(tmp_path):
     assert report.status == "error"
     assert any("checkpoint" in error for error in report.errors)
     assert any("KITTI" in error or "data" in error for error in report.errors)
+    scene = next(check for check in report.checks if check.name == "scene:kitti-04")
+    assert scene.status == "error"
+    identity = next(check for check in report.checks if check.name == "identity:kitti-04")
+    assert identity.status == "blocked"
+    assert identity.detail["blocked_by"] == "scene:kitti-04"
 
 
 def test_preflight_writes_only_atomic_report_and_warns_for_space_dirty_source(tmp_path):

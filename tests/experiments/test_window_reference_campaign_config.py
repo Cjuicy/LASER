@@ -75,6 +75,28 @@ def test_unknown_campaign_key_is_rejected(tmp_path):
         load_campaign_config(path, CampaignOverrides(preset="synthetic-smoke"))
 
 
+def test_runtime_jobs_must_remain_single_scene_serial_protocol(tmp_path):
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        CONFIG.read_text(encoding="utf-8").replace("  jobs: 1\n", "  jobs: 2\n"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="runtime.jobs must be exactly 1"):
+        load_campaign_config(path, CampaignOverrides(preset="synthetic-smoke"))
+
+
+def test_storage_minimum_free_space_is_fixed_to_twenty_gib_protocol(tmp_path):
+    path = tmp_path / "campaign.yaml"
+    path.write_text(
+        CONFIG.read_text(encoding="utf-8").replace(
+            "  minimum_free_gb: 20.0\n", "  minimum_free_gb: 19.0\n"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="storage.minimum_free_gb must be exactly 20.0"):
+        load_campaign_config(path, CampaignOverrides(preset="synthetic-smoke"))
+
+
 def test_identity_completion_contains_every_audit_field():
     seed = RunIdentitySeed(
         schema_version=1,
@@ -157,12 +179,80 @@ def test_plan_dry_run_does_not_import_torch_or_touch_inputs(tmp_path):
     assert not (tmp_path / "output").exists()
 
 
+def test_plan_without_dry_run_stays_torch_import_light_and_publishes_plan(tmp_path):
+    blocker = tmp_path / "sitecustomize.py"
+    blocker.write_text(
+        "import sys\n"
+        "class Block:\n"
+        "  def find_spec(self, fullname, path=None, target=None):\n"
+        "    if fullname == 'torch' or fullname.startswith('torch.'):\n"
+        "      raise RuntimeError('torch import forbidden')\n"
+        "sys.meta_path.insert(0, Block())\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "output"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "run_window_reference_campaign.py"),
+            "plan",
+            "--config", str(CONFIG),
+            "--preset", "kitti-small",
+            "--data-root", str(tmp_path / "missing-data"),
+            "--checkpoint", str(tmp_path / "missing-model.safetensors"),
+            "--output-root", str(output),
+        ],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": f"{tmp_path}{os.pathsep}{ROOT}"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    plan_path = output / "window-reference-v1" / "plan.json"
+    assert plan_path.is_file()
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert len(payload["runs"]) == 18
+
+
 @pytest.mark.parametrize("preset", ["kitti-small", "kitti-formal-subset"])
 def test_multi_scene_presets_have_unique_relative_run_directories(preset):
     loaded = load_campaign_config(CONFIG, CampaignOverrides(preset=preset))
     plan = build_plan(loaded)
     relative_dirs = [run.relative_run_dir for run in plan.runs]
     assert len(relative_dirs) == len(set(relative_dirs))
+
+
+def test_standalone_summary_uses_concrete_kitti_stop_in_identity_key(tmp_path):
+    from PIL import Image
+
+    data_root = tmp_path / "data"
+    image_dir = data_root / "KITTI" / "04" / "image_2"
+    image_dir.mkdir(parents=True)
+    for index in range(2):
+        Image.new("RGB", (8, 6), color=(index, 0, 0)).save(
+            image_dir / f"{index:06d}.png"
+        )
+    import numpy as np
+
+    np.savetxt(data_root / "KITTI" / "04" / "poses.txt", np.ones((2, 12)))
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"fixture-checkpoint")
+    loaded = load_campaign_config(
+        CONFIG,
+        CampaignOverrides(
+            preset="kitti-small",
+            scene_ids=("kitti-04",),
+            data_root=data_root,
+            checkpoint=checkpoint,
+            output_root=tmp_path / "outputs",
+        ),
+    )
+    from experiments.window_reference_campaign.cli import _expected_summary_seeds
+    plan = build_plan(loaded)
+    expected = _expected_summary_seeds(loaded, plan)
+    assert expected
+    assert {key[2] for key in expected} == {"f000000-000002-s1"}
 
 
 def test_normal_pipeline_enum_import_errors_are_not_swallowed(tmp_path):
