@@ -100,6 +100,21 @@ class AtomicConfig:
 
 
 @dataclass(frozen=True)
+class WindowReferenceConfig:
+    enabled: bool = MISSING
+    sampling_stride: int = MISSING
+    max_keyframes: int = MISSING
+    relative_depth_tolerance: float = MISSING
+    min_reference_score: float = MISSING
+    stop_coverage_ratio: float = MISSING
+    min_coverage_gain: float = MISSING
+    min_region_correspondences: int = MISSING
+    min_region_coverage: float = MISSING
+    min_region_purity: float = MISSING
+    merge_vote_threshold: float = MISSING
+
+
+@dataclass(frozen=True)
 class SegmentationConfig:
     method: SegmentationMethod = MISSING
     confidence_keep_ratio: float = MISSING
@@ -109,6 +124,9 @@ class SegmentationConfig:
     felzenszwalb: FelzenszwalbConfig = field(default_factory=FelzenszwalbConfig)
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
     atomic: AtomicConfig = field(default_factory=AtomicConfig)
+    window_reference: WindowReferenceConfig = field(
+        default_factory=WindowReferenceConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -231,6 +249,11 @@ def _normalize_enum_values(config: DictConfig) -> None:
         OmegaConf.update(config, path, normalized, merge=False)
 
 
+def _positive_int(path: str, value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{path} must be a positive integer")
+
+
 def _validate_config(config: PipelineConfig) -> None:
     if config.version != 2:
         raise ValueError("version must be 2")
@@ -304,6 +327,51 @@ def _validate_config(config: PipelineConfig) -> None:
             "must be in (0, 180]"
         )
 
+    window_reference = config.segmentation.window_reference
+    for name in (
+        "sampling_stride",
+        "max_keyframes",
+        "min_region_correspondences",
+    ):
+        _positive_int(
+            f"segmentation.window_reference.{name}",
+            getattr(window_reference, name),
+        )
+
+    relative_depth_tolerance = window_reference.relative_depth_tolerance
+    if (
+        not math.isfinite(relative_depth_tolerance)
+        or relative_depth_tolerance <= 0
+    ):
+        raise ValueError(
+            "segmentation.window_reference.relative_depth_tolerance "
+            "must be finite and in (0, inf)"
+        )
+
+    for name in (
+        "min_reference_score",
+        "stop_coverage_ratio",
+        "min_region_coverage",
+        "min_region_purity",
+        "merge_vote_threshold",
+    ):
+        value = getattr(window_reference, name)
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise ValueError(
+                f"segmentation.window_reference.{name} "
+                "must be finite and in (0, 1]"
+    )
+
+    min_coverage_gain = window_reference.min_coverage_gain
+    if (
+        not math.isfinite(min_coverage_gain)
+        or not 0.0 <= min_coverage_gain <= 1.0
+    ):
+        raise ValueError(
+            "segmentation.window_reference.min_coverage_gain "
+            "must be finite and in [0, 1]"
+        )
+
     if config.reconstruction.mode is ReconstructionMode.NO_LOOP:
         return
     if config.loop is None:
@@ -363,6 +431,17 @@ def load_pipeline_config(
         _make_schema_mutable(schema)
         _normalize_enum_values(source)
         _normalize_enum_values(dotlist)
+        missing_value = object()
+        for values in (source, dotlist):
+            enabled = OmegaConf.select(
+                values,
+                "segmentation.window_reference.enabled",
+                default=missing_value,
+            )
+            if enabled is not missing_value and not isinstance(enabled, bool):
+                raise ValueError(
+                    "segmentation.window_reference.enabled must be a boolean"
+                )
         merged = OmegaConf.merge(schema, source, dotlist)
 
         missing = sorted(OmegaConf.missing_keys(merged))

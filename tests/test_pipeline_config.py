@@ -100,7 +100,76 @@ def test_default_config_has_approved_methods_and_defaults():
     assert loaded.config.segmentation.felzenszwalb.scale == 300
     assert loaded.config.segmentation.felzenszwalb.sigma == pytest.approx(1.1)
     assert loaded.config.segmentation.felzenszwalb.min_size == 500
+    window_reference = loaded.config.segmentation.window_reference
+    assert window_reference.enabled is False
+    assert window_reference.sampling_stride == 4
+    assert window_reference.max_keyframes == 4
+    assert window_reference.relative_depth_tolerance == 0.05
+    assert window_reference.min_reference_score == 0.30
+    assert window_reference.stop_coverage_ratio == 0.90
+    assert window_reference.min_coverage_gain == 0.03
+    assert window_reference.min_region_correspondences == 8
+    assert window_reference.min_region_coverage == 0.10
+    assert window_reference.min_region_purity == 0.80
+    assert window_reference.merge_vote_threshold == 0.80
     assert len(loaded.sha256) == 64
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        (
+            "segmentation.window_reference.enabled=1",
+            "enabled",
+        ),
+        (
+            "segmentation.window_reference.sampling_stride=0",
+            "sampling_stride",
+        ),
+        (
+            "segmentation.window_reference.max_keyframes=true",
+            "max_keyframes",
+        ),
+        (
+            "segmentation.window_reference.relative_depth_tolerance=0",
+            "relative_depth_tolerance",
+        ),
+        (
+            "segmentation.window_reference.min_reference_score=0",
+            "min_reference_score",
+        ),
+        (
+            "segmentation.window_reference.stop_coverage_ratio=1.1",
+            "stop_coverage_ratio",
+        ),
+        (
+            "segmentation.window_reference.min_coverage_gain=-0.01",
+            "min_coverage_gain",
+        ),
+        (
+            "segmentation.window_reference.min_region_correspondences=false",
+            "min_region_correspondences",
+        ),
+        (
+            "segmentation.window_reference.min_region_coverage=nan",
+            "min_region_coverage",
+        ),
+        (
+            "segmentation.window_reference.min_region_purity=0",
+            "min_region_purity",
+        ),
+        (
+            "segmentation.window_reference.merge_vote_threshold=inf",
+            "merge_vote_threshold",
+        ),
+    ],
+)
+def test_window_reference_config_rejects_invalid_boundaries(
+    override,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        load_pipeline_config(DEFAULT, (override,))
 
 
 @pytest.mark.parametrize(

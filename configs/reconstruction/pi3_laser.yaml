@@ -41,6 +41,18 @@ segmentation:
   atomic:
     split_mode: conservative
     split_score_threshold: 0.10
+  window_reference:
+    enabled: false
+    sampling_stride: 4
+    max_keyframes: 4
+    relative_depth_tolerance: 0.05
+    min_reference_score: 0.30
+    stop_coverage_ratio: 0.90
+    min_coverage_gain: 0.03
+    min_region_correspondences: 8
+    min_region_coverage: 0.10
+    min_region_purity: 0.80
+    merge_vote_threshold: 0.80
 
 anchor_propagation:
   enabled: true
