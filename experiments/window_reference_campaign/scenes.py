@@ -385,6 +385,15 @@ def resolve_scene(config: CampaignConfig, selected: PresetSceneConfig) -> Resolv
             max_frames=None,
             stride_override=None,
         )
+        if (
+            selection.start != 0
+            or selection.stop != 4
+            or selection.stride != 1
+            or selection.source_frame_ids != (0, 1, 2, 3)
+        ):
+            raise ValueError(
+                "synthetic scene uses the fixed four-frame selection"
+            )
         source_images = tuple(
             data_root / "__synthetic__" / f"frame-{frame_id:06d}.png"
             for frame_id in selection.source_frame_ids

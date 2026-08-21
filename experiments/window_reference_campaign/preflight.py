@@ -897,6 +897,29 @@ def preflight_campaign(
         from .matrix import build_identity_seed
         from .scenes import resolve_scene
 
+        relative_dirs = [item.relative_run_dir for item in plan.runs]
+        unsafe_dirs = [
+            path
+            for path in relative_dirs
+            if path.is_absolute() or ".." in path.parts
+        ]
+        directories_unique = len(relative_dirs) == len(set(relative_dirs))
+        directories_safe = not unsafe_dirs
+        if not directories_unique or not directories_safe:
+            _check(
+                checks,
+                "plan:run-directories",
+                "error",
+                {"unique": directories_unique, "safe": directories_safe},
+            )
+            errors.append("plan contains duplicate or unsafe relative run directories")
+        else:
+            _check(
+                checks,
+                "plan:run-directories",
+                "ok",
+                {"unique": True, "safe": True, "count": len(relative_dirs)},
+            )
         planned_by_scene: dict[str, list[Any]] = {}
         for planned in plan.runs:
             planned_by_scene.setdefault(planned.scene_id, []).append(planned)
@@ -905,6 +928,7 @@ def preflight_campaign(
             b"LASER-window-reference-synthetic-checkpoint-v1"
         ).hexdigest()
         seed_hashes: list[str] = []
+        seen_seed_hashes: set[str] = set()
         for scene_id, planned_items in planned_by_scene.items():
             resolved = resolve_scene(loaded.config, selected[scene_id])
             payload = {
@@ -936,6 +960,7 @@ def preflight_campaign(
                     "synthetic": True,
                 },
             )
+            scene_duplicate = False
             for planned in planned_items:
                 seed = build_identity_seed(
                     loaded=loaded,
@@ -951,12 +976,21 @@ def preflight_campaign(
                 seed_payload = json.dumps(
                     seed.to_payload(), sort_keys=True, separators=(",", ":"), allow_nan=False
                 )
-                seed_hashes.append(hashlib.sha256(seed_payload.encode()).hexdigest())
+                digest = hashlib.sha256(seed_payload.encode()).hexdigest()
+                if digest in seen_seed_hashes:
+                    errors.append(f"identity seed hash is duplicated: {digest}")
+                    scene_duplicate = True
+                seen_seed_hashes.add(digest)
+                seed_hashes.append(digest)
             _check(
                 checks,
                 f"identity:{scene_id}",
-                "ok",
-                {"seed_count": len(planned_items), "unique": True, "synthetic": True},
+                "error" if scene_duplicate else "ok",
+                {
+                    "seed_count": len(planned_items),
+                    "unique": not scene_duplicate,
+                    "synthetic": True,
+                },
             )
         _check(
             checks,

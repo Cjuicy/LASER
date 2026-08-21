@@ -155,7 +155,9 @@ def _handle_plan(args: argparse.Namespace) -> int:
             os.environ["LASER_WINDOW_REFERENCE_IMPORT_LIGHT"] = previous_import_mode
 
     loaded = load_campaign_config(Path(args.config), _campaign_overrides(args))
-    payload = plan_payload(build_plan(loaded), loaded)
+    plan = build_plan(loaded)
+    _reject_synthetic_frame_overrides(args, plan)
+    payload = plan_payload(plan, loaded)
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     if args.dry_run:
         print(serialized)
@@ -195,6 +197,7 @@ def _handle_preflight(args: argparse.Namespace) -> int:
 
     loaded = load_campaign_config(Path(args.config), _campaign_overrides(args))
     plan = build_plan(loaded)
+    _reject_synthetic_frame_overrides(args, plan)
     report = preflight_campaign(loaded, plan, allow_no_gpu=args.allow_no_gpu)
     target = write_preflight_report(report, loaded.config.campaign_root)
     print(f"{target} ({report.status})")
@@ -203,6 +206,21 @@ def _handle_preflight(args: argparse.Namespace) -> int:
 
 def _plan_is_synthetic(plan) -> bool:
     return bool(plan.runs) and all(item.dataset.value == "synthetic" for item in plan.runs)
+
+
+def _reject_synthetic_frame_overrides(args: argparse.Namespace, plan) -> None:
+    """Keep the literal synthetic fixture's four-frame identity immutable."""
+
+    if not _plan_is_synthetic(plan):
+        return
+    if any(
+        value is not None
+        for value in (args.start_frame, args.max_frames, args.frame_stride)
+    ):
+        raise ValueError(
+            "synthetic preset uses the fixed four-frame selection; "
+            "start/max-frames/frame-stride overrides are not supported"
+        )
 
 
 def _resolve_scenes(loaded, plan):
@@ -241,10 +259,16 @@ def _runtime_payload(*, synthetic: bool, gpu: int) -> dict[str, object]:
     return payload
 
 
-def _campaign_metadata(loaded, *, synthetic: bool, status: str, argv: Sequence[str]) -> dict[str, object]:
-    from .runner import _source_metadata
-
-    source_commit, source_dirty = _source_metadata(loaded.config.repository_root)
+def _campaign_metadata(
+    loaded,
+    *,
+    synthetic: bool,
+    status: str,
+    argv: Sequence[str],
+    preflight,
+) -> dict[str, object]:
+    source_commit = preflight.git.commit
+    source_dirty = preflight.git.dirty
     checkpoint_sha256 = None
     if not synthetic:
         from inference_engine.prediction_cache.fingerprint import sha256_file
@@ -259,6 +283,7 @@ def _campaign_metadata(loaded, *, synthetic: bool, status: str, argv: Sequence[s
         "source_dirty": source_dirty,
         "config_sha256": loaded.sha256,
         "checkpoint_sha256": checkpoint_sha256,
+        "preflight": preflight.to_payload(),
         "runtime": _runtime_payload(synthetic=synthetic, gpu=loaded.config.runtime.gpu),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "finished_at": None,
@@ -296,19 +321,19 @@ def _handle_run(args: argparse.Namespace) -> int:
     from .matrix import build_plan, plan_payload
 
     plan = build_plan(loaded)
+    _reject_synthetic_frame_overrides(args, plan)
     if args.dry_run:
         print(json.dumps(plan_payload(plan, loaded), sort_keys=True, separators=(",", ":")))
         return 0
 
     synthetic = _plan_is_synthetic(plan)
-    if not synthetic:
-        from .preflight import preflight_campaign
+    from .preflight import preflight_campaign
 
-        report = preflight_campaign(loaded, plan, allow_no_gpu=False)
-        if report.status == "error":
-            for error in report.errors:
-                print(error, file=sys.stderr)
-            return 1
+    report = preflight_campaign(loaded, plan, allow_no_gpu=synthetic)
+    if report.status == "error":
+        for error in report.errors:
+            print(error, file=sys.stderr)
+        return 1
     scenes = _resolve_scenes(loaded, plan)
     root = loaded.config.campaign_root
     if root.is_symlink():
@@ -326,6 +351,7 @@ def _handle_run(args: argparse.Namespace) -> int:
             synthetic=synthetic,
             status="running",
             argv=tuple(getattr(args, "_argv", tuple(sys.argv[1:]))),
+            preflight=report,
         ),
     )
     try:
@@ -345,6 +371,7 @@ def _handle_run(args: argparse.Namespace) -> int:
                 if args.keep_artifacts is not None
                 else loaded.config.storage.keep_artifacts
             ),
+            source_state=(report.git.commit, report.git.dirty),
         )
     except Exception as exc:
         _update_campaign_metadata(metadata_path, status="failed", exit_code=1)
@@ -424,6 +451,7 @@ def _handle_summarize(args: argparse.Namespace) -> int:
     from .runner import validate_artifact_for_seed
 
     plan = build_plan(loaded)
+    _reject_synthetic_frame_overrides(args, plan)
     try:
         expected = _expected_summary_seeds(loaded, plan)
         root = loaded.config.campaign_root

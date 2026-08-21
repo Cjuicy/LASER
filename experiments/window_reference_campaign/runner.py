@@ -315,7 +315,16 @@ def cache_entry_complete(
         if type(window_count) is not int or window_count < 1:
             return False
         entry = Path(cache_root) / "v2" / prediction_key
+        version_dir = entry.parent
         complete_path = entry / "complete.json"
+        manifest = entry / "manifest.json"
+        sequence = entry / "sequence.json"
+        windows = entry / "windows"
+        if any(
+            path.is_symlink()
+            for path in (version_dir, entry, complete_path, manifest, sequence, windows)
+        ):
+            return False
         payload = json.loads(complete_path.read_text(encoding="utf-8"))
         if not isinstance(payload, Mapping):
             return False
@@ -325,14 +334,16 @@ def cache_entry_complete(
             or payload.get("window_count") != window_count
         ):
             return False
-        if not (entry / "manifest.json").is_file():
+        if not manifest.is_file():
             return False
-        if not (entry / "sequence.json").is_file():
+        if not sequence.is_file():
             return False
-        windows = entry / "windows"
         if not windows.is_dir():
             return False
-        return all((windows / f"{index:06d}.pt").is_file() for index in range(window_count))
+        window_paths = [windows / f"{index:06d}.pt" for index in range(window_count)]
+        if any(path.is_symlink() for path in window_paths):
+            return False
+        return all(path.is_file() for path in window_paths)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
@@ -855,6 +866,7 @@ def run_campaign(
     failure_policy: FailurePolicy,
     keep_artifacts: bool,
     dependencies: RunnerDependencies | None = None,
+    source_state: tuple[str, bool] | None = None,
 ) -> CampaignOutcome:
     """Run scenes serially, publishing each scene before staging the next."""
 
@@ -871,6 +883,14 @@ def run_campaign(
             failure_policy = FailurePolicy(failure_policy)
         except (TypeError, ValueError) as exc:
             raise ValueError("failure_policy is invalid") from exc
+    if source_state is not None:
+        if (
+            not isinstance(source_state, tuple)
+            or len(source_state) != 2
+            or not isinstance(source_state[0], str)
+            or type(source_state[1]) is not bool
+        ):
+            raise ValueError("source_state must be a (commit, dirty) tuple")
     deps = dependencies or RunnerDependencies()
     configured_root = Path(loaded.config.campaign_root)
     if configured_root.is_symlink():
@@ -879,7 +899,11 @@ def run_campaign(
         raise ValueError("campaign root must be a directory")
     root = configured_root.resolve(strict=False)
     root.mkdir(parents=True, exist_ok=True)
-    source_commit, source_dirty = _source_metadata(loaded.config.repository_root)
+    source_commit, source_dirty = (
+        source_state
+        if source_state is not None
+        else _source_metadata(loaded.config.repository_root)
+    )
     synthetic_only = bool(plan.runs) and all(
         planned.dataset is DatasetKind.SYNTHETIC for planned in plan.runs
     )

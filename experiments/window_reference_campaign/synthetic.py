@@ -30,7 +30,12 @@ from pipeline.config import (
 from .config import LoadedCampaignConfig
 from .diagnostics import aggregate_diagnostics
 from .results import CacheStats, atomic_json
-from .runner import PipelineExecution, RunIdentitySeed, RunRequest
+from .runner import (
+    PipelineExecution,
+    RunIdentitySeed,
+    RunRequest,
+    cache_entry_complete,
+)
 
 
 _HEIGHT = 33
@@ -236,7 +241,16 @@ def _run_fixture_refinement(
 
 def _cache_payload(request: RunRequest, prediction_key: str) -> Path:
     entry = request.cache_root / "v2" / prediction_key
-    (entry / "windows").mkdir(parents=True, exist_ok=True)
+    for directory in (entry.parent, entry, entry / "windows"):
+        if directory.is_symlink() or directory.is_file():
+            directory.unlink()
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir() or directory.is_symlink():
+            raise ValueError("synthetic cache entry is not campaign-owned")
+    for index in range(_WINDOW_COUNT):
+        window_path = entry / "windows" / f"{index:06d}.pt"
+        if window_path.is_symlink():
+            window_path.unlink()
     atomic_json(entry / "manifest.json", {"synthetic": True, "key": prediction_key})
     atomic_json(entry / "sequence.json", {"synthetic": True, "key": prediction_key})
     for index in range(_WINDOW_COUNT):
@@ -251,15 +265,18 @@ def _cache_payload(request: RunRequest, prediction_key: str) -> Path:
 def _synthetic_cache_stats(
     request: RunRequest,
     prediction_key: str,
-    *,
-    existed: bool,
 ) -> CacheStats:
     if request.cache_mode is PredictionCacheMode.OFF:
         return CacheStats(0, 0, 0, 0.0, 0.0, 0, 0, ())
-    if request.cache_mode is PredictionCacheMode.READONLY and not existed:
+    complete = cache_entry_complete(
+        request.cache_root,
+        prediction_key,
+        _WINDOW_COUNT,
+    )
+    if request.cache_mode is PredictionCacheMode.READONLY and not complete:
         raise ValueError("synthetic readonly cache entry is missing")
     if request.cache_mode is PredictionCacheMode.READONLY or (
-        request.cache_mode is PredictionCacheMode.AUTO and existed
+        request.cache_mode is PredictionCacheMode.AUTO and complete
     ):
         return CacheStats(
             1,
@@ -295,6 +312,19 @@ def execute_synthetic(
         raise ValueError("synthetic execution requires RunRequest")
     if not isinstance(loaded, LoadedCampaignConfig):
         raise ValueError("synthetic execution requires LoadedCampaignConfig")
+    frame_count = (
+        request.identity_seed.frame_stop
+        - request.identity_seed.frame_start
+        + request.identity_seed.frame_stride
+        - 1
+    ) // request.identity_seed.frame_stride
+    if (
+        request.identity_seed.frame_start != 0
+        or request.identity_seed.frame_stop != _FRAME_COUNT
+        or request.identity_seed.frame_stride != 1
+        or frame_count != _FRAME_COUNT
+    ):
+        raise ValueError("synthetic fixture requires the fixed four-frame identity")
     fixture = build_synthetic_fixture(
         SegmentationMethod(request.planned.variant.segmentation_method)
     )
@@ -316,12 +346,9 @@ def execute_synthetic(
             "diagnostics": diagnostics,
         },
     )
-    entry = request.cache_root / "v2" / prediction_key
-    existed = (entry / "complete.json").is_file()
     cache_stats = _synthetic_cache_stats(
         request,
         prediction_key,
-        existed=existed,
     )
     return PipelineExecution(
         request.artifact_dir,
@@ -365,7 +392,17 @@ def validate_synthetic_artifact(
     if payload["identity_seed"] != seed.to_payload():
         raise ValueError("synthetic artifact identity seed does not match")
     prediction_key = _require_sha256(payload["prediction_key"], "synthetic prediction_key")
-    if payload["frame_count"] != _FRAME_COUNT:
+    expected_frame_count = (
+        seed.frame_stop - seed.frame_start + seed.frame_stride - 1
+    ) // seed.frame_stride
+    if (
+        seed.frame_start != 0
+        or seed.frame_stop != _FRAME_COUNT
+        or seed.frame_stride != 1
+        or expected_frame_count != _FRAME_COUNT
+    ):
+        raise ValueError("synthetic identity must describe the fixed four-frame selection")
+    if payload["frame_count"] != expected_frame_count:
         raise ValueError("synthetic artifact frame count does not match identity")
     diagnostics = payload["diagnostics"]
     if not isinstance(diagnostics, Mapping):
@@ -388,11 +425,14 @@ def load_synthetic_execution(
     payload = json.loads((Path(artifact_dir) / "synthetic.json").read_text(encoding="utf-8"))
     diagnostics = payload["diagnostics"]
     assert isinstance(diagnostics, Mapping)
+    expected_frame_count = (
+        seed.frame_stop - seed.frame_start + seed.frame_stride - 1
+    ) // seed.frame_stride
     return PipelineExecution(
         Path(artifact_dir),
         digest,
         prediction_key,
-        _FRAME_COUNT,
+        expected_frame_count,
         diagnostics,
         cache_stats,
     )

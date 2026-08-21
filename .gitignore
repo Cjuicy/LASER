@@ -1,5 +1,6 @@
 .hydra/
 output/
+outputs/window_reference_campaign/
 ckpt/
 # Byte-compiled / optimized / DLL files
 __pycache__/

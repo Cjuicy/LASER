@@ -391,6 +391,37 @@ def test_preflight_writes_only_atomic_report_and_warns_for_space_dirty_source(tm
     assert len(set(report.identity_seed_sha256)) == 6
 
 
+def test_synthetic_preflight_checks_matrix_identity_storage_and_skips_gpu(tmp_path):
+    loaded, plan = make_preflight_fixture(tmp_path, preset="synthetic-smoke")
+    dependencies = replace(
+        _dependencies(cuda_available=True),
+        git_state=lambda _: GitState("2" * 40, True),
+        disk_usage=lambda _: DiskUsage(
+            100 * 1024**3, 92 * 1024**3, 8 * 1024**3
+        ),
+    )
+    report = preflight_campaign(
+        loaded,
+        plan,
+        allow_no_gpu=True,
+        dependencies=dependencies,
+    )
+    assert report.status == "ok_with_warnings"
+    assert any("20.0 GiB" in warning for warning in report.warnings)
+    assert any("dirty" in warning for warning in report.warnings)
+    assert [check.name for check in report.checks].count("plan:run-directories") == 1
+    assert next(
+        check for check in report.checks if check.name == "plan:run-directories"
+    ).status == "ok"
+    identity = next(
+        check for check in report.checks if check.name == "identity:synthetic-fixture"
+    )
+    assert identity.status == "ok"
+    assert identity.detail["unique"] is True
+    assert len(report.identity_seed_sha256) == 6
+    assert next(check for check in report.checks if check.name == "cuda").detail["not_applicable"] is True
+
+
 def test_persisted_argv_redacts_options_and_url_userinfo():
     assert redact_argv((
         "--token", "abc",
