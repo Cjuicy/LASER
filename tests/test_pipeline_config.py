@@ -127,7 +127,15 @@ def test_default_config_has_approved_methods_and_defaults():
             "sampling_stride",
         ),
         (
+            "segmentation.window_reference.sampling_stride=true",
+            "sampling_stride",
+        ),
+        (
             "segmentation.window_reference.max_keyframes=true",
+            "max_keyframes",
+        ),
+        (
+            "segmentation.window_reference.max_keyframes=0",
             "max_keyframes",
         ),
         (
@@ -151,6 +159,10 @@ def test_default_config_has_approved_methods_and_defaults():
             "min_region_correspondences",
         ),
         (
+            "segmentation.window_reference.min_region_correspondences=0",
+            "min_region_correspondences",
+        ),
+        (
             "segmentation.window_reference.min_region_coverage=nan",
             "min_region_coverage",
         ),
@@ -170,6 +182,30 @@ def test_window_reference_config_rejects_invalid_boundaries(
 ):
     with pytest.raises(ValueError, match=message):
         load_pipeline_config(DEFAULT, (override,))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("min_coverage_gain", "0", 0.0),
+        ("min_reference_score", "1", 1.0),
+        ("stop_coverage_ratio", "1", 1.0),
+        ("min_region_coverage", "1", 1.0),
+        ("min_region_purity", "1", 1.0),
+        ("merge_vote_threshold", "1", 1.0),
+    ],
+)
+def test_window_reference_config_accepts_closed_boundaries(
+    field,
+    value,
+    expected,
+):
+    loaded = load_pipeline_config(
+        DEFAULT,
+        (f"segmentation.window_reference.{field}={value}",),
+    )
+    actual = getattr(loaded.config.segmentation.window_reference, field)
+    assert actual == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
