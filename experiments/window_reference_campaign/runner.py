@@ -65,6 +65,7 @@ from .staging import (
     StagedScene,
     guarded_remove,
     require_descendant,
+    preview_staging_manifest,
     stage_scene as default_stage_scene,
 )
 
@@ -164,7 +165,14 @@ def _stage_synthetic_scene(scene: ResolvedScene, campaign_root: Path) -> StagedS
     """Publish a tiny campaign-owned manifest without touching external data."""
 
     root = Path(campaign_root).resolve(strict=False)
-    staging_root = root / "work" / "staging" / "synthetic" / scene.scene_id
+    staging_root = (
+        root
+        / "work"
+        / "staging"
+        / "synthetic"
+        / scene.scene_id
+        / scene.slice_id
+    )
     require_descendant(staging_root, root)
     image_dir = staging_root / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -269,7 +277,14 @@ def _run_directory(campaign_root: Path, planned: PlannedRun) -> Path:
 
 
 def _scene_cache_root(campaign_root: Path, planned: PlannedRun) -> Path:
-    return campaign_root / "work" / "cache" / planned.dataset.value / planned.slice_id
+    return (
+        campaign_root
+        / "work"
+        / "cache"
+        / planned.dataset.value
+        / planned.scene_id
+        / planned.slice_id
+    )
 
 
 def run_directory(campaign_root: Path, planned: PlannedRun) -> Path:
@@ -691,6 +706,71 @@ def _failed_record(
     )
 
 
+def _staging_failure_manifest_sha256(scene: ResolvedScene) -> str:
+    """Build a stable seed component when staging never produced a manifest."""
+
+    try:
+        if scene.dataset is DatasetKind.SYNTHETIC:
+            return synthetic_staging_manifest_sha256(scene)
+        _, digest = preview_staging_manifest(scene)
+        return digest
+    except Exception:
+        # A malformed source can fail before ``preview_staging_manifest`` can
+        # canonicalize it.  Failed records still need a typed, deterministic
+        # identity so the staging error is publishable and auditable.
+        payload = {
+            "dataset": scene.dataset.value,
+            "scene_id": scene.scene_id,
+            "scene": scene.scene,
+            "slice_id": scene.slice_id,
+            "source_frame_ids": list(scene.selection.source_frame_ids),
+            "selection": {
+                "start": scene.selection.start,
+                "stop": scene.selection.stop,
+                "stride": scene.selection.stride,
+            },
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _failed_staging_record(
+    planned: PlannedRun,
+    seed: RunIdentitySeed,
+    attempt: int,
+    attempt_dir: Path,
+    cache_policy: CachePolicy,
+    started_at: str,
+    finished_at: str,
+    exc: Exception,
+) -> RunRecord:
+    message = _redact_message(str(exc) or type(exc).__name__)
+    log_path = attempt_dir / "stdout.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(message + "\n", encoding="utf-8")
+    return RunRecord(
+        schema_version=RUN_SCHEMA_VERSION,
+        run_id=planned.variant.run_id,
+        identity_seed=seed,
+        identity=None,
+        status=RunStatus.FAILED,
+        attempt=attempt,
+        failure_stage=FailureStage.STAGING,
+        started_at=started_at,
+        finished_at=finished_at,
+        frame_count=0,
+        window_count=0,
+        cache_policy=cache_policy.value,
+        cache_stats=_zero_cache_stats(),
+        timings=RunTimings(None, None),
+        diagnostics=None,
+        evaluation_kind=EvaluationKind.NONE,
+        evaluation_metrics=None,
+        artifact_manifest_sha256=None,
+        error=RunError(type(exc).__name__, message),
+    )
+
+
 def _expected_window_count(staged: StagedScene, loaded: LoadedCampaignConfig) -> int:
     # The campaign protocol's 75/30 schedule has one or more windows for a
     # valid preflight scene.  Use the actual staged frame count for cache
@@ -990,12 +1070,91 @@ def run_campaign(
             raise ValueError(f"resolved scene is missing: {scene_id}")
 
         # A scene owns its prepared directory for the entire scene run, then
-        # it is cleaned before the next scene is staged.
-        staged = deps.stage_scene(scene, root)
-        if not isinstance(staged, StagedScene):
-            raise ValueError("stage_scene dependency returned an invalid scene")
-        require_descendant(staged.manifest_path.parent, root)
+        # it is cleaned before the next scene is staged.  Staging is a scene
+        # boundary, so an exception must become a normal run failure rather
+        # than escaping the campaign process.
+        try:
+            staged = deps.stage_scene(scene, root)
+            if not isinstance(staged, StagedScene):
+                raise ValueError("stage_scene dependency returned an invalid scene")
+            require_descendant(staged.manifest_path.parent, root)
+        except Exception as exc:
+            manifest_sha256 = _staging_failure_manifest_sha256(scene)
+            staging_expected: list[
+                tuple[PlannedRun, tuple[str, str, str, str], RunIdentitySeed]
+            ] = []
+            for planned in scene_plans[scene_id]:
+                seed = build_identity_seed(
+                    loaded=loaded,
+                    planned=planned,
+                    frame_start=scene.selection.start,
+                    frame_stop=scene.selection.stop,
+                    frame_stride=scene.selection.stride,
+                    staged_manifest_sha256=manifest_sha256,
+                    source_commit=source_commit,
+                    source_dirty=source_dirty,
+                    checkpoint_sha256=checkpoint_sha256,
+                )
+                key = _identity_key(seed, planned.variant.run_id)
+                expected_seeds[key] = seed
+                expected_order[key] = len(expected_order)
+                staging_expected.append((planned, key, seed))
 
+            for planned, seed_key, seed in staging_expected:
+                run_dir = _run_directory(root, planned)
+                require_descendant(run_dir, root)
+                prior_path = run_dir / "run.json"
+                if prior_path.is_file():
+                    try:
+                        prior = read_run_record(prior_path)
+                    except ValueError:
+                        prior = None
+                    if (
+                        prior is not None
+                        and prior.status is RunStatus.SUCCEEDED
+                        and prior.identity_seed == seed
+                    ):
+                        if not resume:
+                            raise ValueError(
+                                f"completed run already exists at {prior_path}; "
+                                "use a new output root or campaign ID"
+                            )
+                        existing[seed_key] = prior
+                        records.append(prior)
+                        skipped_ids.append(planned.variant.run_id)
+                        continue
+
+                attempt, attempt_dir = next_attempt(run_dir)
+                failed = _failed_staging_record(
+                    planned,
+                    seed,
+                    attempt,
+                    attempt_dir,
+                    loaded.config.runtime.cache_policy,
+                    _format_timestamp(deps.utc_now()),
+                    _format_timestamp(deps.utc_now()),
+                    exc,
+                )
+                write_run_record(run_dir / "run.json", failed)
+                records = [
+                    item
+                    for item in records
+                    if not (
+                        item.identity_seed == seed
+                        and item.run_id == planned.variant.run_id
+                    )
+                ]
+                records.append(failed)
+                existing[seed_key] = failed
+                if failure_policy is FailurePolicy.FAIL_FAST:
+                    stop = True
+                    break
+
+            publish_summary()
+            persist_cleanup_errors()
+            if stop:
+                break
+            continue
         scene_expected: list[tuple[PlannedRun, tuple[str, str, str, str], RunIdentitySeed]] = []
         for planned in scene_plans[scene_id]:
             seed = build_identity_seed(
@@ -1324,7 +1483,7 @@ def run_campaign(
             # Keep the tiny synthetic cache so subsequent matrix variants can
             # exercise the ordinary auto->readonly policy boundary.  Real
             # scenes retain the historical cleanup behavior.
-            if staged.dataset is not DatasetKind.SYNTHETIC:
+            if staged.dataset is not DatasetKind.SYNTHETIC and not keep_artifacts:
                 try_remove(
                     scene_cleanup_id,
                     _scene_cache_root(root, scene_plans[scene_id][0]),

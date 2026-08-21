@@ -131,13 +131,23 @@ def _fixture_staged(
     campaign_root: Path | None = None,
 ) -> StagedScene:
     stage_root = tmp_path / "campaign" if campaign_root is None else campaign_root
-    stage = stage_root / "prepared" / "synthetic" / scene.slice_id
+    stage = (
+        stage_root
+        / "prepared"
+        / scene.dataset.value
+        / scene.scene_id
+        / scene.slice_id
+    )
     image_dir = stage / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     image = image_dir / "000000.png"
     image.write_bytes(b"fixture-image")
     manifest = stage / "staging.json"
     manifest.write_text("{}\n", encoding="utf-8")
+    poses_path = None
+    if scene.evaluation_kind is EvaluationKind.INTERNAL_TRAJECTORY:
+        poses_path = stage / "poses.txt"
+        poses_path.write_text("0 0 0 1 0 0 0 0 1 0 0 0\n", encoding="utf-8")
     return StagedScene(
         scene_id=scene.scene_id,
         dataset=scene.dataset,
@@ -147,7 +157,7 @@ def _fixture_staged(
         source_frame_ids=scene.selection.source_frame_ids,
         selection=scene.selection,
         evaluation_kind=scene.evaluation_kind,
-        poses_path=None,
+        poses_path=poses_path,
         pointcloud_gt_path=None,
         manifest_path=manifest,
         manifest_sha256="3" * 64,
@@ -274,6 +284,75 @@ def test_first_pending_uses_auto_then_all_remaining_use_readonly(tmp_path):
     assert {record.identity.prediction_key for record in outcome.records if record.identity} == {"a" * 64}
 
 
+def test_scene_cache_root_is_namespaced_by_scene_and_slice(tmp_path):
+    loaded, plan, _, _ = make_runner_fixture(tmp_path)
+
+    assert runner_module.scene_cache_root(loaded.config.campaign_root, plan.runs[0]) == (
+        loaded.config.campaign_root
+        / "work/cache/synthetic/synthetic-fixture/f000000-000004-s1"
+    )
+
+
+@pytest.mark.parametrize("keep_artifacts", [True, False])
+def test_real_scene_cache_follows_keep_artifacts_retention(tmp_path, keep_artifacts):
+    loaded, plan, scenes, _ = make_runner_fixture(tmp_path)
+    synthetic_planned = plan.runs[0]
+    source_scene = scenes[synthetic_planned.scene_id]
+    real_scene = replace(
+        source_scene,
+        scene_id="kitti-fixture",
+        dataset=DatasetKind.KITTI,
+        scene="04",
+        evaluation_kind=EvaluationKind.INTERNAL_TRAJECTORY,
+    )
+    real_planned = replace(
+        synthetic_planned,
+        scene_id=real_scene.scene_id,
+        dataset=real_scene.dataset,
+        scene=real_scene.scene,
+        relative_run_dir=(
+            Path("runs")
+            / real_scene.dataset.value
+            / real_scene.scene_id
+            / synthetic_planned.slice_id
+            / synthetic_planned.variant.run_id
+        ),
+    )
+    real_plan = CampaignPlan(plan.campaign_id, plan.preset, (real_planned,))
+    real_scenes = {real_scene.scene_id: real_scene}
+
+    def evaluate(request, execution, loaded_config):
+        return EvaluationOutput(
+            EvaluationKind.INTERNAL_TRAJECTORY,
+            {
+                "internal_ate_rmse_m": 0.0,
+                "internal_rpe_translation_rmse_m": 0.0,
+                "internal_rpe_rotation_rmse_deg": 0.0,
+                "internal_matched_frame_count": 40,
+            },
+            (),
+        )
+
+    outcome = run_campaign(
+        loaded,
+        real_plan,
+        real_scenes,
+        resume=True,
+        failure_policy=FailurePolicy.KEEP_GOING,
+        keep_artifacts=keep_artifacts,
+        dependencies=_test_dependencies(
+            lambda request, config: _execution(request),
+            evaluate,
+        ),
+    )
+
+    assert outcome.exit_code == 0
+    cache_root = runner_module.scene_cache_root(
+        loaded.config.campaign_root, real_planned
+    )
+    assert cache_root.exists() is keep_artifacts
+
+
 def test_resume_with_cleaned_cache_returns_first_remaining_run_to_auto(tmp_path):
     loaded, plan, scenes, staged = make_runner_fixture(tmp_path)
     # The runner writes immutable records; this helper is deliberately a real
@@ -298,9 +377,14 @@ def test_resume_with_cleaned_cache_returns_first_remaining_run_to_auto(tmp_path)
         assert (loaded.config.campaign_root / planned.relative_run_dir / "run.json").is_file()
 
     modes.clear()
+    for planned in plan.runs[2:]:
+        (loaded.config.campaign_root / planned.relative_run_dir / "run.json").unlink()
     # Remove the shared cache completion marker to model a cleaned cache while
     # retaining exact completed records.
-    cache_root = loaded.config.campaign_root / "work/cache/synthetic/f000000-000004-s1"
+    cache_root = (
+        loaded.config.campaign_root
+        / "work/cache/synthetic/synthetic-fixture/f000000-000004-s1"
+    )
     for path in cache_root.rglob("complete.json"):
         path.unlink()
     outcome = run_campaign(
@@ -310,8 +394,8 @@ def test_resume_with_cleaned_cache_returns_first_remaining_run_to_auto(tmp_path)
         keep_artifacts=True,
         dependencies=_test_dependencies(execute, _no_evaluation),
     )
-    assert outcome.skipped_run_ids == ("depth__wr-off", "depth__wr-on", "geometry__wr-off", "geometry__wr-on", "atomic__wr-off", "atomic__wr-on")
-    assert modes == []
+    assert outcome.skipped_run_ids == ("depth__wr-off", "depth__wr-on")
+    assert modes == ["auto", "readonly", "readonly", "readonly"]
 
 
 def test_no_resume_refuses_to_replace_an_immutable_success(tmp_path):
@@ -502,47 +586,51 @@ def test_production_dependencies_have_no_test_builder():
     assert not hasattr(RunnerDependencies, "for_tests")
 
 
-def _two_scene_plan(loaded, plan, scenes):
+def _multi_scene_plan(loaded, plan, scenes, count=3):
     first = plan.runs[0]
     first_scene = scenes[first.scene_id]
-    second_scene = replace(
-        first_scene,
-        scene_id="synthetic-fixture-2",
-        scene="deterministic-pointmaps-2",
-    )
-    second = replace(
-        first,
-        scene_id=second_scene.scene_id,
-        scene=second_scene.scene,
-        relative_run_dir=(
-            Path("runs")
-            / first.dataset.value
-            / second_scene.scene_id
-            / first.slice_id
-            / first.variant.run_id
-        ),
-    )
-    return (
-        CampaignPlan(plan.campaign_id, plan.preset, (first, second)),
-        {first_scene.scene_id: first_scene, second_scene.scene_id: second_scene},
-    )
+    planned = []
+    resolved = {}
+    for index in range(count):
+        scene_id = first_scene.scene_id if index == 0 else f"{first_scene.scene_id}-{index + 1}"
+        scene = first_scene if index == 0 else replace(
+            first_scene,
+            scene_id=scene_id,
+            scene=f"{first_scene.scene}-{index + 1}",
+        )
+        item = first if index == 0 else replace(
+            first,
+            scene_id=scene.scene_id,
+            scene=scene.scene,
+            relative_run_dir=(
+                Path("runs")
+                / first.dataset.value
+                / scene.scene_id
+                / first.slice_id
+                / first.variant.run_id
+            ),
+        )
+        planned.append(item)
+        resolved[scene.scene_id] = scene
+    return CampaignPlan(plan.campaign_id, plan.preset, tuple(planned)), resolved
 
 
 def test_runner_stages_and_cleans_one_scene_before_staging_the_next(tmp_path):
     loaded, plan, scenes, _ = make_runner_fixture(tmp_path)
-    two_scene_plan, two_scenes = _two_scene_plan(loaded, plan, scenes)
+    three_scene_plan, three_scenes = _multi_scene_plan(loaded, plan, scenes)
     stage_calls = []
     executed = []
     first_prepared = (
         loaded.config.campaign_root
         / "prepared"
         / "synthetic"
-        / two_scene_plan.runs[0].slice_id
+        / three_scene_plan.runs[0].scene_id
+        / three_scene_plan.runs[0].slice_id
     )
 
     def stage(scene, root):
         stage_calls.append(scene.scene_id)
-        if scene.scene_id == two_scene_plan.runs[1].scene_id:
+        if scene.scene_id == three_scene_plan.runs[1].scene_id:
             if first_prepared.exists():
                 raise RuntimeError("prepared scenes coexist")
             raise RuntimeError("second scene staging failed")
@@ -552,26 +640,71 @@ def test_runner_stages_and_cleans_one_scene_before_staging_the_next(tmp_path):
         executed.append(request.planned.scene_id)
         return _execution(request)
 
-    with pytest.raises(RuntimeError, match="second scene staging failed"):
-        run_campaign(
-            loaded,
-            two_scene_plan,
-            two_scenes,
-            resume=True,
-            failure_policy=FailurePolicy.KEEP_GOING,
-            keep_artifacts=True,
-            dependencies=_test_dependencies(
-                execute, _no_evaluation, stage_scene=stage
-            ),
-        )
+    outcome = run_campaign(
+        loaded,
+        three_scene_plan,
+        three_scenes,
+        resume=True,
+        failure_policy=FailurePolicy.KEEP_GOING,
+        keep_artifacts=True,
+        dependencies=_test_dependencies(execute, _no_evaluation, stage_scene=stage),
+    )
 
     summary = json.loads(
         (loaded.config.campaign_root / "summary.json").read_text(encoding="utf-8")
     )
+    assert stage_calls == [
+        "synthetic-fixture",
+        "synthetic-fixture-2",
+        "synthetic-fixture-3",
+    ]
+    assert executed == ["synthetic-fixture", "synthetic-fixture-3"]
+    assert outcome.exit_code == 1
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].failure_stage is FailureStage.STAGING
+    assert outcome.failures[0].error is not None
+    assert outcome.failures[0].error.message == "second scene staging failed"
+    assert summary["completed_runs"] == 2
+    assert summary["failed_runs"] == 1
+    assert not first_prepared.exists()
+
+
+def test_runner_staging_failure_fail_fast_does_not_stage_later_scene(tmp_path):
+    loaded, plan, scenes, _ = make_runner_fixture(tmp_path)
+    three_scene_plan, three_scenes = _multi_scene_plan(loaded, plan, scenes)
+    stage_calls = []
+    executed = []
+
+    def stage(scene, root):
+        stage_calls.append(scene.scene_id)
+        if scene.scene_id == three_scene_plan.runs[1].scene_id:
+            raise RuntimeError("second scene staging failed")
+        return _fixture_staged(tmp_path, scene, campaign_root=Path(root))
+
+    def execute(request, loaded_config):
+        executed.append(request.planned.scene_id)
+        return _execution(request)
+
+    outcome = run_campaign(
+        loaded,
+        three_scene_plan,
+        three_scenes,
+        resume=True,
+        failure_policy=FailurePolicy.FAIL_FAST,
+        keep_artifacts=True,
+        dependencies=_test_dependencies(execute, _no_evaluation, stage_scene=stage),
+    )
+
+    assert outcome.exit_code == 1
     assert stage_calls == ["synthetic-fixture", "synthetic-fixture-2"]
     assert executed == ["synthetic-fixture"]
-    assert summary["completed_runs"] == 1
-    assert not first_prepared.exists()
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].failure_stage is FailureStage.STAGING
+    assert not (
+        loaded.config.campaign_root
+        / three_scene_plan.runs[2].relative_run_dir
+        / "run.json"
+    ).exists()
 
 
 def test_fresh_execution_validates_artifact_before_success_or_cleanup(tmp_path):

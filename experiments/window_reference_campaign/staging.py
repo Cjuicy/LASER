@@ -899,7 +899,10 @@ def stage_scene(scene: ResolvedScene, campaign_root: str | Path) -> StagedScene:
         raise ValueError("staging requires ResolvedScene")
     root = Path(campaign_root).resolve(strict=False)
     payload, _ = preview_staging_manifest(scene)
-    dataset_root = require_descendant(root / "prepared" / scene.dataset.value, root)
+    dataset_root = require_descendant(
+        root / "prepared" / scene.dataset.value / scene.scene_id,
+        root,
+    )
     dataset_root.mkdir(parents=True, exist_ok=True)
     final = require_descendant(dataset_root / scene.slice_id, root)
     if final.exists() or final.is_symlink():

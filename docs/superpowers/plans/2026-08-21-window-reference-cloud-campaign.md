@@ -889,7 +889,7 @@ def preview_staging_manifest(scene: ResolvedScene) -> tuple[dict[str, object], s
     return payload, canonical_sha256(payload)
 ```
 
-Build staging in `{campaign_root}/prepared/{dataset}/{slice_id}.tmp-{pid}-{nonce}`, then atomically rename it to the final directory. Write images as relative symlinks named `000000.png` onward; write `source_frame_ids.npy`, `poses.txt`, `ground_truth.npz`, and `staging.json` through temporary siblings. The staging manifest records SHA-256 for source files and staged pose/GT payloads, but records no credentials or external URL.
+Build staging in `{campaign_root}/prepared/{dataset}/{scene_id}/{slice_id}.tmp-{pid}-{nonce}`, then atomically rename it to the final directory. Write images as relative symlinks named `000000.png` onward; write `source_frame_ids.npy`, `poses.txt`, `ground_truth.npz`, and `staging.json` through temporary siblings. The staging manifest records SHA-256 for source files and staged pose/GT payloads, but records no credentials or external URL.
 
 For external GT, accept frame IDs from NPZ key `frame_ids`, sibling `source_frame_ids.npy`, or sibling `frame_ids.npy` in that precedence order; reject disagreement when more than one is present. Require `point_maps.shape == (N,H,W,3)`, `valid_mask.shape == (N,H,W)`, finite selected point values where mask is true, unique integer IDs, and configured `(H,W) == (392,518)`. Create a source-ID-to-position map, select exactly `scene.selection.source_frame_ids`, then write campaign-owned NPZ containing all three arrays.
 
@@ -1552,7 +1552,7 @@ def run_directory(campaign_root: Path, planned: PlannedRun) -> Path:
 
 
 def scene_cache_root(campaign_root: Path, planned: PlannedRun) -> Path:
-    return campaign_root / "work/cache" / planned.dataset.value / planned.slice_id
+    return campaign_root / "work/cache" / planned.dataset.value / planned.scene_id / planned.slice_id
 
 
 def next_attempt(run_dir: Path) -> tuple[int, Path]:

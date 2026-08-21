@@ -151,7 +151,17 @@ def _kitti_scene(tmp_path: Path) -> ResolvedScene:
 
 
 def test_staging_uses_one_vector_for_images_pose_rows_and_manifest(tmp_path):
-    staged = stage_scene(_kitti_scene(tmp_path), tmp_path / "campaign")
+    scene = _kitti_scene(tmp_path)
+    staged = stage_scene(scene, tmp_path / "campaign")
+
+    assert staged.manifest_path.parent == (
+        tmp_path
+        / "campaign"
+        / "prepared"
+        / "kitti"
+        / scene.scene_id
+        / scene.slice_id
+    )
 
     assert sorted(path.name for path in staged.image_dir.iterdir()) == [
         "000000.png", "000001.png", "000002.png"
@@ -543,7 +553,7 @@ def test_raw_dataset_output_requires_pointmap_leading_dimension_to_match_ids(tmp
 def test_publish_never_exposes_partial_final_directory(tmp_path, monkeypatch):
     scene = _kitti_scene(tmp_path)
     root = (tmp_path / "campaign").resolve()
-    final = root / "prepared/kitti" / scene.slice_id
+    final = root / "prepared/kitti" / scene.scene_id / scene.slice_id
     snapshots: list[tuple[str, ...]] = []
     original_replace = staging_module.os.replace
 
@@ -571,7 +581,7 @@ def test_publish_failure_does_not_leave_partial_final_or_temporary_directory(
 ):
     scene = _kitti_scene(tmp_path)
     root = (tmp_path / "campaign").resolve()
-    final = root / "prepared/kitti" / scene.slice_id
+    final = root / "prepared/kitti" / scene.scene_id / scene.slice_id
 
     def fail_publish(_temporary, _destination):
         raise OSError("injected atomic publish failure")
@@ -592,7 +602,7 @@ def test_publish_failure_does_not_leave_partial_final_or_temporary_directory(
 def test_publish_race_never_clobbers_concurrent_invalid_final(tmp_path, monkeypatch):
     scene = _kitti_scene(tmp_path)
     root = (tmp_path / "campaign").resolve()
-    final = root / "prepared/kitti" / scene.slice_id
+    final = root / "prepared/kitti" / scene.scene_id / scene.slice_id
 
     def race_publish(_temporary, destination):
         destination.mkdir(parents=True)
@@ -614,7 +624,7 @@ def test_publish_race_never_clobbers_concurrent_invalid_final(tmp_path, monkeypa
 def test_publish_race_with_preexisting_empty_final_keeps_winner_empty(tmp_path, monkeypatch):
     scene = _kitti_scene(tmp_path)
     root = (tmp_path / "campaign").resolve()
-    final = root / "prepared/kitti" / scene.slice_id
+    final = root / "prepared/kitti" / scene.scene_id / scene.slice_id
 
     def empty_winner(_temporary, destination):
         destination.mkdir(parents=True)

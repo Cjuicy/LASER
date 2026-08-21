@@ -329,7 +329,12 @@ def test_default_campaign_root_is_ignored_without_changing_git_source_state():
 
 
 def _synthetic_cache_entry(campaign: Path) -> Path:
-    entries = sorted((campaign / "work/cache/synthetic/f000000-000004-s1/v2").iterdir())
+    entries = sorted(
+        (
+            campaign
+            / "work/cache/synthetic/synthetic-fixture/f000000-000004-s1/v2"
+        ).iterdir()
+    )
     assert len(entries) == 1
     return entries[0]
 
@@ -343,7 +348,11 @@ def _synthetic_prediction_key(campaign: Path) -> str:
 
 
 def _write_complete_synthetic_cache(campaign: Path, prediction_key: str) -> Path:
-    entry = campaign / "work/cache/synthetic/f000000-000004-s1/v2" / prediction_key
+    entry = (
+        campaign
+        / "work/cache/synthetic/synthetic-fixture/f000000-000004-s1/v2"
+        / prediction_key
+    )
     (entry / "windows").mkdir(parents=True, exist_ok=True)
     (entry / "manifest.json").write_text(
         json.dumps({"synthetic": True, "key": prediction_key}) + "\n",
@@ -494,7 +503,11 @@ def test_synthetic_cache_probe_rebuilds_wrong_complete_metadata(tmp_path: Path):
         complete_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         _remove_first_synthetic_record(campaign)
         run_synthetic_campaign(tmp_path, "--resume", "--keep-artifacts")
-        assert cache_entry_complete(campaign / "work/cache/synthetic/f000000-000004-s1", prediction_key, 2)
+        assert cache_entry_complete(
+            campaign / "work/cache/synthetic/synthetic-fixture/f000000-000004-s1",
+            prediction_key,
+            2,
+        )
 
 
 def test_synthetic_preflight_ignores_missing_data_checkpoint_and_gpu(tmp_path: Path):

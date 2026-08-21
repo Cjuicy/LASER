@@ -440,7 +440,7 @@ frame IDs must have equal leading dimensions and match staged frames exactly.
 Each scene slice owns one shared ordinary prediction-cache root:
 
 ```text
-<campaign>/work/cache/<dataset>/<scene-slice>/v2/<prediction-key>/
+<campaign>/work/cache/<dataset>/<scene-id>/<scene-slice>/v2/<prediction-key>/
 ```
 
 Run order is deterministic:
@@ -549,9 +549,9 @@ outputs/window_reference_campaign/<campaign-id>/
   campaign.json
   plan.json
   preflight.json
-  prepared/<dataset>/<scene-slice>/
-  work/cache/<dataset>/<scene-slice>/
-  runs/<dataset>/<scene-slice>/<method>__wr-{off,on}/
+  prepared/<dataset>/<scene-id>/<scene-slice>/
+  work/cache/<dataset>/<scene-id>/<scene-slice>/
+  runs/<dataset>/<scene-id>/<scene-slice>/<method>__wr-{off,on}/
     attempts/<attempt-id>/stdout.log
     run.json
     diagnostics_summary.json
@@ -714,4 +714,3 @@ The detailed plan will expand these sequential TDD units:
 - The current no-GPU instance cannot validate PI3 execution, CUDA memory, or
   empirical quality. The feature remains unvalidated on real data until GPU
   smoke and selected campaigns are run.
-
