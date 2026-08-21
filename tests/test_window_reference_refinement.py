@@ -401,6 +401,10 @@ def test_enabled_refiner_uses_insufficient_support_fallback_without_splitting():
     results, point_maps, camera_poses, confidence, intrinsic = (
         _two_region_identity_fixture()
     )
+    results[1] = SegmentationResult(
+        results[1].labels.astype(np.int32),
+        dict(results[1].diagnostics),
+    )
     refined = _run_enabled(
         results=results,
         point_maps=point_maps,
@@ -414,6 +418,7 @@ def test_enabled_refiner_uses_insufficient_support_fallback_without_splitting():
     )
 
     np.testing.assert_array_equal(refined[1].labels, results[1].labels)
+    assert refined[1].labels.dtype == np.intp
     assert refined[1].diagnostics["window_reference_fallback"] == (
         "insufficient_support"
     )
@@ -435,7 +440,7 @@ def test_enabled_refiner_reports_conflict_only_when_all_eligible_unions_conflict
     point_maps = torch.from_numpy(np.stack([points, points, points]))
     camera_poses = torch.eye(4).repeat(3, 1, 1)
     confidence = torch.zeros((3, height, width))
-    target_labels = np.repeat(np.arange(2, dtype=np.intp)[None, :], height, axis=0)
+    target_labels = np.repeat(np.arange(2, dtype=np.int32)[None, :], height, axis=0)
     source_zero = np.zeros((height, width), dtype=np.intp)
     source_one = np.zeros((height, width), dtype=np.intp)
     source_one.flat[1] = 1
@@ -506,6 +511,7 @@ def test_enabled_refiner_reports_conflict_only_when_all_eligible_unions_conflict
     )
 
     np.testing.assert_array_equal(refined[2].labels, results[2].labels)
+    assert refined[2].labels.dtype == np.intp
     assert refined[2].diagnostics["window_reference_fallback"] == "conflict_only"
     assert refined[2].diagnostics["window_reference_accepted_edges"] == 0
     assert refined[2].diagnostics["window_reference_conflict_edges"] == 1

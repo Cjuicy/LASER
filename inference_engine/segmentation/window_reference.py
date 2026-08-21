@@ -1242,18 +1242,19 @@ class WindowReferenceRefiner:
             if is_keyframe:
                 output_labels = initial_labels.copy()
                 fallback = "none"
-            elif accepted_edges:
+            else:
                 output_labels = compact_labels(roots[initial_labels]).astype(
                     np.intp,
                     copy=False,
                 )
-                fallback = "none"
-            else:
-                output_labels = initial_labels.copy()
                 fallback = (
-                    "conflict_only"
-                    if conflict_edges > 0
-                    else "insufficient_support"
+                    "none"
+                    if accepted_edges > 0
+                    else (
+                        "conflict_only"
+                        if conflict_edges > 0
+                        else "insufficient_support"
+                    )
                 )
             regions_after = int(np.unique(output_labels).size)
             diagnostics = {
