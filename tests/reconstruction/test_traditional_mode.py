@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import torch
 
 from inference_engine.segmentation import DisabledWindowReferenceRefiner
-from reconstruction.shared import as_numpy
+from reconstruction.shared import as_numpy, segment_and_refine_window
+from pipeline.artifacts import write_reconstruction_artifact
 from loop_closure.types import LoopSolution
 from pipeline.config import ReconstructionMode, load_pipeline_config
 from pipeline.manifest import ImageManifest
@@ -46,7 +48,7 @@ class FailingOptimizer:
         raise AssertionError("empty constraints must not invoke optimizer")
 
 
-def _context(anchor, predictions, *, events=None):
+def _context(anchor, predictions, *, events=None, refiner=None):
     config = load_pipeline_config(
         "configs/reconstruction/pi3_laser.yaml",
         (
@@ -62,7 +64,9 @@ def _context(anchor, predictions, *, events=None):
         predictions=predictions,
         frame_ids=(0, 1, 2, 3),
         segmentation_strategy=OneRegionSegmenter(),
-        window_reference_refiner=DisabledWindowReferenceRefiner(),
+        window_reference_refiner=(
+            refiner if refiner is not None else DisabledWindowReferenceRefiner()
+        ),
         anchor_propagator=anchor,
         segmentation_config=config.segmentation,
         anchor_config=config.anchor_propagation,
@@ -87,6 +91,43 @@ def _predictions(events=None):
         if events is not None:
             events.append(f"window:{prediction.spec.index}")
         yield prediction
+
+
+def _segment_only_window(
+    *,
+    strategy,
+    refiner,
+    point_maps,
+    camera_poses,
+    confidence,
+    images,
+    reference_intrinsic,
+):
+    del refiner, camera_poses, reference_intrinsic
+    return strategy.segment(
+        as_numpy(point_maps),
+        as_numpy(confidence),
+        as_numpy(images),
+    )
+
+
+def _artifact_files(path):
+    return sorted(
+        item.relative_to(path)
+        for item in Path(path).rglob("*")
+        if item.is_file()
+    )
+
+
+def _write_test_artifact(artifact, path):
+    return write_reconstruction_artifact(
+        artifact,
+        path,
+        resolved_yaml="version: 2\n",
+        config_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+        git_commit="c" * 40,
+    )
 
 
 def test_traditional_defers_all_recorded_corrections_until_aggregate():
@@ -119,6 +160,78 @@ def test_traditional_defers_all_recorded_corrections_until_aggregate():
     assert mode.trace[1].local_points[:, 0, 0, 2].tolist() == [1.0, 1.0]
     assert mode.trace[1].anchor_scale_mask[:, 0, 0, 0].tolist() == [3.0, 3.0]
     assert artifact.local_points[:, 0, 0, 2].tolist() == [1.0, 1.0, 3.0, 6.0]
+
+
+def test_traditional_disabled_wrapper_matches_segment_only_artifact_contract(
+    tmp_path,
+):
+    def run(segment_window):
+        graph_inputs = []
+
+        def build_graphs(results, threshold):
+            graph_inputs.append(results)
+            return tuple(results), threshold
+
+        context, optimizer_config = _context(
+            SequencedAnchor(scales=(1.0, 1.0)),
+            _predictions(),
+        )
+        mode = TraditionalReconstructionMode(
+            detector=EmptyDetector(),
+            evidence=UnusedEvidence(),
+            optimizer_config=optimizer_config,
+            optimizer=FailingOptimizer(),
+            register_adjacent=lambda *arguments: identity_sim3(),
+            apply_pose_sim3=lambda poses, *arguments: poses,
+            build_graphs=build_graphs,
+            segment_window=segment_window,
+        )
+        return mode.run(context), graph_inputs
+
+    baseline, baseline_graphs = run(_segment_only_window)
+    wrapped, wrapped_graphs = run(segment_and_refine_window)
+
+    assert baseline.schema_version == wrapped.schema_version == 1
+    assert baseline.reconstruction_mode is wrapped.reconstruction_mode
+    assert baseline.segmentation_method is wrapped.segmentation_method
+    assert baseline.prediction_key == wrapped.prediction_key
+    assert baseline.diagnostics == wrapped.diagnostics
+    for name in ("local_points", "global_points", "camera_poses", "confidence"):
+        assert torch.equal(getattr(baseline, name), getattr(wrapped, name))
+    assert len(baseline_graphs) == len(wrapped_graphs)
+    for baseline_results, wrapped_results in zip(
+        baseline_graphs,
+        wrapped_graphs,
+    ):
+        assert len(baseline_results) == len(wrapped_results)
+        for baseline_result, wrapped_result in zip(
+            baseline_results,
+            wrapped_results,
+        ):
+            assert torch.equal(
+                torch.as_tensor(baseline_result.labels),
+                torch.as_tensor(wrapped_result.labels),
+            )
+            assert dict(baseline_result.diagnostics) == dict(
+                wrapped_result.diagnostics
+            )
+
+    baseline_dir = _write_test_artifact(baseline, tmp_path / "baseline")
+    wrapped_dir = _write_test_artifact(wrapped, tmp_path / "wrapped")
+    assert _artifact_files(baseline_dir) == _artifact_files(wrapped_dir)
+    for relative in (
+        Path("manifest.json"),
+        Path("diagnostics.json"),
+        Path("resolved_reconstruction.yaml"),
+    ):
+        baseline_file = baseline_dir / relative
+        wrapped_file = wrapped_dir / relative
+        if relative.suffix == ".json":
+            assert json.loads(baseline_file.read_text()) == json.loads(
+                wrapped_file.read_text()
+            )
+        else:
+            assert baseline_file.read_text() == wrapped_file.read_text()
 
 
 def test_traditional_segments_refines_graphs_and_anchors_untransformed_state():
@@ -203,6 +316,83 @@ def test_traditional_segments_refines_graphs_and_anchors_untransformed_state():
     assert all(torch.equal(call[1], torch.eye(4).repeat(2, 1, 1)) for call in calls)
     assert all(call[3] is intrinsic for call in calls)
     assert all(call[4] is context.window_reference_refiner for call in calls)
+
+
+def test_traditional_enabled_wrapper_forwards_missing_prediction_intrinsic():
+    graph_inputs = []
+
+    class RecordingEnabledRefiner:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+            self.returned = []
+
+        def refine(
+            self,
+            results,
+            *,
+            point_maps,
+            camera_poses,
+            confidence,
+            reference_intrinsic,
+        ):
+            self.calls.append(
+                (point_maps, camera_poses, confidence, reference_intrinsic)
+            )
+            refined = [
+                type(result)(
+                    result.labels.copy(),
+                    {**dict(result.diagnostics), "refined": True},
+                )
+                for result in results
+            ]
+            self.returned.append(refined)
+            return refined
+
+    refiner = RecordingEnabledRefiner()
+
+    def build_graphs(results, threshold):
+        graph_inputs.append(results)
+        return tuple(results), threshold
+
+    context, optimizer_config = _context(
+        SequencedAnchor(scales=(1.0, 1.0)),
+        _predictions(),
+        refiner=refiner,
+    )
+    mode = TraditionalReconstructionMode(
+        detector=EmptyDetector(),
+        evidence=UnusedEvidence(),
+        optimizer_config=optimizer_config,
+        optimizer=FailingOptimizer(),
+        register_adjacent=lambda *arguments: identity_sim3(),
+        apply_pose_sim3=lambda poses, *arguments: poses,
+        build_graphs=build_graphs,
+        segment_window=segment_and_refine_window,
+    )
+
+    artifact = mode.run(context)
+
+    assert len(refiner.calls) == 3
+    assert all(call[3] is None for call in refiner.calls)
+    assert all(
+        graph_result is refined
+        for graph_result, refined in zip(graph_inputs, refiner.returned)
+    )
+    assert all(
+        graph_result[0].labels is refined[0].labels
+        for graph_result, refined in zip(graph_inputs, refiner.returned)
+    )
+    assert all(
+        result.diagnostics["refined"]
+        for window_results in graph_inputs
+        for result in window_results
+    )
+    assert all(
+        summary["refined"]
+        for summary in artifact.diagnostics.segmentation_summaries
+    )
 
 
 def test_traditional_detects_only_after_all_windows_are_recorded():

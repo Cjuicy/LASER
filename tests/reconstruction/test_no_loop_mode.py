@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import inspect
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
 from inference_engine.segmentation import DisabledWindowReferenceRefiner
-from pipeline.artifacts import ReconstructionArtifact
+from pipeline.artifacts import ReconstructionArtifact, write_reconstruction_artifact
 from pipeline.config import (
     ConfidenceQuantileMethod,
     ReconstructionMode,
@@ -16,7 +18,11 @@ from pipeline.config import (
 from reconstruction.modes.base import ReconstructionContext
 from reconstruction.modes.no_loop import NoLoopReconstructionMode
 from reconstruction.prediction_stream import iter_window_predictions
-from reconstruction.shared import as_numpy, reference_intrinsic
+from reconstruction.shared import (
+    as_numpy,
+    reference_intrinsic,
+    segment_and_refine_window,
+)
 from tests.reconstruction.fixtures import (
     SPECS,
     LiteralProvider,
@@ -46,6 +52,43 @@ def _context(anchor, predictions, *, segmenter=None):
         registration_config=config.registration,
         window_config=config.window,
         reconstruction_mode=ReconstructionMode.NO_LOOP,
+    )
+
+
+def _segment_only_window(
+    *,
+    strategy,
+    refiner,
+    point_maps,
+    camera_poses,
+    confidence,
+    images,
+    reference_intrinsic,
+):
+    del refiner, camera_poses, reference_intrinsic
+    return strategy.segment(
+        as_numpy(point_maps),
+        as_numpy(confidence),
+        as_numpy(images),
+    )
+
+
+def _artifact_files(path):
+    return sorted(
+        item.relative_to(path)
+        for item in Path(path).rglob("*")
+        if item.is_file()
+    )
+
+
+def _write_test_artifact(artifact, path):
+    return write_reconstruction_artifact(
+        artifact,
+        path,
+        resolved_yaml="version: 2\n",
+        config_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+        git_commit="c" * 40,
     )
 
 
@@ -101,6 +144,79 @@ def test_no_loop_matches_table_four_incremental_order():
         10.0,
         21.0,
     ]
+
+
+def test_no_loop_disabled_wrapper_matches_segment_only_artifact_contract(tmp_path):
+    def run(segment_window):
+        graph_inputs = []
+
+        def build_graphs(results, threshold):
+            graph_inputs.append(results)
+            return tuple(results), threshold
+
+        mode = NoLoopReconstructionMode(
+            register_adjacent=lambda *arguments: identity_sim3(),
+            apply_pose_sim3=lambda poses, *arguments: poses,
+            build_graphs=build_graphs,
+            segment_window=segment_window,
+        )
+        artifact = mode.run(
+            _context(
+                SequencedAnchor(scales=(1.0, 1.0)),
+                iter_window_predictions(
+                    LiteralProvider(),
+                    SPECS,
+                    torch.zeros((4, 3, 1, 1)),
+                    "cpu",
+                ),
+            )
+        )
+        return artifact, graph_inputs
+
+    baseline, baseline_graphs = run(_segment_only_window)
+    wrapped, wrapped_graphs = run(segment_and_refine_window)
+
+    assert baseline.schema_version == wrapped.schema_version == 1
+    assert baseline.reconstruction_mode is wrapped.reconstruction_mode
+    assert baseline.segmentation_method is wrapped.segmentation_method
+    assert baseline.prediction_key == wrapped.prediction_key
+    assert baseline.diagnostics == wrapped.diagnostics
+    for name in ("local_points", "global_points", "camera_poses", "confidence"):
+        assert torch.equal(getattr(baseline, name), getattr(wrapped, name))
+    assert len(baseline_graphs) == len(wrapped_graphs)
+    for baseline_results, wrapped_results in zip(
+        baseline_graphs,
+        wrapped_graphs,
+    ):
+        assert len(baseline_results) == len(wrapped_results)
+        for baseline_result, wrapped_result in zip(
+            baseline_results,
+            wrapped_results,
+        ):
+            np.testing.assert_array_equal(
+                baseline_result.labels,
+                wrapped_result.labels,
+            )
+            assert dict(baseline_result.diagnostics) == dict(
+                wrapped_result.diagnostics
+            )
+
+    baseline_dir = _write_test_artifact(baseline, tmp_path / "baseline")
+    wrapped_dir = _write_test_artifact(wrapped, tmp_path / "wrapped")
+    assert _artifact_files(baseline_dir) == _artifact_files(wrapped_dir)
+    for relative in (
+        Path("manifest.json"),
+        Path("diagnostics.json"),
+        Path("resolved_reconstruction.yaml"),
+    ):
+        baseline_file = baseline_dir / relative
+        wrapped_file = wrapped_dir / relative
+        if relative.suffix == ".json":
+            assert json.loads(baseline_file.read_text()) == json.loads(
+                wrapped_file.read_text()
+            )
+        else:
+            assert baseline_file.read_text() == wrapped_file.read_text()
 
 
 def test_no_loop_consumes_predictions_incrementally():
