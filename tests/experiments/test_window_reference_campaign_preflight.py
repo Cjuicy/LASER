@@ -22,6 +22,8 @@ from experiments.window_reference_campaign.preflight import (
     DiskUsage,
     GitState,
     PreflightDependencies,
+    _default_cuda_state,
+    _validate_pointmap,
     build_bootstrap_actions,
     preflight_campaign,
     run_bootstrap,
@@ -136,6 +138,138 @@ def test_run_bootstrap_prints_shell_quoted_commands_and_executes_in_order(tmp_pa
     assert run_bootstrap(actions, execute=True, run=run) == 0
     assert [item[0] for item in calls] == [action.argv for action in actions]
     assert all(item[1] == tmp_path.resolve() and item[2] is True for item in calls)
+
+
+def test_default_cuda_state_checks_selected_device_bfloat16_and_restores_current(monkeypatch):
+    class DeviceContext:
+        def __init__(self, cuda, index):
+            self.cuda = cuda
+            self.index = index
+            self.previous = None
+
+        def __enter__(self):
+            self.previous = self.cuda.current
+            self.cuda.entered.append(self.index)
+            self.cuda.current = self.index
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.cuda.current = self.previous
+            return False
+
+    class FakeCuda:
+        current = 0
+        entered = []
+        queried = []
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+        @staticmethod
+        def get_device_name(index):
+            return f"fake-{index}"
+
+        @classmethod
+        def device(cls, index):
+            return DeviceContext(cls, index)
+
+        @classmethod
+        def is_bf16_supported(cls):
+            cls.queried.append(cls.current)
+            return cls.current == 1
+
+    fake_torch = type("FakeTorch", (), {"cuda": FakeCuda})
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    gpu0 = _default_cuda_state(0)
+    gpu1 = _default_cuda_state(1)
+
+    assert gpu0.bfloat16_supported is False
+    assert gpu1.bfloat16_supported is True
+    assert FakeCuda.queried == [0, 1]
+    assert FakeCuda.entered == [0, 1]
+    assert FakeCuda.current == 0
+
+
+def test_default_cuda_state_context_or_api_failure_is_conservative(monkeypatch):
+    class BrokenCuda:
+        current = 0
+        entered = []
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 2
+
+        @staticmethod
+        def get_device_name(index):
+            return f"fake-{index}"
+
+        @classmethod
+        def device(cls, index):
+            cls.entered.append(index)
+            raise RuntimeError("device context failed")
+
+        @staticmethod
+        def is_bf16_supported():
+            raise AssertionError("must not query outside selected device context")
+
+    fake_torch = type("FakeTorch", (), {"cuda": BrokenCuda})
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    state = _default_cuda_state(1)
+
+    assert state.bfloat16_supported is False
+    assert BrokenCuda.entered == [1]
+    assert BrokenCuda.current == 0
+
+
+def _pointmap_archive(tmp_path: Path, *, include_archive_ids: bool = True) -> Path:
+    pointmap = tmp_path / "ground_truth.npz"
+    payload = {
+        "point_maps": np.zeros((2, 2, 3, 3), dtype=np.float32),
+        "valid_mask": np.ones((2, 2, 3), dtype=bool),
+    }
+    if include_archive_ids:
+        payload["frame_ids"] = np.array([10, 20], dtype=np.int64)
+    np.savez(pointmap, **payload)
+    return pointmap
+
+
+def test_validate_pointmap_accepts_matching_npz_and_both_sibling_frame_id_sources(tmp_path):
+    pointmap = _pointmap_archive(tmp_path)
+    np.save(pointmap.parent / "source_frame_ids.npy", np.array([10, 20], dtype=np.int64))
+    np.save(pointmap.parent / "frame_ids.npy", np.array([10, 20], dtype=np.int64))
+
+    detail = _validate_pointmap(pointmap, (2, 3), (10, 20))
+
+    assert detail["frame_count"] == 2
+    assert detail["spatial_shape"] == [2, 3]
+
+
+def test_validate_pointmap_rejects_conflicting_npz_and_sibling_frame_id_sources(tmp_path):
+    pointmap = _pointmap_archive(tmp_path)
+    np.save(pointmap.parent / "source_frame_ids.npy", np.array([10, 20], dtype=np.int64))
+    np.save(pointmap.parent / "frame_ids.npy", np.array([10, 21], dtype=np.int64))
+
+    with pytest.raises(ValueError, match="frame ID sources disagree"):
+        _validate_pointmap(pointmap, (2, 3), (10, 20))
+
+
+def test_validate_pointmap_rejects_non_vector_sibling_frame_ids(tmp_path):
+    pointmap = _pointmap_archive(tmp_path)
+    np.save(pointmap.parent / "source_frame_ids.npy", np.array([[10, 20]], dtype=np.int64))
+
+    with pytest.raises(ValueError, match="one-dimensional integer array"):
+        _validate_pointmap(pointmap, (2, 3), (10, 20))
 
 
 def test_allow_no_gpu_succeeds_but_records_not_gpu_ready(tmp_path):

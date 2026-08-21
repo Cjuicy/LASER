@@ -365,12 +365,18 @@ def _default_cuda_state(index: int) -> CudaState:
         count = int(torch.cuda.device_count()) if available else 0
         if not available or index < 0 or index >= count:
             return CudaState(available, count, None, None, None)
-        name = str(torch.cuda.get_device_name(index))
         try:
-            bfloat16 = bool(torch.cuda.is_bf16_supported(device=index))
-        except TypeError:
-            bfloat16 = bool(torch.cuda.is_bf16_supported())
+            name = str(torch.cuda.get_device_name(index))
         except Exception:
+            name = None
+        try:
+            # PyTorch's public helper reads the current CUDA device.  Enter
+            # the selected device explicitly; passing ``device=`` is not
+            # portable across supported PyTorch versions.
+            with torch.cuda.device(index):
+                bfloat16 = bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            # A context/API failure must never claim dtype compatibility.
             bfloat16 = False
         return CudaState(True, count, index, name, bfloat16)
     except Exception:
@@ -527,17 +533,29 @@ def _validate_pointmap(path: Path, expected: tuple[int, int], selected_ids: tupl
             raise ValueError("point-map GT archive requires point_maps and valid_mask")
         point_maps = np.asarray(archive["point_maps"])
         valid_mask = np.asarray(archive["valid_mask"])
+        candidates: list[tuple[str, np.ndarray]] = []
         if "frame_ids" in archive:
-            frame_ids = np.asarray(archive["frame_ids"])
-        else:
-            sibling = path.parent / "source_frame_ids.npy"
-            if not sibling.is_file():
-                sibling = path.parent / "frame_ids.npy"
-            if not sibling.is_file():
-                raise ValueError("point-map GT archive requires frame IDs")
-            frame_ids = np.asarray(np.load(sibling, allow_pickle=False))
-        if frame_ids.ndim != 1 or frame_ids.dtype.kind not in "iu":
-            raise ValueError("point-map GT frame IDs must be a one-dimensional integer array")
+            candidates.append(("frame_ids", np.asarray(archive["frame_ids"])))
+        for name in ("source_frame_ids.npy", "frame_ids.npy"):
+            sibling = path.parent / name
+            if sibling.is_file():
+                try:
+                    candidates.append((name, np.asarray(np.load(sibling, allow_pickle=False))))
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f"point-map GT frame IDs are invalid: {sibling}") from exc
+        if not candidates:
+            raise ValueError("point-map GT archive requires frame IDs")
+        normalized_candidates: list[tuple[str, np.ndarray]] = []
+        for source_name, raw_ids in candidates:
+            source_ids = np.asarray(raw_ids)
+            if source_ids.ndim != 1 or source_ids.dtype.kind not in "iu":
+                raise ValueError("point-map GT frame IDs must be a one-dimensional integer array")
+            normalized_candidates.append(
+                (source_name, source_ids.astype(np.int64, copy=False))
+            )
+        frame_ids = normalized_candidates[0][1]
+        if any(not np.array_equal(frame_ids, other) for _, other in normalized_candidates[1:]):
+            raise ValueError("point-map GT frame ID sources disagree")
         if len(set(int(value) for value in frame_ids.tolist())) != len(frame_ids):
             raise ValueError("point-map GT frame IDs must be unique")
         if point_maps.ndim != 4 or point_maps.shape[-1] != 3:
