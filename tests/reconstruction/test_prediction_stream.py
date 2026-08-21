@@ -19,6 +19,105 @@ SPECS = (
 )
 
 
+def _mapping():
+    return {
+        "local_points": torch.zeros((1, 2, 2, 2, 3)),
+        "camera_poses": torch.eye(4).repeat(1, 2, 1, 1),
+        "conf": torch.ones((1, 2, 2, 2)),
+        "images": torch.zeros((1, 2, 3, 2, 2)),
+    }
+
+
+def test_window_prediction_allows_absent_reference_intrinsic():
+    prediction = WindowPrediction.from_mapping(
+        _mapping(),
+        SPECS[0],
+        "key",
+        "cpu",
+    )
+
+    assert prediction.reference_intrinsic is None
+
+
+def test_window_prediction_moves_reference_intrinsic_to_process_device():
+    intrinsic = torch.tensor(
+        [
+            [2.0, 0.0, 1.0],
+            [0.0, 3.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ],
+    )
+    mapping = {**_mapping(), "reference_intrinsic": intrinsic}
+
+    prediction = WindowPrediction.from_mapping(
+        mapping,
+        SPECS[0],
+        "key",
+        "cpu",
+    )
+
+    assert torch.equal(prediction.reference_intrinsic, intrinsic)
+    assert prediction.reference_intrinsic.device.type == "cpu"
+    intrinsic[0, 0] = -123.0
+    assert prediction.reference_intrinsic[0, 0].item() > 0.0
+
+
+@pytest.mark.parametrize(
+    ("name", "intrinsic", "match"),
+    [
+        ("shape", torch.ones((2, 3)), "shape"),
+        ("dtype", torch.ones((3, 3), dtype=torch.int64), "floating dtype"),
+        (
+            "finiteness",
+            torch.tensor(
+                [
+                    [2.0, 0.0, 1.0],
+                    [0.0, 3.0, 1.0],
+                    [0.0, 0.0, float("nan")],
+                ],
+            ),
+            "finite",
+        ),
+        (
+            "focal lengths",
+            torch.tensor(
+                [
+                    [0.0, 0.0, 1.0],
+                    [0.0, 3.0, 1.0],
+                    [0.0, 0.0, 1.0],
+                ],
+            ),
+            "focal lengths",
+        ),
+        (
+            "last row",
+            torch.tensor(
+                [
+                    [2.0, 0.0, 1.0],
+                    [0.0, 3.0, 1.0],
+                    [0.0, 0.0, 2.0],
+                ],
+            ),
+            "last row",
+        ),
+    ],
+)
+def test_window_prediction_rejects_invalid_reference_intrinsic(
+    name,
+    intrinsic,
+    match,
+):
+    del name
+
+    with pytest.raises(ValueError, match=match):
+        WindowPrediction.from_mapping(
+            {**_mapping(), "reference_intrinsic": intrinsic},
+            SPECS[0],
+            "key",
+            "cpu",
+        )
+
+
 class CompleteRecordingProvider:
     def __init__(self, prediction_key: str):
         self.prediction_key = prediction_key

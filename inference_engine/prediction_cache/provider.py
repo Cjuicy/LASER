@@ -140,11 +140,24 @@ class OrdinaryPredictionProvider(torch.nn.Module):
             raise ValueError(
                 "cached depth produced non-finite reconstructed local points"
             )
+        return self._with_reference_intrinsic(
+            {
+                "local_points": local_points.unsqueeze(0),
+                "camera_poses": artifact.camera_poses.clone().unsqueeze(0),
+                "conf": artifact.confidence.clone().unsqueeze(0),
+                "images": images.detach().clone().unsqueeze(0),
+            }
+        )
+
+    def _with_reference_intrinsic(
+        self,
+        prediction: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if self._reference_intrinsic is None:
+            raise RuntimeError("reference intrinsic is unavailable")
         return {
-            "local_points": local_points.unsqueeze(0),
-            "camera_poses": artifact.camera_poses.clone().unsqueeze(0),
-            "conf": artifact.confidence.clone().unsqueeze(0),
-            "images": images.detach().clone().unsqueeze(0),
+            **prediction,
+            "reference_intrinsic": self._reference_intrinsic.clone(),
         }
 
     def get(

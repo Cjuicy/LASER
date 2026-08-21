@@ -225,6 +225,51 @@ def test_provider_attaches_current_images_and_returns_independent_clones(
     assert torch.equal(replay["images"].squeeze(0), IMAGES[0:2])
 
 
+def _assert_reference_intrinsic_isolated(provider, prediction):
+    intrinsic = prediction["reference_intrinsic"]
+    assert intrinsic.shape == (3, 3)
+    assert torch.equal(intrinsic, provider.reference_intrinsic)
+    intrinsic[0, 0] = -123.0
+    assert provider.reference_intrinsic[0, 0].item() > 0.0
+
+
+def test_provider_returns_reference_intrinsic_on_cache_miss(tmp_path):
+    provider = OrdinaryPredictionProvider(
+        store=_store(tmp_path),
+        model=_handle([]),
+    )
+
+    prediction = provider.get(SPECS[0], IMAGES[0:2])
+
+    _assert_reference_intrinsic_isolated(provider, prediction)
+
+
+def test_provider_returns_reference_intrinsic_on_cache_hit(tmp_path):
+    OrdinaryPredictionProvider(
+        store=_store(tmp_path),
+        model=_handle([]),
+    ).get(SPECS[0], IMAGES[0:2])
+    provider = OrdinaryPredictionProvider(
+        store=_store(tmp_path),
+        model=_handle([]),
+    )
+
+    prediction = provider.get(SPECS[0], IMAGES[0:2])
+
+    _assert_reference_intrinsic_isolated(provider, prediction)
+
+
+def test_provider_returns_reference_intrinsic_in_off_mode(tmp_path):
+    provider = OrdinaryPredictionProvider(
+        store=_store(tmp_path, PredictionCacheMode.OFF),
+        model=_handle([]),
+    )
+
+    prediction = provider.get(SPECS[0], IMAGES[0:2])
+
+    _assert_reference_intrinsic_isolated(provider, prediction)
+
+
 def test_off_mode_uses_same_normalization_but_forwards_every_window(
     tmp_path,
 ):

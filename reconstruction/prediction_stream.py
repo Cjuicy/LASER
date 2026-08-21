@@ -20,6 +20,7 @@ class WindowPrediction:
     confidence: torch.Tensor
     images: torch.Tensor
     prediction_key: str
+    reference_intrinsic: torch.Tensor | None = None
 
     @classmethod
     def from_mapping(
@@ -64,6 +65,50 @@ class WindowPrediction:
                 )
             values[public_name] = value
 
+        if "reference_intrinsic" not in mapping:
+            reference_intrinsic = None
+        else:
+            reference_intrinsic = mapping["reference_intrinsic"]
+            if not isinstance(reference_intrinsic, torch.Tensor):
+                raise ValueError(
+                    f"{_context(spec)} reference_intrinsic must be a tensor"
+                )
+            if reference_intrinsic.shape != (3, 3):
+                raise ValueError(
+                    f"{_context(spec)} reference_intrinsic must have shape (3,3)"
+                )
+            if not reference_intrinsic.is_floating_point():
+                raise ValueError(
+                    f"{_context(spec)} reference_intrinsic must use floating dtype"
+                )
+            if not torch.isfinite(reference_intrinsic).all():
+                raise ValueError(
+                    f"{_context(spec)} reference_intrinsic must contain finite values"
+                )
+            if (
+                reference_intrinsic[0, 0] <= 0
+                or reference_intrinsic[1, 1] <= 0
+            ):
+                raise ValueError(
+                    f"{_context(spec)} reference_intrinsic focal lengths "
+                    "must be positive"
+                )
+            expected_last_row = torch.tensor(
+                [0.0, 0.0, 1.0],
+                dtype=reference_intrinsic.dtype,
+                device=reference_intrinsic.device,
+            )
+            if not torch.allclose(
+                reference_intrinsic[2],
+                expected_last_row,
+                atol=1e-6,
+                rtol=0,
+            ):
+                raise ValueError(
+                    f"{_context(spec)} reference_intrinsic last row must be [0,0,1]"
+                )
+            reference_intrinsic = reference_intrinsic.clone().to(process_device)
+
         local_points = values["local_points"]
         camera_poses = values["camera_poses"]
         confidence = values["confidence"]
@@ -95,6 +140,7 @@ class WindowPrediction:
             confidence=confidence,
             images=window_images,
             prediction_key=prediction_key,
+            reference_intrinsic=reference_intrinsic,
         )
 
 
