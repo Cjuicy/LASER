@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Callable, Mapping, Protocol
 
 import numpy as np
 import torch
@@ -239,6 +240,191 @@ class _PairProjection:
             value = np.asarray(getattr(self, name), dtype=dtype).copy()
             value.setflags(write=False)
             object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True)
+class _ReferenceSelection:
+    indices: tuple[int, ...]
+    best_scores: np.ndarray
+    pair_projections: tuple[tuple[int, int, object], ...] = ()
+    rejected_indices: tuple[int, ...] = ()
+    coverage_ratio: float = 0.0
+    diagnostics: Mapping[str, int | float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        scores = np.asarray(self.best_scores, dtype=np.float64).copy()
+        scores.setflags(write=False)
+        object.__setattr__(self, "best_scores", scores)
+        object.__setattr__(self, "indices", tuple(int(index) for index in self.indices))
+        object.__setattr__(
+            self,
+            "rejected_indices",
+            tuple(int(index) for index in self.rejected_indices),
+        )
+        object.__setattr__(self, "pair_projections", tuple(self.pair_projections))
+        object.__setattr__(
+            self,
+            "diagnostics",
+            MappingProxyType(dict(self.diagnostics)),
+        )
+
+
+def _projection_score(projection: object) -> float:
+    score = getattr(projection, "score", projection)
+    try:
+        value = float(score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pair evaluator must return a numeric score") from exc
+    if not np.isfinite(value):
+        return 0.0
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def _select_references(
+    *,
+    qualities: np.ndarray,
+    frame_count: int,
+    evaluate: Callable[[int, int], object],
+    config: object,
+) -> _ReferenceSelection:
+    qualities = np.asarray(qualities, dtype=np.float64)
+    if qualities.ndim != 1 or qualities.size != frame_count:
+        raise ValueError("qualities must contain one value per frame")
+    if frame_count < 1:
+        raise ValueError("frame_count must be positive")
+
+    best_scores = np.zeros(frame_count, dtype=np.float64)
+    positive = [
+        index
+        for index, quality in enumerate(qualities)
+        if np.isfinite(quality) and quality > 0.0
+    ]
+    if not positive:
+        return _ReferenceSelection(
+            indices=(),
+            best_scores=best_scores,
+            coverage_ratio=0.0,
+            diagnostics={
+                "evaluated_pairs": 0,
+                "reliable_pairs": 0,
+                "selected_count": 0,
+                "rejected_count": 0,
+                "coverage_ratio": 0.0,
+            },
+        )
+
+    center = (frame_count - 1) / 2.0
+    first = min(
+        positive,
+        key=lambda index: (-qualities[index], abs(index - center), index),
+    )
+    selected_order = [first]
+    rejected_indices: list[int] = []
+    reliable_projections: list[tuple[int, int, object]] = []
+    evaluated_pairs = 0
+    max_keyframes = min(int(config.max_keyframes), frame_count)
+
+    def evaluate_source(source: int) -> None:
+        nonlocal evaluated_pairs
+        for target in range(frame_count):
+            if target == source:
+                continue
+            projection = evaluate(source, target)
+            evaluated_pairs += 1
+            score = _projection_score(projection)
+            best_scores[target] = max(best_scores[target], score)
+            if score >= config.min_reference_score:
+                reliable_projections.append((source, target, projection))
+
+    def current_coverage() -> float:
+        covered = best_scores >= config.min_reference_score
+        covered[selected_order] = True
+        return float(np.mean(covered))
+
+    evaluate_source(first)
+    coverage_ratio = current_coverage()
+    while (
+        len(selected_order) < max_keyframes
+        and coverage_ratio < config.stop_coverage_ratio
+    ):
+        candidates = [
+            index
+            for index, quality in enumerate(qualities)
+            if (
+                np.isfinite(quality)
+                and quality > 0.0
+                and index not in selected_order
+                and index not in rejected_indices
+            )
+        ]
+        if not candidates:
+            break
+        candidate = min(
+            candidates,
+            key=lambda index: (
+                -qualities[index] * (1.0 - best_scores[index]),
+                index,
+            ),
+        )
+
+        candidate_scores = np.zeros(frame_count, dtype=np.float64)
+        candidate_projections: list[tuple[int, int, object]] = []
+        for target in range(frame_count):
+            if target == candidate:
+                continue
+            projection = evaluate(candidate, target)
+            evaluated_pairs += 1
+            score = _projection_score(projection)
+            candidate_scores[target] = score
+            candidate_projections.append((candidate, target, projection))
+
+        selected_set = set(selected_order)
+        eligible_targets = [
+            target
+            for target in range(frame_count)
+            if target not in selected_set and target != candidate
+        ]
+        gain = (
+            float(
+                np.mean(
+                    [
+                        max(best_scores[target], candidate_scores[target])
+                        - best_scores[target]
+                        for target in eligible_targets
+                    ]
+                )
+            )
+            if eligible_targets
+            else 0.0
+        )
+        if gain < config.min_coverage_gain:
+            rejected_indices.append(candidate)
+            continue
+
+        selected_order.append(candidate)
+        for source, target, projection in candidate_projections:
+            score = candidate_scores[target]
+            best_scores[target] = max(best_scores[target], score)
+            if score >= config.min_reference_score:
+                reliable_projections.append((source, target, projection))
+        coverage_ratio = current_coverage()
+
+    indices = tuple(sorted(selected_order))
+    diagnostics = {
+        "evaluated_pairs": evaluated_pairs,
+        "reliable_pairs": len(reliable_projections),
+        "selected_count": len(indices),
+        "rejected_count": len(rejected_indices),
+        "coverage_ratio": coverage_ratio,
+    }
+    return _ReferenceSelection(
+        indices=indices,
+        best_scores=best_scores,
+        pair_projections=tuple(reliable_projections),
+        rejected_indices=tuple(rejected_indices),
+        coverage_ratio=coverage_ratio,
+        diagnostics=diagnostics,
+    )
 
 
 def _empty_pair_projection(

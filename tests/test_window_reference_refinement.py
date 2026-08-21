@@ -11,6 +11,7 @@ from inference_engine.segmentation.window_reference import (
     _confidence_mask_and_quality,
     _confidence_probability,
     _project_pair,
+    _select_references,
 )
 from pipeline.config import load_pipeline_config
 
@@ -338,6 +339,169 @@ def test_confidence_mask_uses_valid_points_quantile_and_keeps_equal_values():
     assert quality == pytest.approx(
         (2.0 / 4.0) * (1.0 / (1.0 + np.exp(-1.0)))
     )
+
+
+def test_selection_chooses_highest_quality_before_temporal_ties():
+    pair_scores = np.array(
+        [
+            [0.0, 0.8, 0.8],
+            [0.8, 0.0, 0.8],
+            [0.8, 0.8, 0.0],
+        ]
+    )
+    config = _segmentation_config().window_reference
+
+    selection = _select_references(
+        qualities=np.array([0.9, 0.8, 0.8]),
+        frame_count=3,
+        evaluate=lambda source, target: pair_scores[source][target],
+        config=config,
+    )
+
+    assert selection.indices == (0,)
+    assert selection.rejected_indices == ()
+    np.testing.assert_allclose(selection.best_scores, [0.0, 0.8, 0.8])
+    assert selection.coverage_ratio == pytest.approx(1.0)
+
+
+def test_selection_uses_temporal_center_for_first_quality_tie():
+    pair_scores = np.array(
+        [
+            [0.0, 0.8, 0.8],
+            [0.8, 0.0, 0.8],
+            [0.8, 0.8, 0.0],
+        ]
+    )
+    config = _segmentation_config().window_reference
+
+    selection = _select_references(
+        qualities=np.array([0.8, 0.8, 0.2]),
+        frame_count=3,
+        evaluate=lambda source, target: pair_scores[source][target],
+        config=config,
+    )
+
+    assert selection.indices == (1,)
+    assert selection.coverage_ratio == pytest.approx(1.0)
+
+
+def test_selection_uses_lower_index_for_temporal_center_tie():
+    pair_scores = np.full((4, 4), 0.8)
+    np.fill_diagonal(pair_scores, 0.0)
+    config = _segmentation_config().window_reference
+
+    selection = _select_references(
+        qualities=np.array([0.2, 0.8, 0.8, 0.2]),
+        frame_count=4,
+        evaluate=lambda source, target: pair_scores[source][target],
+        config=config,
+    )
+
+    assert selection.indices == (1,)
+    assert selection.coverage_ratio == pytest.approx(1.0)
+
+
+def test_selection_rejects_low_gain_candidate_and_continues():
+    pair_scores = np.array(
+        [
+            [0.0, 0.2, 0.2, 0.0],
+            [0.5, 0.0, 0.21, 0.0],
+            [0.0, 0.9, 0.0, 0.8],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    config = _segmentation_config(
+        "segmentation.window_reference.min_reference_score=0.30",
+        "segmentation.window_reference.stop_coverage_ratio=0.90",
+        "segmentation.window_reference.min_coverage_gain=0.03",
+        "segmentation.window_reference.max_keyframes=4",
+    ).window_reference
+
+    selection = _select_references(
+        qualities=np.array([0.9, 0.85, 0.8, 0.0]),
+        frame_count=4,
+        evaluate=lambda source, target: pair_scores[source][target],
+        config=config,
+    )
+
+    assert selection.indices == (0, 2)
+    assert selection.rejected_indices == (1,)
+    np.testing.assert_allclose(selection.best_scores, [0.0, 0.9, 0.2, 0.8])
+    assert selection.coverage_ratio == pytest.approx(1.0)
+    assert [(source, target) for source, target, _ in selection.pair_projections] == [
+        (2, 1),
+        (2, 3),
+    ]
+
+
+def test_selection_honors_keyframe_safety_ceiling():
+    pair_scores = np.array(
+        [
+            [0.0, 0.4, 0.2],
+            [0.4, 0.0, 0.4],
+            [0.4, 0.4, 0.0],
+        ]
+    )
+    config = _segmentation_config(
+        "segmentation.window_reference.min_reference_score=0.30",
+        "segmentation.window_reference.stop_coverage_ratio=0.90",
+        "segmentation.window_reference.min_coverage_gain=0.03",
+        "segmentation.window_reference.max_keyframes=1",
+    ).window_reference
+
+    selection = _select_references(
+        qualities=np.array([0.9, 0.8, 0.7]),
+        frame_count=3,
+        evaluate=lambda source, target: pair_scores[source][target],
+        config=config,
+    )
+
+    assert selection.indices == (0,)
+    assert selection.rejected_indices == ()
+    assert selection.coverage_ratio == pytest.approx(2.0 / 3.0)
+
+
+def test_selection_exhausts_zero_quality_candidates_without_rejection():
+    pair_scores = np.zeros((3, 3))
+    config = _segmentation_config().window_reference
+
+    selection = _select_references(
+        qualities=np.array([0.9, 0.0, 0.0]),
+        frame_count=3,
+        evaluate=lambda source, target: pair_scores[source][target],
+        config=config,
+    )
+
+    assert selection.indices == (0,)
+    assert selection.rejected_indices == ()
+    assert selection.coverage_ratio == pytest.approx(1.0 / 3.0)
+
+
+def test_selection_breaks_equal_candidate_priority_by_lower_index():
+    pair_scores = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.8, 0.8],
+            [0.0, 0.8, 0.0, 0.8],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    config = _segmentation_config(
+        "segmentation.window_reference.min_reference_score=0.30",
+        "segmentation.window_reference.stop_coverage_ratio=0.90",
+        "segmentation.window_reference.min_coverage_gain=0.03",
+        "segmentation.window_reference.max_keyframes=4",
+    ).window_reference
+
+    selection = _select_references(
+        qualities=np.array([0.9, 0.8, 0.8, 0.1]),
+        frame_count=4,
+        evaluate=lambda source, target: pair_scores[source][target],
+        config=config,
+    )
+
+    assert selection.indices == (0, 1)
+    assert selection.rejected_indices == ()
 
 
 def _projection_fixture_inputs():
