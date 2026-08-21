@@ -51,6 +51,15 @@ sparse geometry/visibility checks, and may merge complete adjacent regions from
 the selected initial segmentation method. It never splits a region. Missing or
 unreliable geometry preserves the initial labels.
 
+The geometry contract uses the authoritative provider intrinsic: traditional and
+corrected modes use `WindowPrediction.reference_intrinsic` propagated from the
+provider, while no-loop uses the current intrinsic actually used to
+re-unproject its point maps. PI3 camera poses are OpenCV camera-to-world poses;
+projection transforms source local points with
+`inv(T_target_c2w) @ T_source_c2w` before applying `K`. The refiner never
+estimates or replaces `K`. Missing, invalid, or incompatible `K` falls back to
+the initial labels unchanged.
+
 The complete configuration is:
 
 | Field | Default | Accepted values | Purpose |
