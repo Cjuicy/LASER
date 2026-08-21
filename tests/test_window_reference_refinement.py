@@ -970,6 +970,33 @@ def test_selection_rejects_low_gain_candidate_and_continues():
     ]
 
 
+def test_selection_uses_subthreshold_scores_from_accepted_reference_for_priority():
+    pair_scores = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.6, 0.4],
+            [0.0, 0.0, 0.0, 0.8],
+            [0.0, 0.0, 0.8, 0.0],
+        ]
+    )
+    config = _segmentation_config(
+        "segmentation.window_reference.min_reference_score=0.50",
+        "segmentation.window_reference.stop_coverage_ratio=1.0",
+        "segmentation.window_reference.min_coverage_gain=0.05",
+        "segmentation.window_reference.max_keyframes=3",
+    ).window_reference
+
+    selection = _select_references(
+        qualities=np.array([1.0, 0.95, 0.9, 0.5]),
+        frame_count=4,
+        evaluate=lambda source, target: pair_scores[source][target],
+        config=config,
+    )
+
+    assert selection.indices == (0, 1, 2)
+    np.testing.assert_allclose(selection.best_scores, [0.0, 0.0, 0.6, 0.8])
+
+
 def test_selection_honors_keyframe_safety_ceiling():
     pair_scores = np.array(
         [

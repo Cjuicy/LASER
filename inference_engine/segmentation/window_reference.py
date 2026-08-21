@@ -787,11 +787,9 @@ def _select_references(
             continue
 
         selected_order.append(candidate)
+        np.maximum(best_scores, candidate_scores, out=best_scores)
         for source, target, summary in candidate_summaries:
-            score = candidate_scores[target]
-            best_scores[target] = max(best_scores[target], score)
-            if score >= config.min_reference_score:
-                reliable_summaries.append((source, target, summary))
+            reliable_summaries.append((source, target, summary))
         coverage_ratio = current_coverage()
 
     indices = tuple(sorted(selected_order))
