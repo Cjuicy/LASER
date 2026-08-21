@@ -1,0 +1,95 @@
+version: 1
+campaign:
+  id: window-reference-v1
+pipeline_config: configs/reconstruction/pi3_laser_no_loop.yaml
+matrix:
+  methods: [depth, geometry, atomic]
+  refinement: [false, true]
+  reconstruction_mode: no_loop
+  window_size: 75
+  overlap: 30
+  atomic_split_mode: conservative
+window_reference:
+  sampling_stride: 4
+  max_keyframes: 4
+  relative_depth_tolerance: 0.05
+  min_reference_score: 0.30
+  stop_coverage_ratio: 0.90
+  min_coverage_gain: 0.03
+  min_region_correspondences: 8
+  min_region_coverage: 0.10
+  min_region_purity: 0.80
+  merge_vote_threshold: 0.80
+runtime:
+  model_name: pi3
+  model_dtype: bfloat16
+  inference_device: cuda
+  process_device: cpu
+  jobs: 1
+  gpu: 0
+  cache_policy: auto
+  failure_policy: keep-going
+storage:
+  data_root: data
+  checkpoint: weights/PI3/model.safetensors
+  output_root: outputs/window_reference_campaign
+  minimum_free_gb: 20.0
+  keep_artifacts: false
+evaluation:
+  pointcloud_config: configs/evaluation/pointcloud.yaml
+  trajectory_config: configs/evaluation/ate.yaml
+scenes:
+  synthetic-fixture:
+    dataset: synthetic
+    scene: deterministic-pointmaps
+    source_root: null
+    frame_index_map: null
+    prepared_gt: null
+    expected_gt_shape: null
+  seven-chess-seq-03:
+    dataset: 7scenes
+    scene: chess/seq-03
+    source_root: 7-Scenes
+    frame_index_map: datasets/seq-id-maps/7scenes_mv-recon_seq-id-map-kf10.json
+    prepared_gt: pointcloud_benchmark/7scenes/chess__seq-03/ground_truth.npz
+    expected_gt_shape: [392, 518]
+  nrgbd-thin-geometry:
+    dataset: nrgbd
+    scene: thin_geometry
+    source_root: NeuralRGBD
+    frame_index_map: datasets/seq-id-maps/NRGBD_mv-recon_seq-id-map-kf10.json
+    prepared_gt: pointcloud_benchmark/nrgbd/thin_geometry/ground_truth.npz
+    expected_gt_shape: [392, 518]
+  nrgbd-complete-kitchen:
+    dataset: nrgbd
+    scene: complete_kitchen
+    source_root: NeuralRGBD
+    frame_index_map: datasets/seq-id-maps/NRGBD_mv-recon_seq-id-map-kf10.json
+    prepared_gt: pointcloud_benchmark/nrgbd/complete_kitchen/ground_truth.npz
+    expected_gt_shape: [392, 518]
+  kitti-00: {dataset: kitti, scene: "00", source_root: KITTI, frame_index_map: null, prepared_gt: null, expected_gt_shape: null}
+  kitti-01: {dataset: kitti, scene: "01", source_root: KITTI, frame_index_map: null, prepared_gt: null, expected_gt_shape: null}
+  kitti-03: {dataset: kitti, scene: "03", source_root: KITTI, frame_index_map: null, prepared_gt: null, expected_gt_shape: null}
+  kitti-04: {dataset: kitti, scene: "04", source_root: KITTI, frame_index_map: null, prepared_gt: null, expected_gt_shape: null}
+  kitti-07: {dataset: kitti, scene: "07", source_root: KITTI, frame_index_map: null, prepared_gt: null, expected_gt_shape: null}
+presets:
+  synthetic-smoke:
+    scenes: [{scene_id: synthetic-fixture, start: 0, stop: 4, stride: 1}]
+  pointcloud-small:
+    scenes:
+      - {scene_id: seven-chess-seq-03, start: 0, stop: 100, stride: 1}
+      - {scene_id: nrgbd-thin-geometry, start: 0, stop: 40, stride: 1}
+      - {scene_id: nrgbd-complete-kitchen, start: 0, stop: 122, stride: 1}
+  kitti-smoke:
+    scenes: [{scene_id: kitti-04, start: 0, stop: 80, stride: 1}]
+  kitti-small:
+    scenes:
+      - {scene_id: kitti-04, start: 0, stop: null, stride: 1}
+      - {scene_id: kitti-03, start: 0, stop: null, stride: 1}
+      - {scene_id: kitti-07, start: 0, stop: null, stride: 1}
+  kitti-formal-subset:
+    scenes:
+      - {scene_id: kitti-00, start: 0, stop: null, stride: 1}
+      - {scene_id: kitti-01, start: 0, stop: null, stride: 1}
+      - {scene_id: kitti-04, start: 0, stop: null, stride: 1}
+      - {scene_id: kitti-07, start: 0, stop: null, stride: 1}

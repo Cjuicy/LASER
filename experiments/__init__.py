@@ -1,16 +1,19 @@
-from .config import (
-    EvaluationKind,
-    ExperimentConfig,
-    ExperimentDatasetConfig,
-    load_experiment_config,
-)
-from .matrix import (
-    ArtifactRepository,
-    MatrixEntry,
-    build_matrix,
-    reconstruction_identity,
-)
-from .runner import ExperimentRunRecord, matrix_cache_mode, run_matrix
+from importlib import import_module
+
+
+_EXPORTS = {
+    "EvaluationKind": ("experiments.config", "EvaluationKind"),
+    "ExperimentConfig": ("experiments.config", "ExperimentConfig"),
+    "ExperimentDatasetConfig": ("experiments.config", "ExperimentDatasetConfig"),
+    "load_experiment_config": ("experiments.config", "load_experiment_config"),
+    "ArtifactRepository": ("experiments.matrix", "ArtifactRepository"),
+    "MatrixEntry": ("experiments.matrix", "MatrixEntry"),
+    "build_matrix": ("experiments.matrix", "build_matrix"),
+    "reconstruction_identity": ("experiments.matrix", "reconstruction_identity"),
+    "ExperimentRunRecord": ("experiments.runner", "ExperimentRunRecord"),
+    "matrix_cache_mode": ("experiments.runner", "matrix_cache_mode"),
+    "run_matrix": ("experiments.runner", "run_matrix"),
+}
 
 __all__ = [
     "EvaluationKind",
@@ -25,3 +28,13 @@ __all__ = [
     "matrix_cache_mode",
     "run_matrix",
 ]
+
+
+def __getattr__(name: str):
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError:
+        raise AttributeError(name) from None
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
