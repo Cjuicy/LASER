@@ -100,6 +100,63 @@ def test_artifact_round_trip_validates_tensor_digest(tmp_path):
         load_pointmap_estimate(output)
 
 
+def test_enabled_segmentation_diagnostics_round_trip_preserves_artifact_contract(
+    tmp_path,
+):
+    summary = {
+        "window_reference_applied": True,
+        "window_reference_keyframes": "0,2",
+        "window_reference_keyframe_count": 2,
+        "window_reference_is_keyframe": False,
+        "window_reference_coverage_ratio": 0.75,
+        "window_reference_regions_before": 5,
+        "window_reference_regions_after": 3,
+        "window_reference_candidate_edges": 4,
+        "window_reference_accepted_edges": 2,
+        "window_reference_conflict_edges": 1,
+        "window_reference_projected_samples": 32,
+        "window_reference_occluded_samples": 3,
+        "window_reference_depth_rejected_samples": 1,
+        "window_reference_fallback": "none",
+    }
+    diagnostics = ReconstructionDiagnostics(
+        stage_timings_ms={"segmentation": 4.5},
+        segmentation_summaries=(summary,),
+        candidate_count=2,
+        constraint_count=1,
+        mode_scalars={"window_count": 3, "coverage_ratio": 0.75},
+    )
+    artifact = make_artifact(diagnostics=diagnostics)
+    output = write_reconstruction_artifact(
+        artifact,
+        tmp_path / "enabled-window-reference",
+        resolved_yaml="segmentation:\n  window_reference:\n    enabled: true\n",
+        config_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+        git_commit="c" * 40,
+    )
+
+    assert_artifacts_equal(load_reconstruction_artifact(output), artifact)
+    assert artifact.schema_version == 1
+    assert load_reconstruction_artifact(output).schema_version == 1
+    assert all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in artifact.diagnostics.mode_scalars.values()
+    )
+    assert {
+        path.name
+        for path in Path(output).iterdir()
+    } == {
+        "trajectory.pt",
+        "pointmap.pt",
+        "confidence.pt",
+        "resolved_reconstruction.yaml",
+        "diagnostics.json",
+        "manifest.json",
+    }
+    assert not any("segmentation" in path.name for path in Path(output).iterdir())
+
+
 def test_narrow_loaders_do_not_read_unrelated_tensors(tmp_path):
     output = write_reconstruction_artifact(
         make_artifact(),

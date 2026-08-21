@@ -49,6 +49,7 @@ and Corrected reconstruction also require `weights/dino_salad.ckpt` and
 ```text
 PI3 prediction stream
   -> depth | geometry | atomic segmentation
+  -> optional window-reference segmentation refinement (merge-only)
   -> original LASER AnchorPropagator
   -> no_loop | traditional | corrected reconstruction
   -> ReconstructionArtifact

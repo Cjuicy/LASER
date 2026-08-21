@@ -43,6 +43,44 @@ same LASER `AnchorPropagator`. Depth uses Felzenszwalb depth regions; Geometry
 adds surface-normal criteria; Atomic performs layer atom merge/split with the
 configured exclusive split mode.
 
+### Window reference segmentation refinement
+
+`segmentation.window_reference.enabled` defaults to `false`. When enabled,
+LASER selects reference frames adaptively from the current PI3 window, performs
+sparse geometry/visibility checks, and may merge complete adjacent regions from
+the selected initial segmentation method. It never splits a region. Missing or
+unreliable geometry preserves the initial labels.
+
+The complete configuration is:
+
+| Field | Default | Accepted values | Purpose |
+| --- | ---: | --- | --- |
+| `segmentation.window_reference.enabled` | `false` | boolean | Enable the optional refinement stage. |
+| `segmentation.window_reference.sampling_stride` | `4` | positive integer (`>= 1`) | Pixel stride for sparse projection and visibility checks; larger values reduce CPU work. |
+| `segmentation.window_reference.max_keyframes` | `4` | positive integer (`>= 1`) | Maximum number of adaptively selected reference frames; smaller values reduce CPU work. |
+| `segmentation.window_reference.relative_depth_tolerance` | `0.05` | finite float in `(0, inf)` | Relative depth agreement required for a projected sample. |
+| `segmentation.window_reference.min_reference_score` | `0.30` | finite float in `(0, 1]` | Minimum frame quality score for reference selection. |
+| `segmentation.window_reference.stop_coverage_ratio` | `0.90` | finite float in `(0, 1]` | Stop selecting references once this coverage is reached. |
+| `segmentation.window_reference.min_coverage_gain` | `0.03` | finite float in `[0, 1]` | Minimum additional coverage contributed by a reference. |
+| `segmentation.window_reference.min_region_correspondences` | `8` | positive integer (`>= 1`) | Minimum sparse correspondences supporting a region mapping. |
+| `segmentation.window_reference.min_region_coverage` | `0.10` | finite float in `(0, 1]` | Minimum target-region coverage for a mapping. |
+| `segmentation.window_reference.min_region_purity` | `0.80` | finite float in `(0, 1]` | Minimum source-label purity for a mapping. |
+| `segmentation.window_reference.merge_vote_threshold` | `0.80` | finite float in `(0, 1]` | Vote threshold for accepting an adjacent-region merge. |
+
+The refiner runs on the CPU process device and is deliberately bounded by
+`sampling_stride` and `max_keyframes`; use a larger stride or fewer keyframes
+when CPU budget matters. It is a merge-only stage: labels are compacted after
+accepted merges, and no region is ever split. A single-frame window, missing or
+invalid intrinsics, invalid/non-finite geometry, incompatible geometry, no
+usable reference, or insufficient/conflicting support falls back to the
+initial labels. The per-frame diagnostics record the fallback reason and the
+before/after region counts.
+
+The defaults and thresholds are implementation defaults, not a quality claim.
+Their empirical effect must be calibrated with the real PI3 weights, dataset,
+and prediction cache; this repository does not claim reconstruction-metric
+improvement without that real-cache evaluation gate.
+
 `segmentation.confidence_keep_ratio` and
 `registration.confidence_keep_ratio` are positive keep ratios in `(0,1]`.
 ATE defaults to the `higher` NumPy quantile rule. The point-cloud experiment
