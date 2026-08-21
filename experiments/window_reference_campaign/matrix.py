@@ -74,6 +74,12 @@ class PlannedRun:
         if not isinstance(self.relative_run_dir, Path):
             raise ValueError("planned relative_run_dir must be a path")
 
+    @property
+    def run_id(self) -> str:
+        """Expose the canonical variant identifier at the plan boundary."""
+
+        return self.variant.run_id
+
 
 @dataclass(frozen=True)
 class CampaignPlan:
@@ -287,6 +293,56 @@ def build_plan(loaded: LoadedCampaignConfig) -> CampaignPlan:
     return CampaignPlan(config.campaign_id, config.selected_preset, tuple(runs))
 
 
+def build_identity_seed(
+    *,
+    loaded: LoadedCampaignConfig,
+    planned: PlannedRun,
+    frame_start: int,
+    frame_stop: int,
+    frame_stride: int,
+    staged_manifest_sha256: str,
+    source_commit: str,
+    source_dirty: bool,
+    checkpoint_sha256: str,
+) -> RunIdentitySeed:
+    """Construct the immutable identity axes for one planned run.
+
+    Runtime-only values (the staged manifest, source revision and checkpoint
+    digest) are intentionally supplied by the runner after staging and
+    fingerprinting.  Every campaign-controlled axis is copied from the
+    resolved loaded configuration and plan so identity construction cannot
+    silently drift from the approved matrix.
+    """
+
+    if not isinstance(loaded, LoadedCampaignConfig):
+        raise ValueError("identity seed requires LoadedCampaignConfig")
+    if not isinstance(planned, PlannedRun):
+        raise ValueError("identity seed requires PlannedRun")
+    config = loaded.config
+    return RunIdentitySeed(
+        schema_version=1,
+        campaign_config_sha256=loaded.sha256,
+        source_commit=source_commit,
+        source_dirty=source_dirty,
+        dataset=planned.dataset.value,
+        scene=planned.scene,
+        frame_start=frame_start,
+        frame_stop=frame_stop,
+        frame_stride=frame_stride,
+        staged_manifest_sha256=staged_manifest_sha256,
+        segmentation_method=planned.variant.segmentation_method.value,
+        atomic_split_mode=config.matrix.atomic_split_mode.value,
+        window_reference_enabled=planned.variant.window_reference_enabled,
+        window_reference_config=config.window_reference.to_payload(),
+        reconstruction_mode=config.matrix.reconstruction_mode.value,
+        window_size=config.matrix.window_size,
+        overlap=config.matrix.overlap,
+        model_name=config.runtime.model_name.value,
+        model_dtype=config.runtime.model_dtype,
+        checkpoint_sha256=checkpoint_sha256,
+    )
+
+
 def plan_payload(
     plan: CampaignPlan,
     loaded: LoadedCampaignConfig,
@@ -329,6 +385,7 @@ __all__ = [
     "RunIdentitySeed",
     "RunVariant",
     "build_plan",
+    "build_identity_seed",
     "complete_identity",
     "expand_matrix",
     "identity_sha256",
