@@ -74,9 +74,13 @@ def _run_enabled(
     camera_poses,
     confidence,
     intrinsic,
+    overrides=(),
 ):
     refiner = build_window_reference_refiner(
-        _segmentation_config("segmentation.window_reference.enabled=true")
+        _segmentation_config(
+            "segmentation.window_reference.enabled=true",
+            *overrides,
+        )
     )
     return refiner.refine(
         results,
@@ -219,9 +223,20 @@ def test_enabled_refiner_returns_copied_results_for_runtime_fallback(reason):
         assert dict(result.diagnostics) == {
             **diagnostics,
             "window_reference_applied": False,
+            "window_reference_keyframes": "",
+            "window_reference_keyframe_count": 0,
+            "window_reference_is_keyframe": False,
+            "window_reference_coverage_ratio": 0.0,
+            "window_reference_candidate_edges": 0,
+            "window_reference_accepted_edges": 0,
+            "window_reference_conflict_edges": 0,
+            "window_reference_projected_samples": 0,
+            "window_reference_occluded_samples": 0,
+            "window_reference_depth_rejected_samples": 0,
             "window_reference_fallback": reason,
             "window_reference_regions_before": 1,
             "window_reference_regions_after": 1,
+            "region_count": 1,
         }
         assert result.diagnostics is not original.diagnostics
     torch.testing.assert_close(point_maps, original_point_maps, equal_nan=True)
@@ -232,6 +247,67 @@ def test_enabled_refiner_returns_copied_results_for_runtime_fallback(reason):
     ):
         np.testing.assert_array_equal(result.labels, labels)
         assert dict(result.diagnostics) == diagnostics
+
+
+def test_enabled_fallback_diagnostics_are_complete_finite_scalars():
+    results, point_maps, camera_poses, confidence, _ = _identity_fixture()
+    results[0] = SegmentationResult(
+        np.array([[0, 1, 1], [0, 1, 1], [0, 1, 1]], dtype=np.intp),
+        {"method": "fixture", "region_count": 99, "custom": "kept"},
+    )
+
+    refined = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=None,
+    )
+
+    expected_types = {
+        "window_reference_applied": bool,
+        "window_reference_keyframes": str,
+        "window_reference_keyframe_count": int,
+        "window_reference_is_keyframe": bool,
+        "window_reference_coverage_ratio": float,
+        "window_reference_regions_before": int,
+        "window_reference_regions_after": int,
+        "window_reference_candidate_edges": int,
+        "window_reference_accepted_edges": int,
+        "window_reference_conflict_edges": int,
+        "window_reference_projected_samples": int,
+        "window_reference_occluded_samples": int,
+        "window_reference_depth_rejected_samples": int,
+        "window_reference_fallback": str,
+    }
+    diagnostics = refined[0].diagnostics
+    assert diagnostics["custom"] == "kept"
+    assert diagnostics["region_count"] == 2
+    assert set(expected_types).issubset(diagnostics)
+    for key, expected_type in expected_types.items():
+        assert type(diagnostics[key]) is expected_type
+        if expected_type is float:
+            assert np.isfinite(diagnostics[key])
+
+
+def test_intrinsic_compatibility_uses_full_matrix_including_skew():
+    results, point_maps, camera_poses, confidence, _ = _identity_fixture()
+    skewed_intrinsic = torch.tensor(
+        [[2.0, 2.0, 1.0], [0.0, 2.0, 1.0], [0.0, 0.0, 1.0]]
+    )
+
+    refined = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=skewed_intrinsic,
+        overrides=("segmentation.window_reference.sampling_stride=1",),
+    )
+
+    assert refined[0].diagnostics["window_reference_fallback"] == (
+        "intrinsic_incompatible"
+    )
 
 
 def test_centered_axis_uses_the_shared_stride_rule_without_special_cases():

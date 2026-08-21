@@ -5,7 +5,7 @@ from typing import Protocol
 import numpy as np
 import torch
 
-from inference_engine.segmentation.base import SegmentationResult, compact_labels
+from inference_engine.segmentation.base import SegmentationResult
 from pipeline.config import ConfidenceQuantileMethod, SegmentationConfig
 
 
@@ -69,23 +69,33 @@ def _fallback_results(
     results: list[SegmentationResult],
     reason: str,
 ) -> list[SegmentationResult]:
-    return [
-        SegmentationResult(
-            labels=result.labels.copy(),
-            diagnostics={
-                **dict(result.diagnostics),
-                "window_reference_applied": False,
-                "window_reference_fallback": reason,
-                "window_reference_regions_before": int(
-                    np.unique(result.labels).size
-                ),
-                "window_reference_regions_after": int(
-                    np.unique(result.labels).size
-                ),
-            },
+    fallback_results = []
+    for result in results:
+        region_count = int(np.unique(result.labels).size)
+        fallback_results.append(
+            SegmentationResult(
+                labels=result.labels.copy(),
+                diagnostics={
+                    **dict(result.diagnostics),
+                    "region_count": region_count,
+                    "window_reference_applied": False,
+                    "window_reference_keyframes": "",
+                    "window_reference_keyframe_count": 0,
+                    "window_reference_is_keyframe": False,
+                    "window_reference_coverage_ratio": 0.0,
+                    "window_reference_regions_before": region_count,
+                    "window_reference_regions_after": region_count,
+                    "window_reference_candidate_edges": 0,
+                    "window_reference_accepted_edges": 0,
+                    "window_reference_conflict_edges": 0,
+                    "window_reference_projected_samples": 0,
+                    "window_reference_occluded_samples": 0,
+                    "window_reference_depth_rejected_samples": 0,
+                    "window_reference_fallback": reason,
+                },
+            )
         )
-        for result in results
-    ]
+    return fallback_results
 
 
 def _tensor_numpy(value: object, *, dtype: np.dtype) -> np.ndarray:
@@ -187,8 +197,12 @@ def _intrinsic_compatible(
     if not np.any(valid):
         return False
     xyz = sampled[valid]
-    u = intrinsic[0, 0] * xyz[:, 0] / xyz[:, 2] + intrinsic[0, 2]
-    v = intrinsic[1, 1] * xyz[:, 1] / xyz[:, 2] + intrinsic[1, 2]
+    homogeneous = xyz @ intrinsic.T
+    denominator = homogeneous[:, 2]
+    if not np.all(np.isfinite(homogeneous)) or not np.all(denominator > 1e-6):
+        return False
+    u = homogeneous[:, 0] / denominator
+    v = homogeneous[:, 1] / denominator
     expected_u = np.broadcast_to(columns[None, :], sampled.shape[:3])[valid]
     expected_v = np.broadcast_to(rows[:, None], sampled.shape[:3])[valid]
     return bool(
