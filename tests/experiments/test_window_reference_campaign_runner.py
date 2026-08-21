@@ -146,6 +146,7 @@ def _fixture_staged(
         image_dir=image_dir,
         source_frame_ids=scene.selection.source_frame_ids,
         selection=scene.selection,
+        evaluation_kind=scene.evaluation_kind,
         poses_path=None,
         pointcloud_gt_path=None,
         manifest_path=manifest,

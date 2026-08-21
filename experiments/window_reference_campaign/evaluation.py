@@ -120,30 +120,17 @@ def default_evaluation_dependencies() -> EvaluationDependencies:
 
 
 def _staged_evaluation_kind(staged: "StagedScene") -> "EvaluationKind":
-    """Read the explicit kind, with compatibility for Task 2's old shape."""
+    """Read the typed staging contract without inferring from payload paths."""
 
-    from .config import DatasetKind, EvaluationKind
+    from .config import EvaluationKind
 
-    explicit = getattr(staged, "evaluation_kind", None)
-    if explicit is not None:
-        try:
-            return EvaluationKind(explicit)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("staged evaluation kind is invalid") from exc
-
-    # The current Task 2 StagedScene carries the generated GT/pose path but
-    # not the resolved kind.  Dataset identity is enough to distinguish the
-    # supported campaign branches in that compatibility shape.
-    dataset = getattr(staged, "dataset", None)
-    if dataset in {DatasetKind.SEVEN_SCENES, DatasetKind.NRGBD}:
-        return EvaluationKind.POINTCLOUD
-    if dataset is DatasetKind.KITTI:
-        return EvaluationKind.INTERNAL_TRAJECTORY
-    if getattr(staged, "pointcloud_gt_path", None) is not None:
-        return EvaluationKind.POINTCLOUD
-    if getattr(staged, "poses_path", None) is not None:
-        return EvaluationKind.INTERNAL_TRAJECTORY
-    return EvaluationKind.NONE
+    try:
+        value = staged.evaluation_kind
+    except AttributeError as exc:
+        raise ValueError("staged evaluation_kind is required") from exc
+    if not isinstance(value, EvaluationKind):
+        raise ValueError("staged evaluation_kind is invalid")
+    return value
 
 
 def _source_frame_ids(staged: "StagedScene") -> tuple[int, ...]:

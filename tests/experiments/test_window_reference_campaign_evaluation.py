@@ -83,22 +83,23 @@ def _staged(
         dataset=(
             DatasetKind.KITTI
             if evaluation_kind is EvaluationKind.INTERNAL_TRAJECTORY
-            else DatasetKind.SEVEN_SCENES
+            else (
+                DatasetKind.SEVEN_SCENES
+                if evaluation_kind is EvaluationKind.POINTCLOUD
+                else DatasetKind.SYNTHETIC
+            )
         ),
         scene="fixture",
         slice_id="f000000-000004-s1",
         image_dir=image_dir,
         source_frame_ids=source_frame_ids,
         selection=selection,
+        evaluation_kind=evaluation_kind,
         poses_path=poses_path,
         pointcloud_gt_path=pointcloud_gt_path,
         manifest_path=tmp_path / "staged" / "staging.json",
         manifest_sha256="a" * 64,
     )
-    # Task 2's current StagedScene predates the explicit field in the Task 5
-    # brief.  Keep the fixture aligned with the brief without changing the
-    # production staging dataclass in this task.
-    object.__setattr__(staged, "evaluation_kind", evaluation_kind)
     return staged
 
 

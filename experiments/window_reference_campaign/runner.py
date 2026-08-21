@@ -131,6 +131,18 @@ class RunRequest:
     log_path: Path
 
 
+def _default_evaluate_artifact(
+    request: RunRequest,
+    execution: PipelineExecution,
+    loaded: LoadedCampaignConfig,
+) -> EvaluationOutput:
+    """Load the campaign evaluator only when a run reaches evaluation."""
+
+    from .evaluation import evaluate_artifact
+
+    return evaluate_artifact(request, execution, loaded)
+
+
 @dataclass(frozen=True)
 class RunnerDependencies:
     """Production dependency boundary for one serial campaign process."""
@@ -154,7 +166,7 @@ class RunnerDependencies:
         if self.execute_pipeline is None:
             object.__setattr__(self, "execute_pipeline", execute_pipeline)
         if self.evaluate_artifact is None:
-            raise ValueError("evaluate_artifact dependency is required")
+            object.__setattr__(self, "evaluate_artifact", _default_evaluate_artifact)
         if self.validate_artifact is None:
             object.__setattr__(self, "validate_artifact", validate_artifact_for_seed)
         if self.monotonic is None:
@@ -765,11 +777,7 @@ def run_campaign(
             failure_policy = FailurePolicy(failure_policy)
         except (TypeError, ValueError) as exc:
             raise ValueError("failure_policy is invalid") from exc
-    deps = dependencies or RunnerDependencies(
-        evaluate_artifact=lambda request, execution, config: EvaluationOutput(
-            EvaluationKind.NONE, None, ()
-        )
-    )
+    deps = dependencies or RunnerDependencies()
     root = loaded.config.campaign_root.resolve(strict=False)
     root.mkdir(parents=True, exist_ok=True)
     source_commit, source_dirty = _source_metadata(loaded.config.repository_root)

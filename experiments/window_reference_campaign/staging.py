@@ -24,7 +24,7 @@ from .scenes import (
 )
 
 
-STAGING_SCHEMA_VERSION = 1
+STAGING_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class StagedScene:
     image_dir: Path
     source_frame_ids: tuple[int, ...]
     selection: ResolvedFrameSelection
+    evaluation_kind: EvaluationKind
     poses_path: Path | None
     pointcloud_gt_path: Path | None
     manifest_path: Path
@@ -59,10 +60,33 @@ class StagedScene:
             raise ValueError("staged source frame IDs must be non-negative integers")
         if tuple(self.source_frame_ids) != tuple(self.selection.source_frame_ids):
             raise ValueError("staged source frame IDs must match the selection")
+        if not isinstance(self.evaluation_kind, EvaluationKind):
+            raise ValueError("staged evaluation_kind is invalid")
         for name in ("poses_path", "pointcloud_gt_path"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, Path):
                 raise ValueError(f"staged {name} must be a path or None")
+        if self.evaluation_kind is EvaluationKind.NONE:
+            if self.dataset is not DatasetKind.SYNTHETIC:
+                raise ValueError("staged none evaluation is only valid for synthetic")
+            if self.poses_path is not None or self.pointcloud_gt_path is not None:
+                raise ValueError("staged none evaluation must not contain poses or GT")
+        elif self.evaluation_kind is EvaluationKind.POINTCLOUD:
+            if self.dataset not in {DatasetKind.SEVEN_SCENES, DatasetKind.NRGBD}:
+                raise ValueError("staged pointcloud evaluation dataset is invalid")
+            if self.pointcloud_gt_path is None:
+                raise ValueError("staged pointcloud evaluation requires GT")
+            if self.poses_path is not None:
+                raise ValueError("staged pointcloud evaluation must not contain poses")
+        elif self.evaluation_kind is EvaluationKind.INTERNAL_TRAJECTORY:
+            if self.dataset is not DatasetKind.KITTI:
+                raise ValueError("staged internal trajectory dataset is invalid")
+            if self.poses_path is None:
+                raise ValueError("staged internal trajectory evaluation requires poses")
+            if self.pointcloud_gt_path is not None:
+                raise ValueError("staged internal trajectory evaluation must not contain GT")
+        else:  # pragma: no cover - guarded by enum validation above
+            raise ValueError("staged evaluation_kind is invalid")
         if (
             not isinstance(self.manifest_sha256, str)
             or len(self.manifest_sha256) != 64
@@ -302,6 +326,7 @@ def preview_staging_manifest(scene: ResolvedScene) -> tuple[dict[str, object], s
         "dataset": scene.dataset.value,
         "scene": scene.scene,
         "slice_id": scene.slice_id,
+        "evaluation_kind": scene.evaluation_kind.value,
         "approved_data_root": str(approved),
         "selection": {
             "start": scene.selection.start,
@@ -735,6 +760,10 @@ def load_valid_staging(
     try:
         selection = _selection_from_manifest(manifest)
         dataset = DatasetKind(manifest["dataset"])
+        raw_evaluation_kind = manifest["evaluation_kind"]
+        if type(raw_evaluation_kind) is not str:
+            raise ValueError("evaluation_kind must be a string")
+        evaluation_kind = EvaluationKind(raw_evaluation_kind)
         scene_id = manifest["scene_id"]
         scene_name = manifest["scene"]
         slice_id = manifest["slice_id"]
@@ -753,6 +782,7 @@ def load_valid_staging(
         image_dir=image_dir,
         source_frame_ids=tuple(int(item) for item in source_ids),
         selection=selection,
+        evaluation_kind=evaluation_kind,
         poses_path=poses,
         pointcloud_gt_path=gt,
         manifest_path=manifest_path,
