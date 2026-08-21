@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import inspect
 
+import numpy as np
 import pytest
 import torch
 
+from inference_engine.segmentation import DisabledWindowReferenceRefiner
 from pipeline.artifacts import ReconstructionArtifact
 from pipeline.config import (
     ConfidenceQuantileMethod,
@@ -14,6 +16,7 @@ from pipeline.config import (
 from reconstruction.modes.base import ReconstructionContext
 from reconstruction.modes.no_loop import NoLoopReconstructionMode
 from reconstruction.prediction_stream import iter_window_predictions
+from reconstruction.shared import as_numpy, reference_intrinsic
 from tests.reconstruction.fixtures import (
     SPECS,
     LiteralProvider,
@@ -36,6 +39,7 @@ def _context(anchor, predictions, *, segmenter=None):
         predictions=predictions,
         frame_ids=(0, 1, 2, 3),
         segmentation_strategy=segmenter or OneRegionSegmenter(),
+        window_reference_refiner=DisabledWindowReferenceRefiner(),
         anchor_propagator=anchor,
         segmentation_config=config.segmentation,
         anchor_config=config.anchor_propagation,
@@ -141,6 +145,105 @@ def test_no_loop_consumes_predictions_incrementally():
         "yield:2",
         "segment",
     ]
+
+
+def test_no_loop_segments_refines_graphs_and_anchors_current_window_state():
+    events = []
+    calls = []
+
+    class RecordingAnchor:
+        def propagate(
+            self,
+            source_points,
+            target_points,
+            source_graphs,
+            target_graphs,
+            overlap,
+        ):
+            del source_points, source_graphs, target_graphs, overlap
+            events.append("anchor")
+            return torch.ones((*target_points.shape[:-1], 1))
+
+    def segment_window(
+        *,
+        strategy,
+        refiner,
+        point_maps,
+        camera_poses,
+        confidence,
+        images,
+        reference_intrinsic,
+    ):
+        events.extend(("segment", "refine"))
+        calls.append(
+            (
+                point_maps.clone(),
+                camera_poses.clone(),
+                confidence.clone(),
+                reference_intrinsic,
+                refiner,
+            )
+        )
+        return strategy.segment(
+            as_numpy(point_maps),
+            as_numpy(confidence),
+            as_numpy(images),
+        )
+
+    def apply_pose(poses, scale, rotation, translation):
+        del rotation, translation
+        adjusted = poses.clone()
+        adjusted[:, 0, 3] = float(scale)
+        return adjusted
+
+    predictions = iter_window_predictions(
+        LiteralProvider(),
+        SPECS,
+        torch.zeros((4, 3, 1, 1)),
+        "cpu",
+    )
+    context = _context(RecordingAnchor(), predictions)
+    mode = NoLoopReconstructionMode(
+        register_adjacent=lambda *arguments: identity_sim3(
+            (2.0, 3.0)[len(calls) - 1]
+        ),
+        apply_pose_sim3=apply_pose,
+        build_graphs=lambda results, threshold: (
+            events.append("graph") or (tuple(results), threshold)
+        ),
+        segment_window=segment_window,
+    )
+
+    mode.run(context)
+
+    assert events == [
+        "segment",
+        "refine",
+        "graph",
+        "segment",
+        "refine",
+        "graph",
+        "anchor",
+        "segment",
+        "refine",
+        "graph",
+        "anchor",
+    ]
+    assert [call[0][..., 2].unique().item() for call in calls] == [1.0, 2.0, 3.0]
+    assert [call[1][:, 0, 3].tolist() for call in calls] == [
+        [0.0, 0.0],
+        [2.0, 2.0],
+        [3.0, 3.0],
+    ]
+    expected_intrinsic = reference_intrinsic(
+        LiteralProvider().get(SPECS[0], torch.zeros((2, 3, 1, 1)))
+        ["local_points"].squeeze(0)
+    )
+    assert all(
+        torch.equal(call[3], expected_intrinsic)
+        for call in calls
+    )
+    assert all(call[4] is context.window_reference_refiner for call in calls)
 
 
 def test_no_loop_rejects_context_for_other_mode():

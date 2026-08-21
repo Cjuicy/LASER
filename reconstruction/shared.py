@@ -10,10 +10,41 @@ from inference_engine.utils.registration_confidence import (
     intersect_confidence_masks,
     select_top_confidence_mask,
 )
+from inference_engine.segmentation.base import (
+    SegmentationResult,
+    SegmentationStrategy,
+)
+from inference_engine.segmentation.window_reference import WindowReferenceRefinement
 
 
 def as_numpy(value: torch.Tensor):
     return value.detach().cpu().numpy()
+
+
+def segment_and_refine_window(
+    *,
+    strategy: SegmentationStrategy,
+    refiner: WindowReferenceRefinement,
+    point_maps: torch.Tensor,
+    camera_poses: torch.Tensor,
+    confidence: torch.Tensor,
+    images: torch.Tensor,
+    reference_intrinsic: torch.Tensor | None,
+) -> list[SegmentationResult]:
+    results = strategy.segment(
+        as_numpy(point_maps),
+        as_numpy(confidence),
+        as_numpy(images),
+    )
+    if not refiner.enabled:
+        return results
+    return refiner.refine(
+        results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        reference_intrinsic=reference_intrinsic,
+    )
 
 
 def reference_intrinsic(local_points: torch.Tensor) -> torch.Tensor:

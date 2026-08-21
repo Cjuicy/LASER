@@ -17,6 +17,7 @@ from reconstruction.shared import (
     as_numpy,
     mutual_confidence_mask,
     reference_intrinsic,
+    segment_and_refine_window,
     unproject_with_reference,
 )
 
@@ -28,10 +29,12 @@ class NoLoopReconstructionMode:
         register_adjacent: Callable = register_adjacent_windows,
         apply_pose_sim3: Callable = apply_sim3_to_pose,
         build_graphs: Callable = build_temporal_graphs,
+        segment_window: Callable = segment_and_refine_window,
     ) -> None:
         self._register_adjacent = register_adjacent
         self._apply_pose_sim3 = apply_pose_sim3
         self._build_graphs = build_graphs
+        self._segment_window = segment_window
 
     def run(self, context: ReconstructionContext) -> ReconstructionArtifact:
         if context.reconstruction_mode is not ReconstructionMode.NO_LOOP:
@@ -97,10 +100,14 @@ class NoLoopReconstructionMode:
                     translation,
                 )
 
-            results = context.segmentation_strategy.segment(
-                as_numpy(local_points),
-                as_numpy(confidence),
-                as_numpy(prediction.images),
+            results = self._segment_window(
+                strategy=context.segmentation_strategy,
+                refiner=context.window_reference_refiner,
+                point_maps=local_points,
+                camera_poses=camera_poses,
+                confidence=confidence,
+                images=prediction.images,
+                reference_intrinsic=intrinsic,
             )
             graph = self._build_graphs(
                 results,

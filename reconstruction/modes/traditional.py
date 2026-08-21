@@ -20,7 +20,11 @@ from loop_closure.utils.sim3loop import Sim3LoopOptimizer
 from pipeline.artifacts import ReconstructionArtifact, ReconstructionDiagnostics
 from pipeline.config import OptimizerConfig, ReconstructionMode
 from reconstruction.modes.base import ReconstructionContext
-from reconstruction.shared import as_numpy, mutual_confidence_mask
+from reconstruction.shared import (
+    as_numpy,
+    mutual_confidence_mask,
+    segment_and_refine_window,
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,7 @@ class TraditionalReconstructionMode:
         register_adjacent: Callable = register_adjacent_windows,
         apply_pose_sim3: Callable = apply_sim3_to_pose,
         build_graphs: Callable = build_temporal_graphs,
+        segment_window: Callable = segment_and_refine_window,
     ) -> None:
         self.detector = detector
         self.evidence = evidence
@@ -59,6 +64,7 @@ class TraditionalReconstructionMode:
         )
         self._register_adjacent = register_adjacent
         self._build_graphs = build_graphs
+        self._segment_window = segment_window
         self.trace: tuple[TraditionalWindowState, ...] = ()
 
     def run(self, context: ReconstructionContext) -> ReconstructionArtifact:
@@ -116,10 +122,14 @@ class TraditionalReconstructionMode:
             else:
                 relative_sim3 = identity_sim3(local_points.device)
 
-            results = context.segmentation_strategy.segment(
-                as_numpy(local_points),
-                as_numpy(confidence),
-                as_numpy(prediction.images),
+            results = self._segment_window(
+                strategy=context.segmentation_strategy,
+                refiner=context.window_reference_refiner,
+                point_maps=local_points,
+                camera_poses=camera_poses,
+                confidence=confidence,
+                images=prediction.images,
+                reference_intrinsic=prediction.reference_intrinsic,
             )
             graph = self._build_graphs(
                 results,

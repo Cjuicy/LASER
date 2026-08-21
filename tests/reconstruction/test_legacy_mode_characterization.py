@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from inference_engine.segmentation import DisabledWindowReferenceRefiner
 from loop_closure.types import LoopSolution
 from loop_closure.methods.corrected import (
     CorrectedLoopProcessor,
@@ -47,6 +48,7 @@ def _no_loop_context(anchor):
         ),
         frame_ids=(0, 1, 2, 3),
         segmentation_strategy=OneRegionSegmenter(),
+        window_reference_refiner=DisabledWindowReferenceRefiner(),
         anchor_propagator=anchor,
         segmentation_config=config.segmentation,
         anchor_config=config.anchor_propagation,

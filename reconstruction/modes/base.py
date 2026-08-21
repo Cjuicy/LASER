@@ -8,6 +8,7 @@ import torch
 
 from inference_engine.anchor_propagation import AnchorPropagator
 from inference_engine.segmentation.base import SegmentationStrategy
+from inference_engine.segmentation.window_reference import WindowReferenceRefinement
 from pipeline.artifacts import ReconstructionArtifact
 from pipeline.config import (
     AnchorPropagationConfig,
@@ -25,6 +26,7 @@ class ReconstructionContext:
     predictions: Iterable[WindowPrediction]
     frame_ids: tuple[int, ...]
     segmentation_strategy: SegmentationStrategy
+    window_reference_refiner: WindowReferenceRefinement
     anchor_propagator: AnchorPropagator
     segmentation_config: SegmentationConfig
     anchor_config: AnchorPropagationConfig

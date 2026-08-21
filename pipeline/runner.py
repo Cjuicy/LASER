@@ -19,7 +19,10 @@ from inference_engine.prediction_cache.fingerprint import (
 from inference_engine.prediction_cache.provider import OrdinaryPredictionProvider
 from inference_engine.prediction_cache.store import OrdinaryPredictionStore
 from inference_engine.prediction_cache.types import build_window_specs
-from inference_engine.segmentation import build_segmentation_strategy
+from inference_engine.segmentation import (
+    build_segmentation_strategy,
+    build_window_reference_refiner,
+)
 from loop_closure.constraint_estimation import JointAlignmentEstimator
 from loop_closure.detection import SaladLoopDetector
 from pipeline.artifacts import (
@@ -129,6 +132,7 @@ class PipelineDependencies:
     build_prediction_provider: Callable = OrdinaryPredictionProvider
     load_images: Callable = _load_images
     build_segmentation_strategy: Callable = build_segmentation_strategy
+    build_window_reference_refiner: Callable = build_window_reference_refiner
     build_anchor_propagator: Callable = AnchorPropagator
     build_reconstruction_mode: Callable = build_reconstruction_mode
     build_loop_detector: Callable = SaladLoopDetector
@@ -244,6 +248,9 @@ class PipelineRunner:
         segmenter = dependencies.build_segmentation_strategy(
             config.segmentation
         )
+        window_reference_refiner = dependencies.build_window_reference_refiner(
+            config.segmentation
+        )
         anchor = dependencies.build_anchor_propagator(
             config.anchor_propagation.correspondence_iou_threshold
         )
@@ -275,6 +282,7 @@ class PipelineRunner:
             predictions=predictions,
             frame_ids=tuple(range(len(manifest))),
             segmentation_strategy=segmenter,
+            window_reference_refiner=window_reference_refiner,
             anchor_propagator=anchor,
             segmentation_config=config.segmentation,
             anchor_config=config.anchor_propagation,

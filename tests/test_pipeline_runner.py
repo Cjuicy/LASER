@@ -72,7 +72,7 @@ def _loaded(tmp_path, mode="no_loop"):
     return load_pipeline_config(config, overrides)
 
 
-def _dependencies(events, mode):
+def _dependencies(events, mode, *, refiner_builder=None, context_sink=None):
     def preflight(*arguments):
         events.values.append("preflight")
 
@@ -121,6 +121,8 @@ def _dependencies(events, mode):
     class Mode:
         def run(self, context):
             events.values.append(mode)
+            if context_sink is not None:
+                context_sink(context)
             return _artifact(ReconstructionMode(mode))
 
     def build_mode(selected, services):
@@ -136,7 +138,7 @@ def _dependencies(events, mode):
     def forbidden(*arguments, **keywords):
         raise AssertionError("no_loop constructed loop services")
 
-    return PipelineDependencies(
+    dependency_kwargs = dict(
         validate_preflight=preflight,
         load_images=images,
         build_prediction_fingerprint=fingerprint,
@@ -152,6 +154,9 @@ def _dependencies(events, mode):
         cuda_available=lambda: False,
         git_commit=lambda: "test-commit",
     )
+    if refiner_builder is not None:
+        dependency_kwargs["build_window_reference_refiner"] = refiner_builder
+    return PipelineDependencies(**dependency_kwargs)
 
 
 def test_runner_no_loop_never_builds_loop_services(tmp_path):
@@ -175,6 +180,31 @@ def test_runner_no_loop_never_builds_loop_services(tmp_path):
         "no_loop",
         "write_artifact",
     ]
+
+
+def test_runner_builds_and_injects_window_reference_refiner(tmp_path):
+    events = Events()
+    loaded = _loaded(tmp_path)
+    sentinel = object()
+    builder_inputs = []
+    captured = []
+
+    def build_refiner(segmentation_config):
+        builder_inputs.append(segmentation_config)
+        return sentinel
+
+    PipelineRunner(
+        loaded,
+        dependencies=_dependencies(
+            events,
+            "no_loop",
+            refiner_builder=build_refiner,
+            context_sink=captured.append,
+        ),
+    ).run()
+
+    assert builder_inputs == [loaded.config.segmentation]
+    assert captured[0].window_reference_refiner is sentinel
 
 
 def test_run_from_config_returns_typed_artifact(tmp_path):

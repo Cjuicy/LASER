@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import torch
 
+from inference_engine.segmentation import DisabledWindowReferenceRefiner
+from reconstruction.shared import as_numpy
 from loop_closure.types import LoopSolution
 from pipeline.config import ReconstructionMode, load_pipeline_config
 from pipeline.manifest import ImageManifest
@@ -59,6 +62,7 @@ def _context(anchor, predictions, *, events=None):
         predictions=predictions,
         frame_ids=(0, 1, 2, 3),
         segmentation_strategy=OneRegionSegmenter(),
+        window_reference_refiner=DisabledWindowReferenceRefiner(),
         anchor_propagator=anchor,
         segmentation_config=config.segmentation,
         anchor_config=config.anchor_propagation,
@@ -115,6 +119,90 @@ def test_traditional_defers_all_recorded_corrections_until_aggregate():
     assert mode.trace[1].local_points[:, 0, 0, 2].tolist() == [1.0, 1.0]
     assert mode.trace[1].anchor_scale_mask[:, 0, 0, 0].tolist() == [3.0, 3.0]
     assert artifact.local_points[:, 0, 0, 2].tolist() == [1.0, 1.0, 3.0, 6.0]
+
+
+def test_traditional_segments_refines_graphs_and_anchors_untransformed_state():
+    events = []
+    calls = []
+    intrinsic = torch.tensor(
+        [[2.0, 0.0, 0.5], [0.0, 2.0, 0.5], [0.0, 0.0, 1.0]]
+    )
+
+    class RecordingAnchor:
+        def propagate(
+            self,
+            source_points,
+            target_points,
+            source_graphs,
+            target_graphs,
+            overlap,
+        ):
+            del source_points, source_graphs, target_graphs, overlap
+            events.append("anchor")
+            return torch.ones((*target_points.shape[:-1], 1))
+
+    def segment_window(
+        *,
+        strategy,
+        refiner,
+        point_maps,
+        camera_poses,
+        confidence,
+        images,
+        reference_intrinsic,
+    ):
+        events.extend(("segment", "refine"))
+        calls.append(
+            (
+                point_maps.clone(),
+                camera_poses.clone(),
+                confidence.clone(),
+                reference_intrinsic,
+                refiner,
+            )
+        )
+        return strategy.segment(
+            as_numpy(point_maps),
+            as_numpy(confidence),
+            as_numpy(images),
+        )
+
+    def build_graphs(results, threshold):
+        events.append("graph")
+        return tuple(results), threshold
+
+    source = (replace(prediction, reference_intrinsic=intrinsic) for prediction in _predictions())
+    context, optimizer_config = _context(RecordingAnchor(), source)
+    mode = TraditionalReconstructionMode(
+        detector=EmptyDetector(),
+        evidence=UnusedEvidence(),
+        optimizer_config=optimizer_config,
+        optimizer=FailingOptimizer(),
+        register_adjacent=lambda *arguments: identity_sim3(),
+        apply_pose_sim3=lambda poses, *arguments: poses,
+        build_graphs=build_graphs,
+        segment_window=segment_window,
+    )
+
+    mode.run(context)
+
+    assert events == [
+        "segment",
+        "refine",
+        "graph",
+        "segment",
+        "refine",
+        "graph",
+        "anchor",
+        "segment",
+        "refine",
+        "graph",
+        "anchor",
+    ]
+    assert all(torch.equal(call[0][..., 2], torch.ones((2, 1, 1))) for call in calls)
+    assert all(torch.equal(call[1], torch.eye(4).repeat(2, 1, 1)) for call in calls)
+    assert all(call[3] is intrinsic for call in calls)
+    assert all(call[4] is context.window_reference_refiner for call in calls)
 
 
 def test_traditional_detects_only_after_all_windows_are_recorded():
