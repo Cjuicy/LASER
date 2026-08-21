@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shlex
@@ -420,6 +421,62 @@ def test_synthetic_preflight_checks_matrix_identity_storage_and_skips_gpu(tmp_pa
     assert identity.detail["unique"] is True
     assert len(report.identity_seed_sha256) == 6
     assert next(check for check in report.checks if check.name == "cuda").detail["not_applicable"] is True
+
+
+def test_synthetic_preflight_uses_applicable_python_gate_and_targeted_imports(tmp_path):
+    loaded, plan = make_preflight_fixture(tmp_path, preset="synthetic-smoke")
+    calls: list[str] = []
+
+    def imports(name: str):
+        calls.append(name)
+        return importlib.import_module(name)
+
+    report = preflight_campaign(
+        loaded,
+        plan,
+        allow_no_gpu=True,
+        dependencies=replace(
+            _dependencies(cuda_available=False),
+            python_version=(3, 13, 5),
+            import_module=imports,
+        ),
+    )
+    assert report.status == "ok"
+    assert next(check for check in report.checks if check.name == "python").status == "ok"
+    assert {
+        "numpy",
+        "torch",
+        "inference_engine.segmentation",
+        "inference_engine.prediction_cache.fingerprint",
+        "pipeline.config",
+    } <= set(calls)
+    assert not {"open3d", "evo", "lietorch", "pi3"} & set(calls)
+
+
+def test_synthetic_preflight_rejects_unsupported_python_before_campaign_checks(tmp_path):
+    loaded, plan = make_preflight_fixture(tmp_path, preset="synthetic-smoke")
+    report = preflight_campaign(
+        loaded,
+        plan,
+        allow_no_gpu=True,
+        dependencies=replace(_dependencies(cuda_available=False), python_version=(3, 10, 0)),
+    )
+    assert report.status == "error"
+    assert next(check for check in report.checks if check.name == "python").status == "error"
+    assert any("supported for synthetic" in error for error in report.errors)
+
+
+def test_real_preflight_retains_exact_python_311_gate(tmp_path):
+    loaded, plan = make_preflight_fixture(tmp_path, preset="kitti-smoke")
+    report = preflight_campaign(
+        loaded,
+        plan,
+        allow_no_gpu=True,
+        dependencies=replace(_dependencies(cuda_available=False), python_version=(3, 13, 5)),
+    )
+    assert report.status == "error"
+    assert next(check for check in report.checks if check.name == "python").status == "error"
+    assert any("Python version must be exactly 3.11" in error for error in report.errors)
 
 
 def test_persisted_argv_redacts_options_and_url_userinfo():

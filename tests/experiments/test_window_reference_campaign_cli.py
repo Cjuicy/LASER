@@ -6,6 +6,7 @@ import csv
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -212,6 +213,61 @@ def test_synthetic_run_preflight_error_aborts_before_any_campaign_write(
     )
     assert code != 0
     assert calls
+    assert not output.exists()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize(
+    "blocked_module",
+    (
+        "numpy",
+        "torch",
+        "inference_engine.segmentation",
+        "inference_engine.prediction_cache.fingerprint",
+        "pipeline.config",
+    ),
+)
+def test_synthetic_run_checks_runtime_imports_before_any_campaign_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_module: str,
+):
+    from experiments.window_reference_campaign import cli, preflight
+
+    output = tmp_path / "campaign-output"
+    base = replace(
+        preflight.default_preflight_dependencies(),
+        python_version=(3, 11, 15),
+    )
+    calls: list[str] = []
+
+    def blocked_import(name: str):
+        calls.append(name)
+        if name == blocked_module:
+            raise ImportError(f"controlled synthetic {blocked_module} failure")
+        return base.import_module(name)
+
+    monkeypatch.setattr(
+        preflight,
+        "default_preflight_dependencies",
+        lambda: replace(base, import_module=blocked_import),
+    )
+    code = cli.main(
+        [
+            "run",
+            "--preset",
+            "synthetic-smoke",
+            "--data-root",
+            str(tmp_path / "missing-data"),
+            "--checkpoint",
+            str(tmp_path / "missing-model.safetensors"),
+            "--output-root",
+            str(output),
+        ]
+    )
+    assert code != 0
+    assert blocked_module in calls
+    assert not {"open3d", "evo", "lietorch", "pi3"} & set(calls)
     assert not output.exists()
 
 

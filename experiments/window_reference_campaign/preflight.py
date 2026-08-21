@@ -36,6 +36,14 @@ _REQUIRED_IMPORTS = (
     "inference_engine.utils.fast_seg",
     "inference_engine.utils._segmentation_cy",
 )
+_SYNTHETIC_REQUIRED_IMPORTS = (
+    "numpy",
+    "torch",
+    "inference_engine.segmentation",
+    "inference_engine.prediction_cache.fingerprint",
+    "pipeline.config",
+)
+_SYNTHETIC_SUPPORTED_PYTHON = frozenset({(3, 11), (3, 12), (3, 13)})
 _MIN_FREE_BYTES = 20 * 1024**3
 _PROTECTED_WORDS = (
     "kitti",
@@ -319,7 +327,10 @@ class PreflightDependencies:
     ) -> "PreflightDependencies":
         """Build deterministic boundary doubles without importing heavy modules."""
 
-        modules = {name: type("SentinelModule", (), {"__version__": "fixture"})() for name in _REQUIRED_IMPORTS}
+        modules = {
+            name: type("SentinelModule", (), {"__version__": "fixture"})()
+            for name in (*_REQUIRED_IMPORTS, *_SYNTHETIC_REQUIRED_IMPORTS)
+        }
         git_value = git or GitState("1" * 40, False)
         cuda_value = cuda or CudaState(False, 0, None, None, None)
         usage = DiskUsage(100 * 1024**3, 100 * 1024**3 - free_bytes, free_bytes)
@@ -435,24 +446,48 @@ def _check_python(
         _check(checks, "python", "ok", detail)
 
 
-def _check_imports(
+def _check_synthetic_python(
     dependencies: PreflightDependencies,
     checks: list[PreflightCheck],
     errors: list[str],
 ) -> None:
-    for module_name in _REQUIRED_IMPORTS:
+    version = dependencies.python_version
+    detail = {
+        "version": ".".join(str(item) for item in version),
+        "required": "3.11, 3.12, or 3.13 for synthetic",
+    }
+    if version[:2] not in _SYNTHETIC_SUPPORTED_PYTHON:
+        message = (
+            "Python version is not supported for synthetic campaigns; "
+            f"found {detail['version']}"
+        )
+        _check(checks, "python", "error", detail)
+        errors.append(message)
+    else:
+        _check(checks, "python", "ok", detail)
+
+
+def _check_imports(
+    dependencies: PreflightDependencies,
+    checks: list[PreflightCheck],
+    errors: list[str],
+    *,
+    module_names: Sequence[str] = _REQUIRED_IMPORTS,
+    check_prefix: str = "import",
+) -> None:
+    for module_name in module_names:
         try:
             module = dependencies.import_module(module_name)
             version = getattr(module, "__version__", None)
             detail: dict[str, object] = {"module": module_name, "available": True}
             if version is not None:
                 detail["version"] = str(version)
-            _check(checks, f"import:{module_name}", "ok", detail)
+            _check(checks, f"{check_prefix}:{module_name}", "ok", detail)
         except Exception as exc:
             message = f"required import {module_name} is unavailable: {exc}"
             _check(
                 checks,
-                f"import:{module_name}",
+                f"{check_prefix}:{module_name}",
                 "error",
                 {"module": module_name, "available": False, "error": str(exc)},
             )
@@ -880,17 +915,13 @@ def preflight_campaign(
         # Synthetic checks intentionally avoid model imports, checkpoint/data
         # existence, and CUDA.  Keep the storage and source provenance checks
         # so the same campaign-owned output boundary is exercised.
-        version = dependencies.python_version
-        python_detail = {
-            "version": ".".join(str(item) for item in version),
-            "required": "3.11 for real campaigns",
-            "synthetic": True,
-        }
-        if version[:2] != (3, 11):
-            _check(checks, "python", "warning", python_detail)
-            warnings.append("synthetic campaign does not import the PI3 runtime")
-        else:
-            _check(checks, "python", "ok", python_detail)
+        _check_synthetic_python(dependencies, checks, errors)
+        _check_imports(
+            dependencies,
+            checks,
+            errors,
+            module_names=_SYNTHETIC_REQUIRED_IMPORTS,
+        )
         repository = Path(loaded.config.repository_root)
         git = _check_git(repository, dependencies, checks, warnings, errors)
         free = _check_storage(loaded, dependencies, checks, warnings, errors)
