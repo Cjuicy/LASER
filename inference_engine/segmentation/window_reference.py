@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
@@ -208,6 +209,638 @@ def _intrinsic_compatible(
     return bool(
         np.all(np.abs(u - expected_u) <= 0.5)
         and np.all(np.abs(v - expected_v) <= 0.5)
+    )
+
+
+@dataclass(frozen=True)
+class _PairProjection:
+    source_flat_indices: np.ndarray
+    target_flat_indices: np.ndarray
+    correspondence_weights: np.ndarray
+    coverage: float = 0.0
+    geometry_ratio: float = 0.0
+    mean_confidence: float = 0.0
+    score: float = 0.0
+    projected_samples: int = 0
+    occluded_samples: int = 0
+    depth_rejected_samples: int = 0
+    target_invalid_samples: int = 0
+    out_of_bounds_samples: int = 0
+    nonpositive_depth_samples: int = 0
+    invalid_source_samples: int = 0
+    winner_samples: int = 0
+
+    def __post_init__(self) -> None:
+        arrays = (
+            ("source_flat_indices", np.int64),
+            ("target_flat_indices", np.int64),
+            ("correspondence_weights", np.float64),
+        )
+        for name, dtype in arrays:
+            value = np.asarray(getattr(self, name), dtype=dtype).copy()
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    @property
+    def weights(self) -> np.ndarray:
+        return self.correspondence_weights
+
+    @property
+    def source_indices(self) -> np.ndarray:
+        return self.source_flat_indices
+
+    @property
+    def target_indices(self) -> np.ndarray:
+        return self.target_flat_indices
+
+    @property
+    def coverage_ratio(self) -> float:
+        return self.coverage
+
+    @property
+    def confidence(self) -> float:
+        return self.mean_confidence
+
+    @property
+    def confidence_score(self) -> float:
+        return self.mean_confidence
+
+    @property
+    def pair_score(self) -> float:
+        return self.score
+
+    @property
+    def projected_count(self) -> int:
+        return self.projected_samples
+
+    @property
+    def projected_sample_count(self) -> int:
+        return self.projected_samples
+
+    @property
+    def occluded_count(self) -> int:
+        return self.occluded_samples
+
+    @property
+    def occluded_sample_count(self) -> int:
+        return self.occluded_samples
+
+    @property
+    def depth_rejected_count(self) -> int:
+        return self.depth_rejected_samples
+
+    @property
+    def depth_rejected_sample_count(self) -> int:
+        return self.depth_rejected_samples
+
+    @property
+    def target_invalid_count(self) -> int:
+        return self.target_invalid_samples
+
+    @property
+    def invalid_target_samples(self) -> int:
+        return self.target_invalid_samples
+
+    @property
+    def target_rejected_samples(self) -> int:
+        return self.target_invalid_samples
+
+    @property
+    def out_of_bounds_count(self) -> int:
+        return self.out_of_bounds_samples
+
+    @property
+    def negative_depth_samples(self) -> int:
+        return self.nonpositive_depth_samples
+
+
+def _empty_pair_projection(
+    *,
+    projected_samples: int = 0,
+    occluded_samples: int = 0,
+    depth_rejected_samples: int = 0,
+    target_invalid_samples: int = 0,
+    out_of_bounds_samples: int = 0,
+    nonpositive_depth_samples: int = 0,
+    invalid_source_samples: int = 0,
+    winner_samples: int = 0,
+) -> _PairProjection:
+    return _PairProjection(
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.float64),
+        projected_samples=projected_samples,
+        occluded_samples=occluded_samples,
+        depth_rejected_samples=depth_rejected_samples,
+        target_invalid_samples=target_invalid_samples,
+        out_of_bounds_samples=out_of_bounds_samples,
+        nonpositive_depth_samples=nonpositive_depth_samples,
+        invalid_source_samples=invalid_source_samples,
+        winner_samples=winner_samples,
+    )
+
+
+def _project_pair(*args: object, **kwargs: object) -> _PairProjection:
+    """Project one sparse source frame into one target frame deterministically.
+
+    The canonical positional order is ``source_points, target_points,
+    source_pose, target_pose, source_mask, target_mask, source_probability,
+    target_probability, intrinsic, source_rows, source_columns``.  Keyword
+    aliases also accept prepared frame stacks via ``points``, ``poses``,
+    ``masks``, ``probabilities``, ``source_index``, and ``target_index``.
+    """
+
+    names = (
+        "source_points",
+        "target_points",
+        "source_pose",
+        "target_pose",
+        "source_mask",
+        "target_mask",
+        "source_probability",
+        "target_probability",
+        "intrinsic",
+        "source_rows",
+        "source_columns",
+    )
+    values: dict[str, object] = {}
+    if args:
+        first_array = np.asarray(args[0])
+        indexed_stack = (
+            len(args) in (9, 10, 11)
+            and np.isscalar(args[0])
+            and np.isscalar(args[1])
+            and np.asarray(args[2]).ndim == 4
+        )
+        stacked_frames = len(args) in (9, 10, 11) and first_array.ndim == 4
+        if indexed_stack:
+            # Indexed stack style: source index, target index, points,
+            # poses, masks/probabilities, probabilities/masks, K, rows,
+            # columns, [stride, tol].
+            values.update(
+                {
+                    "source_index": args[0],
+                    "target_index": args[1],
+                    "points": args[2],
+                    "poses": args[3],
+                    "intrinsic": args[6],
+                    "source_rows": args[7],
+                    "source_columns": args[8],
+                }
+            )
+            first_confidence, second_confidence = args[4], args[5]
+            if np.asarray(first_confidence).dtype.kind == "b":
+                values["masks"] = first_confidence
+                values["probabilities"] = second_confidence
+            else:
+                values["probabilities"] = first_confidence
+                values["masks"] = second_confidence
+            if len(args) >= 10:
+                kwargs.setdefault("sampling_stride", args[9])
+            if len(args) >= 11:
+                kwargs.setdefault("relative_depth_tolerance", args[10])
+        elif stacked_frames:
+            # Stack style: points, poses, masks/probabilities,
+            # probabilities/masks, K, source index, target index, rows,
+            # columns, [stride, tol].
+            values.update(
+                {
+                    "points": args[0],
+                    "poses": args[1],
+                    "intrinsic": args[4],
+                    "source_index": args[5],
+                    "target_index": args[6],
+                    "source_rows": args[7],
+                    "source_columns": args[8],
+                }
+            )
+            first_confidence, second_confidence = args[2], args[3]
+            if np.asarray(first_confidence).dtype.kind == "b":
+                values["masks"] = first_confidence
+                values["probabilities"] = second_confidence
+            else:
+                values["probabilities"] = first_confidence
+                values["masks"] = second_confidence
+            if len(args) >= 10:
+                kwargs.setdefault("sampling_stride", args[9])
+            if len(args) >= 11:
+                kwargs.setdefault("relative_depth_tolerance", args[10])
+        elif len(args) in (11, 12, 13):
+            values.update(dict(zip(names, args[:11], strict=False)))
+            if len(args) >= 12:
+                kwargs.setdefault("sampling_stride", args[11])
+            if len(args) >= 13:
+                kwargs.setdefault("relative_depth_tolerance", args[12])
+        else:
+            raise TypeError("unsupported _project_pair positional arguments")
+    values.update(kwargs)
+
+    points = values.pop("points", None)
+    poses = values.pop("poses", values.pop("camera_poses", None))
+    masks = values.pop("masks", values.pop("selected_masks", None))
+    probabilities = values.pop(
+        "probabilities",
+        values.pop("confidence_probabilities", None),
+    )
+    source_index = values.pop(
+        "source_index",
+        values.pop("source_frame", values.pop("source_frame_index", None)),
+    )
+    target_index = values.pop(
+        "target_index",
+        values.pop("target_frame", values.pop("target_frame_index", None)),
+    )
+
+    if values.get("intrinsic") is None:
+        values["intrinsic"] = values.pop(
+            "K",
+            values.pop("reference_intrinsic", None),
+        )
+    if values.get("source_rows") is None:
+        values["source_rows"] = values.pop(
+            "rows",
+            values.pop("sample_rows", values.pop("sampled_rows", None)),
+        )
+    if values.get("source_columns") is None:
+        values["source_columns"] = values.pop(
+            "columns",
+            values.pop(
+                "sample_columns",
+                values.pop("sampled_columns", None),
+            ),
+        )
+    if values.get("sampling_stride") is None:
+        values["sampling_stride"] = values.pop("stride", None)
+    if values.get("relative_depth_tolerance") is None:
+        values["relative_depth_tolerance"] = values.pop("depth_tolerance", None)
+    if values.get("source_probability") is None:
+        values["source_probability"] = values.pop(
+            "source_probabilities",
+            values.pop(
+                "source_confidence_probability",
+                values.pop(
+                    "source_confidence_prob",
+                    values.pop(
+                        "source_probs",
+                        values.pop("source_confidence", None),
+                    ),
+                ),
+            ),
+        )
+    if values.get("source_mask") is None:
+        values["source_mask"] = values.pop(
+            "source_valid_mask",
+            values.pop("source_high_confidence_mask", None),
+        )
+    if values.get("target_mask") is None:
+        values["target_mask"] = values.pop(
+            "target_valid_mask",
+            values.pop("target_high_confidence_mask", None),
+        )
+    if values.get("target_probability") is None:
+        values["target_probability"] = values.pop(
+            "target_probabilities",
+            values.pop(
+                "target_confidence_probability",
+                values.pop(
+                    "target_confidence_prob",
+                    values.pop(
+                        "target_probs",
+                        values.pop("target_confidence", None),
+                    ),
+                ),
+            ),
+        )
+
+    sample_indices = values.pop(
+        "sample_indices",
+        values.pop("source_sample_indices", None),
+    )
+    if (
+        values.get("source_rows") is None
+        and values.get("source_columns") is None
+        and sample_indices is not None
+    ):
+        try:
+            values["source_rows"], values["source_columns"] = sample_indices
+        except (TypeError, ValueError) as exc:
+            raise TypeError("sample_indices must contain rows and columns") from exc
+
+    if points is not None:
+        if source_index is None or target_index is None:
+            raise TypeError("stack projection requires source and target indices")
+        points_array = np.asarray(points)
+        values["source_points"] = points_array[int(source_index)]
+        values["target_points"] = points_array[int(target_index)]
+    if poses is not None:
+        if source_index is None or target_index is None:
+            raise TypeError("stack projection requires source and target indices")
+        poses_array = np.asarray(poses)
+        values["source_pose"] = poses_array[int(source_index)]
+        values["target_pose"] = poses_array[int(target_index)]
+    if masks is not None:
+        masks_array = np.asarray(masks)
+        if source_index is not None and target_index is not None:
+            values["source_mask"] = masks_array[int(source_index)]
+            values["target_mask"] = masks_array[int(target_index)]
+        elif masks_array.ndim == 3 and masks_array.shape[0] == 2:
+            values["source_mask"], values["target_mask"] = masks_array
+    if probabilities is not None:
+        probabilities_array = np.asarray(probabilities)
+        if source_index is not None and target_index is not None:
+            values["source_probability"] = probabilities_array[int(source_index)]
+            values["target_probability"] = probabilities_array[int(target_index)]
+        elif probabilities_array.ndim == 3 and probabilities_array.shape[0] == 2:
+            values["source_probability"], values["target_probability"] = (
+                probabilities_array
+            )
+
+    required = (
+        "source_points",
+        "target_points",
+        "source_pose",
+        "target_pose",
+        "source_mask",
+        "target_mask",
+        "source_probability",
+        "target_probability",
+        "intrinsic",
+        "source_rows",
+        "source_columns",
+        "sampling_stride",
+        "relative_depth_tolerance",
+    )
+    missing = [name for name in required if values.get(name) is None]
+    if missing:
+        raise TypeError(f"missing _project_pair arguments: {', '.join(missing)}")
+
+    source_points = np.asarray(values["source_points"], dtype=np.float64)
+    target_points = np.asarray(values["target_points"], dtype=np.float64)
+    source_pose = np.asarray(values["source_pose"], dtype=np.float64)
+    target_pose = np.asarray(values["target_pose"], dtype=np.float64)
+    raw_source_mask = np.asarray(values["source_mask"])
+    raw_target_mask = np.asarray(values["target_mask"])
+    raw_source_probability = np.asarray(values["source_probability"])
+    raw_target_probability = np.asarray(values["target_probability"])
+    if (
+        raw_source_mask.dtype.kind != "b"
+        and raw_source_probability.dtype.kind == "b"
+    ):
+        source_mask = raw_source_probability.astype(bool)
+        target_mask = raw_target_probability.astype(bool)
+        source_probability = raw_source_mask.astype(np.float64)
+        target_probability = raw_target_mask.astype(np.float64)
+    else:
+        source_mask = raw_source_mask.astype(bool)
+        target_mask = raw_target_mask.astype(bool)
+        source_probability = raw_source_probability.astype(np.float64)
+        target_probability = raw_target_probability.astype(np.float64)
+    intrinsic = np.asarray(values["intrinsic"], dtype=np.float64)
+    source_rows = np.asarray(values["source_rows"], dtype=np.int64)
+    source_columns = np.asarray(values["source_columns"], dtype=np.int64)
+    sampling_stride = int(values["sampling_stride"])
+    relative_depth_tolerance = float(values["relative_depth_tolerance"])
+
+    if source_points.ndim != 3 or source_points.shape[-1] != 3:
+        raise ValueError("source_points must have shape (H, W, 3)")
+    if target_points.shape != source_points.shape:
+        raise ValueError("target_points must match source_points shape")
+    height, width, _ = source_points.shape
+    masks_shape = (height, width)
+    if source_mask.shape != masks_shape or target_mask.shape != masks_shape:
+        raise ValueError("source and target masks must have shape (H, W)")
+    if (
+        source_probability.shape != masks_shape
+        or target_probability.shape != masks_shape
+    ):
+        raise ValueError("source and target probabilities must have shape (H, W)")
+    if source_pose.shape != (4, 4) or target_pose.shape != (4, 4):
+        raise ValueError("source_pose and target_pose must have shape (4, 4)")
+    if intrinsic.shape != (3, 3):
+        raise ValueError("intrinsic must have shape (3, 3)")
+    if sampling_stride <= 0 or not np.isfinite(relative_depth_tolerance):
+        raise ValueError("projection parameters must be valid")
+    if relative_depth_tolerance <= 0.0:
+        raise ValueError("relative_depth_tolerance must be positive")
+    if source_rows.ndim != 1 or source_columns.ndim != 1:
+        raise ValueError("source_rows and source_columns must be one-dimensional")
+    if (
+        np.any(source_rows < 0)
+        or np.any(source_rows >= height)
+        or np.any(source_columns < 0)
+        or np.any(source_columns >= width)
+    ):
+        raise ValueError("source sample indices must be in bounds")
+
+    grid_rows, grid_columns = np.meshgrid(
+        source_rows,
+        source_columns,
+        indexing="ij",
+    )
+    source_flat_all = (grid_rows * width + grid_columns).reshape(-1)
+    sampled_points = source_points[grid_rows, grid_columns].reshape(-1, 3)
+    sampled_mask = source_mask[grid_rows, grid_columns].reshape(-1)
+    sampled_probability = source_probability[grid_rows, grid_columns].reshape(-1)
+    sampled_finite = (
+        sampled_mask
+        & np.all(np.isfinite(sampled_points), axis=1)
+        & np.isfinite(sampled_probability)
+    )
+    source_finite = (
+        sampled_finite
+        & (sampled_points[:, 2] > 1e-6)
+    )
+    invalid_source_samples = int(source_finite.size - np.count_nonzero(source_finite))
+    nonpositive_depth_samples = int(
+        np.count_nonzero(sampled_finite & (sampled_points[:, 2] <= 1e-6))
+    )
+    if not np.any(source_finite):
+        return _empty_pair_projection(
+            nonpositive_depth_samples=nonpositive_depth_samples,
+            invalid_source_samples=invalid_source_samples,
+        )
+
+    source_flat = source_flat_all[source_finite]
+    sampled_points = sampled_points[source_finite]
+    sampled_probability = np.clip(sampled_probability[source_finite], 0.0, 1.0)
+    source_homogeneous = np.concatenate(
+        [sampled_points, np.ones((sampled_points.shape[0], 1), dtype=np.float64)],
+        axis=1,
+    )
+    try:
+        relative = np.linalg.inv(target_pose.astype(np.float64)) @ source_pose.astype(
+            np.float64
+        )
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("camera poses must be invertible") from exc
+    target_homogeneous = (relative @ source_homogeneous.T).T
+    target_xyz = target_homogeneous[:, :3]
+    positive_depth = np.all(np.isfinite(target_xyz), axis=1) & (
+        target_xyz[:, 2] > 1e-6
+    )
+    nonpositive_depth_samples += int(
+        positive_depth.size - np.count_nonzero(positive_depth)
+    )
+    if not np.any(positive_depth):
+        return _empty_pair_projection(
+            nonpositive_depth_samples=nonpositive_depth_samples,
+            invalid_source_samples=invalid_source_samples,
+        )
+
+    source_flat = source_flat[positive_depth]
+    sampled_probability = sampled_probability[positive_depth]
+    target_xyz = target_xyz[positive_depth]
+    projected = target_xyz @ intrinsic.T
+    denominator = projected[:, 2]
+    finite_projection = np.all(np.isfinite(projected), axis=1) & (
+        denominator > 1e-6
+    )
+    source_flat = source_flat[finite_projection]
+    sampled_probability = sampled_probability[finite_projection]
+    target_xyz = target_xyz[finite_projection]
+    projected = projected[finite_projection]
+    denominator = denominator[finite_projection]
+    if source_flat.size == 0:
+        return _empty_pair_projection(
+            nonpositive_depth_samples=nonpositive_depth_samples,
+            invalid_source_samples=invalid_source_samples,
+        )
+
+    pixel_u = np.floor(projected[:, 0] / denominator + 0.5).astype(np.int64)
+    pixel_v = np.floor(projected[:, 1] / denominator + 0.5).astype(np.int64)
+    projected_depth = target_xyz[:, 2]
+    in_bounds = (
+        (pixel_u >= 0)
+        & (pixel_u < width)
+        & (pixel_v >= 0)
+        & (pixel_v < height)
+    )
+    out_of_bounds_samples = int(in_bounds.size - np.count_nonzero(in_bounds))
+    source_flat = source_flat[in_bounds]
+    sampled_probability = sampled_probability[in_bounds]
+    projected_depth = projected_depth[in_bounds]
+    pixel_u = pixel_u[in_bounds]
+    pixel_v = pixel_v[in_bounds]
+    projected_samples = int(source_flat.size)
+    if projected_samples == 0:
+        return _empty_pair_projection(
+            projected_samples=0,
+            out_of_bounds_samples=out_of_bounds_samples,
+            nonpositive_depth_samples=nonpositive_depth_samples,
+            invalid_source_samples=invalid_source_samples,
+        )
+
+    target_flat = pixel_v * width + pixel_u
+    order = np.lexsort((source_flat, projected_depth, target_flat))
+    source_flat = source_flat[order]
+    sampled_probability = sampled_probability[order]
+    projected_depth = projected_depth[order]
+    pixel_u = pixel_u[order]
+    pixel_v = pixel_v[order]
+    target_flat = target_flat[order]
+    first = np.r_[True, target_flat[1:] != target_flat[:-1]]
+    winners_source = source_flat[first]
+    winners_target = target_flat[first]
+    winners_probability = sampled_probability[first]
+    winners_depth = projected_depth[first]
+    winners_u = pixel_u[first]
+    winners_v = pixel_v[first]
+    winner_samples = int(winners_source.size)
+    occluded_samples = projected_samples - winner_samples
+
+    target_flat_all = np.arange(height * width, dtype=np.int64)
+    target_xyz_flat = target_points.reshape(-1, 3)
+    target_probability_flat = target_probability.reshape(-1)
+    target_geometry = (
+        target_mask.reshape(-1)
+        & np.all(np.isfinite(target_xyz_flat), axis=1)
+        & (target_xyz_flat[:, 2] > 1e-6)
+        & np.isfinite(target_probability_flat)
+    )
+    target_geometry = target_geometry.reshape(height, width)
+    valid_target_flat = target_flat_all[target_geometry.reshape(-1)]
+    if valid_target_flat.size:
+        valid_target_v = valid_target_flat // width
+        valid_target_u = valid_target_flat % width
+        target_cells = np.unique(
+            (valid_target_v // sampling_stride)
+            * ((width + sampling_stride - 1) // sampling_stride)
+            + (valid_target_u // sampling_stride)
+        )
+    else:
+        target_cells = np.empty(0, dtype=np.int64)
+
+    winner_target_valid = target_geometry[winners_v, winners_u]
+    target_invalid_samples = int(winner_samples - np.count_nonzero(winner_target_valid))
+    winner_target_depth = target_points[winners_v, winners_u, 2]
+    denominator_depth = np.maximum(np.abs(winner_target_depth), 1e-6)
+    relative_error = np.full(winner_samples, np.inf, dtype=np.float64)
+    relative_error[winner_target_valid] = np.abs(
+        winners_depth[winner_target_valid] - winner_target_depth[winner_target_valid]
+    ) / denominator_depth[winner_target_valid]
+    consistent = winner_target_valid & (relative_error < relative_depth_tolerance)
+    depth_rejected_samples = int(
+        np.count_nonzero(winner_target_valid & ~consistent)
+    )
+    if np.any(consistent):
+        target_cells_for_winners = np.unique(
+            (winners_v[consistent] // sampling_stride)
+            * ((width + sampling_stride - 1) // sampling_stride)
+            + (winners_u[consistent] // sampling_stride)
+        )
+        confidence_weight = np.sqrt(
+            winners_probability[consistent]
+            * np.clip(target_probability[winners_v[consistent], winners_u[consistent]], 0.0, 1.0)
+        )
+        depth_weight = np.maximum(
+            0.0,
+            1.0 - relative_error[consistent] / relative_depth_tolerance,
+        )
+        correspondence_weights = confidence_weight * depth_weight
+        source_indices = winners_source[consistent]
+        target_indices = winners_target[consistent]
+    else:
+        target_cells_for_winners = np.empty(0, dtype=np.int64)
+        confidence_weight = np.empty(0, dtype=np.float64)
+        correspondence_weights = np.empty(0, dtype=np.float64)
+        source_indices = np.empty(0, dtype=np.int64)
+        target_indices = np.empty(0, dtype=np.int64)
+
+    coverage = (
+        float(target_cells_for_winners.size / target_cells.size)
+        if target_cells.size
+        else 0.0
+    )
+    geometry_denominator = int(np.count_nonzero(winner_target_valid))
+    geometry_ratio = (
+        float(np.count_nonzero(consistent) / geometry_denominator)
+        if geometry_denominator
+        else 0.0
+    )
+    mean_confidence = (
+        float(np.mean(confidence_weight)) if confidence_weight.size else 0.0
+    )
+    score = coverage * float(np.sqrt(geometry_ratio * mean_confidence))
+    components = (coverage, geometry_ratio, mean_confidence, score)
+    coverage, geometry_ratio, mean_confidence, score = tuple(
+        float(np.clip(value, 0.0, 1.0)) for value in components
+    )
+    return _PairProjection(
+        source_indices,
+        target_indices,
+        correspondence_weights,
+        coverage=coverage,
+        geometry_ratio=geometry_ratio,
+        mean_confidence=mean_confidence,
+        score=score,
+        projected_samples=projected_samples,
+        occluded_samples=occluded_samples,
+        depth_rejected_samples=depth_rejected_samples,
+        target_invalid_samples=target_invalid_samples,
+        out_of_bounds_samples=out_of_bounds_samples,
+        nonpositive_depth_samples=nonpositive_depth_samples,
+        invalid_source_samples=invalid_source_samples,
+        winner_samples=winner_samples,
     )
 
 

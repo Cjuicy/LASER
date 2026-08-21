@@ -10,6 +10,7 @@ from inference_engine.segmentation.window_reference import (
     _centered_axis,
     _confidence_mask_and_quality,
     _confidence_probability,
+    _project_pair,
 )
 from pipeline.config import load_pipeline_config
 
@@ -337,3 +338,165 @@ def test_confidence_mask_uses_valid_points_quantile_and_keeps_equal_values():
     assert quality == pytest.approx(
         (2.0 / 4.0) * (1.0 / (1.0 + np.exp(-1.0)))
     )
+
+
+def _projection_fixture_inputs():
+    results, point_maps, camera_poses, confidence, intrinsic = _identity_fixture()
+    del results, confidence
+    points = point_maps.numpy()
+    poses = camera_poses.numpy()
+    probabilities = np.full((2, 3, 3), 0.5, dtype=np.float64)
+    masks = np.ones((2, 3, 3), dtype=bool)
+    return (
+        points[0],
+        points[1],
+        poses[0],
+        poses[1],
+        masks[0],
+        masks[1],
+        probabilities[0],
+        probabilities[1],
+        intrinsic.numpy(),
+        np.array([1], dtype=np.int64),
+        np.array([1], dtype=np.int64),
+    )
+
+
+def test_identity_projection_maps_center_sample_to_same_target_pixel():
+    pair = _project_pair(
+        *_projection_fixture_inputs(),
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+
+    assert pair.source_flat_indices.tolist() == [4]
+    assert pair.target_flat_indices.tolist() == [4]
+
+
+def test_c2w_translation_projects_source_center_one_pixel_right():
+    inputs = list(_projection_fixture_inputs())
+    source_pose = inputs[2].copy()
+    source_pose[0, 3] = 0.5
+    inputs[2] = source_pose
+
+    pair = _project_pair(
+        *inputs,
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+
+    assert pair.source_flat_indices.tolist() == [4]
+    assert pair.target_flat_indices.tolist() == [5]
+
+
+def test_projection_z_buffer_prefers_nearest_depth_and_lower_flat_index_on_tie():
+    inputs = list(_projection_fixture_inputs())
+    source_points = inputs[0].copy()
+    source_points[1, 1] = [0.0, 0.0, 2.0]
+    source_points[1, 2] = [0.0, 0.0, 1.0]
+    inputs[0] = source_points
+    inputs[9] = np.array([1], dtype=np.int64)
+    inputs[10] = np.array([1, 2], dtype=np.int64)
+
+    pair = _project_pair(
+        *inputs,
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+
+    assert pair.source_flat_indices.tolist() == [5]
+    assert pair.target_flat_indices.tolist() == [4]
+    assert pair.projected_samples == 2
+    assert pair.occluded_samples == 1
+
+    source_points[1, 1] = [0.0, 0.0, 1.0]
+    inputs[0] = source_points
+    pair = _project_pair(
+        *inputs,
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+
+    assert pair.source_flat_indices.tolist() == [4]
+
+
+def test_projection_rejects_out_of_bounds_and_nonpositive_depth_samples():
+    inputs = list(_projection_fixture_inputs())
+    source_points = inputs[0].copy()
+    source_points[1, 1] = [2.0, 0.0, 1.0]
+    source_points[1, 2] = [0.0, 0.0, -1.0]
+    inputs[0] = source_points
+    inputs[9] = np.array([1], dtype=np.int64)
+    inputs[10] = np.array([1, 2], dtype=np.int64)
+
+    pair = _project_pair(
+        *inputs,
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+
+    assert pair.source_flat_indices.size == 0
+    assert pair.target_flat_indices.size == 0
+    assert pair.projected_samples == 0
+
+
+def test_projection_abstains_for_low_confidence_target_pixels():
+    inputs = list(_projection_fixture_inputs())
+    target_mask = inputs[5].copy()
+    target_mask[1, 1] = False
+    inputs[5] = target_mask
+
+    pair = _project_pair(
+        *inputs,
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+
+    assert pair.source_flat_indices.size == 0
+    assert pair.target_flat_indices.size == 0
+    assert pair.coverage == pytest.approx(0.0)
+    assert pair.score == pytest.approx(0.0)
+
+
+def test_projection_uses_strict_relative_depth_tolerance():
+    inputs = list(_projection_fixture_inputs())
+    target_points = inputs[1].copy()
+    target_points[1, 1, 2] = 1.0 / (1.0 - 0.05)
+    inputs[1] = target_points
+
+    pair = _project_pair(
+        *inputs,
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+
+    assert pair.source_flat_indices.size == 0
+    assert pair.depth_rejected_samples == 1
+    assert pair.geometry_ratio == pytest.approx(0.0)
+
+
+def test_projection_reports_perfect_pair_score_and_zero_denominators():
+    pair = _project_pair(
+        *_projection_fixture_inputs(),
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+
+    assert pair.coverage == pytest.approx(1.0)
+    assert pair.geometry_ratio == pytest.approx(1.0)
+    assert pair.mean_confidence == pytest.approx(0.5)
+    assert pair.score == pytest.approx(np.sqrt(0.5))
+    np.testing.assert_allclose(pair.correspondence_weights, [0.5])
+
+    inputs = list(_projection_fixture_inputs())
+    inputs[4] = np.zeros((3, 3), dtype=bool)
+    inputs[5] = np.zeros((3, 3), dtype=bool)
+    empty_pair = _project_pair(
+        *inputs,
+        sampling_stride=4,
+        relative_depth_tolerance=0.05,
+    )
+    assert empty_pair.coverage == pytest.approx(0.0)
+    assert empty_pair.geometry_ratio == pytest.approx(0.0)
+    assert empty_pair.mean_confidence == pytest.approx(0.0)
+    assert empty_pair.score == pytest.approx(0.0)
