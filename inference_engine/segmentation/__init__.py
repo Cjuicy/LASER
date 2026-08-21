@@ -4,6 +4,12 @@ from .base import (
     build_temporal_graphs,
 )
 from .confidence import select_numpy_top_confidence_mask
+from .window_reference import (
+    DisabledWindowReferenceRefiner,
+    WindowReferenceRefinement,
+    WindowReferenceRefiner,
+    build_window_reference_refiner,
+)
 
 
 def build_segmentation_strategy(config):
@@ -17,6 +23,9 @@ __all__ = [
     "SegmentationStrategy",
     "build_segmentation_strategy",
     "build_temporal_graphs",
+    "build_window_reference_refiner",
+    "DisabledWindowReferenceRefiner",
     "select_numpy_top_confidence_mask",
+    "WindowReferenceRefinement",
+    "WindowReferenceRefiner",
 ]
-
