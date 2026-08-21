@@ -427,6 +427,41 @@ def test_enabled_refiner_uses_insufficient_support_fallback_without_splitting():
     assert refined[1].diagnostics["region_count"] == 2
 
 
+def test_enabled_refiner_compacts_bool_nonkeyframe_fallback_labels():
+    results, point_maps, camera_poses, confidence, intrinsic = (
+        _two_region_identity_fixture()
+    )
+    results[1] = SegmentationResult(
+        np.array(
+            [
+                [False, False, True],
+                [False, False, True],
+                [False, False, True],
+            ],
+            dtype=bool,
+        ),
+        dict(results[1].diagnostics),
+    )
+
+    refined = _run_enabled(
+        results=results,
+        point_maps=point_maps,
+        camera_poses=camera_poses,
+        confidence=confidence,
+        intrinsic=intrinsic,
+        overrides=(
+            "segmentation.window_reference.sampling_stride=1",
+            "segmentation.window_reference.min_region_correspondences=9",
+        ),
+    )
+
+    np.testing.assert_array_equal(refined[1].labels, results[1].labels)
+    assert refined[1].labels.dtype == np.intp
+    assert refined[1].diagnostics["window_reference_fallback"] == (
+        "insufficient_support"
+    )
+
+
 def test_enabled_refiner_reports_conflict_only_when_all_eligible_unions_conflict(
     monkeypatch,
 ):

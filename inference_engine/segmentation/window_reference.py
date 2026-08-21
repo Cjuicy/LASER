@@ -1243,7 +1243,8 @@ class WindowReferenceRefiner:
                 output_labels = initial_labels.copy()
                 fallback = "none"
             else:
-                output_labels = compact_labels(roots[initial_labels]).astype(
+                region_indices = np.asarray(initial_labels, dtype=np.intp)
+                output_labels = compact_labels(roots[region_indices]).astype(
                     np.intp,
                     copy=False,
                 )
