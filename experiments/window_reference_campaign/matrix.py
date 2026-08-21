@@ -90,6 +90,9 @@ class CampaignPlan:
             raise ValueError("plan runs must be a tuple")
         if any(not isinstance(item, PlannedRun) for item in self.runs):
             raise ValueError("plan contains an invalid run")
+        relative_dirs = [item.relative_run_dir for item in self.runs]
+        if len(relative_dirs) != len(set(relative_dirs)):
+            raise ValueError("plan relative_run_dir values must be unique")
 
 
 @dataclass(frozen=True)
@@ -255,11 +258,19 @@ def build_plan(loaded: LoadedCampaignConfig) -> CampaignPlan:
     runs: list[PlannedRun] = []
     for selected in config.selected_scenes:
         scene_config = config.scenes[selected.scene_id]
+        if (
+            not scene_config.scene_id
+            or scene_config.scene_id in {".", ".."}
+            or Path(scene_config.scene_id).name != scene_config.scene_id
+            or "\\" in scene_config.scene_id
+        ):
+            raise ValueError("scene_id must be a path-safe component")
         slice_id = _slice_id(selected.start, selected.stop, selected.stride)
         for variant in variants:
             relative = (
                 Path("runs")
                 / scene_config.dataset.value
+                / scene_config.scene_id
                 / slice_id
                 / variant.run_id
             )

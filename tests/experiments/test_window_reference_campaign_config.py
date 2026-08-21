@@ -155,3 +155,40 @@ def test_plan_dry_run_does_not_import_torch_or_touch_inputs(tmp_path):
         "atomic__wr-off", "atomic__wr-on",
     ]
     assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("preset", ["kitti-small", "kitti-formal-subset"])
+def test_multi_scene_presets_have_unique_relative_run_directories(preset):
+    loaded = load_campaign_config(CONFIG, CampaignOverrides(preset=preset))
+    plan = build_plan(loaded)
+    relative_dirs = [run.relative_run_dir for run in plan.runs]
+    assert len(relative_dirs) == len(set(relative_dirs))
+
+
+def test_normal_pipeline_enum_import_errors_are_not_swallowed(tmp_path):
+    blocker = tmp_path / "sitecustomize.py"
+    blocker.write_text(
+        "import sys\n"
+        "class Block:\n"
+        "  def find_spec(self, fullname, path=None, target=None):\n"
+        "    if fullname == 'pipeline.config':\n"
+        "      raise RuntimeError('pipeline config initialization failed')\n"
+        "sys.meta_path.insert(0, Block())\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("LASER_WINDOW_REFERENCE_IMPORT_LIGHT", None)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import experiments.window_reference_campaign.config",
+        ],
+        cwd=ROOT,
+        env={**env, "PYTHONPATH": f"{tmp_path}{os.pathsep}{ROOT}"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode != 0
+    assert "pipeline config initialization failed" in completed.stderr

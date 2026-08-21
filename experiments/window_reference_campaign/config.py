@@ -11,20 +11,11 @@ from typing import Mapping
 
 from omegaconf import OmegaConf
 
-try:
-    # In normal runtime these are the pipeline's exact enum classes.  The
-    # package-level pipeline exports currently import torch, so retain a
-    # value-compatible light fallback for the import-free plan subprocess.
-    if os.environ.get("LASER_WINDOW_REFERENCE_IMPORT_LIGHT") == "1":
-        raise ImportError("light campaign import requested")
-    from pipeline.config import (
-        AtomicSplitMode,
-        ModelName,
-        PredictionCacheMode,
-        ReconstructionMode,
-        SegmentationMethod,
-    )
-except (ImportError, RuntimeError):  # pragma: no cover - torch-blocked plan
+# In normal runtime these are the pipeline's exact enum classes.  The
+# package-level pipeline exports currently import torch, so define a
+# value-compatible light fallback only when the CLI explicitly requests its
+# import-free plan path.  Normal import errors must remain visible.
+if os.environ.get("LASER_WINDOW_REFERENCE_IMPORT_LIGHT") == "1":
     class SegmentationMethod(str, Enum):
         DEPTH = "depth"
         GEOMETRY = "geometry"
@@ -48,6 +39,14 @@ except (ImportError, RuntimeError):  # pragma: no cover - torch-blocked plan
         REFRESH = "refresh"
         READONLY = "readonly"
         OFF = "off"
+else:
+    from pipeline.config import (
+        AtomicSplitMode,
+        ModelName,
+        PredictionCacheMode,
+        ReconstructionMode,
+        SegmentationMethod,
+    )
 
 
 class DatasetKind(str, Enum):
