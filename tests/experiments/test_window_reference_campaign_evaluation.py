@@ -98,6 +98,7 @@ def _staged(
         poses_path=poses_path,
         pointcloud_gt_path=pointcloud_gt_path,
         manifest_path=tmp_path / "staged" / "staging.json",
+        identity_manifest_sha256="a" * 64,
         manifest_sha256="a" * 64,
     )
     return staged

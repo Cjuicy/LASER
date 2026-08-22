@@ -160,6 +160,7 @@ def _fixture_staged(
         poses_path=poses_path,
         pointcloud_gt_path=None,
         manifest_path=manifest,
+        identity_manifest_sha256="3" * 64,
         manifest_sha256="3" * 64,
     )
 
@@ -705,6 +706,62 @@ def test_runner_staging_failure_fail_fast_does_not_stage_later_scene(tmp_path):
         / three_scene_plan.runs[2].relative_run_dir
         / "run.json"
     ).exists()
+
+
+@pytest.mark.parametrize(
+    ("resume", "failure_policy"),
+    [
+        (True, FailurePolicy.KEEP_GOING),
+        (False, FailurePolicy.FAIL_FAST),
+    ],
+)
+def test_staging_failure_preserves_parseable_success_run_json(
+    tmp_path, resume, failure_policy
+):
+    loaded, full_plan, scenes, _ = make_runner_fixture(tmp_path)
+    plan = CampaignPlan(full_plan.campaign_id, full_plan.preset, (full_plan.runs[0],))
+    planned = plan.runs[0]
+    executed = []
+
+    def execute(request, loaded_config):
+        executed.append(request.planned.run_id)
+        return _execution(request)
+
+    successful = run_campaign(
+        loaded,
+        plan,
+        scenes,
+        resume=True,
+        failure_policy=FailurePolicy.FAIL_FAST,
+        keep_artifacts=True,
+        dependencies=_test_dependencies(execute, _no_evaluation),
+    )
+    assert successful.exit_code == 0
+    run_dir = loaded.config.campaign_root / planned.relative_run_dir
+    original = (run_dir / "run.json").read_bytes()
+
+    def fail_stage(scene, root):
+        raise RuntimeError("restage failed after success")
+
+    failed = run_campaign(
+        loaded,
+        plan,
+        scenes,
+        resume=resume,
+        failure_policy=failure_policy,
+        keep_artifacts=True,
+        dependencies=_test_dependencies(
+            execute,
+            _no_evaluation,
+            stage_scene=fail_stage,
+        ),
+    )
+
+    assert failed.exit_code == 1
+    assert (run_dir / "run.json").read_bytes() == original
+    assert failed.failures[0].failure_stage is FailureStage.STAGING
+    assert (run_dir / "attempts/0002/run.json").is_file()
+    assert executed == [planned.run_id]
 
 
 def test_fresh_execution_validates_artifact_before_success_or_cleanup(tmp_path):

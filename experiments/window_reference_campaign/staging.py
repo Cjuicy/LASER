@@ -40,6 +40,7 @@ class StagedScene:
     poses_path: Path | None
     pointcloud_gt_path: Path | None
     manifest_path: Path
+    identity_manifest_sha256: str
     manifest_sha256: str
 
     def __post_init__(self) -> None:
@@ -87,12 +88,14 @@ class StagedScene:
                 raise ValueError("staged internal trajectory evaluation must not contain GT")
         else:  # pragma: no cover - guarded by enum validation above
             raise ValueError("staged evaluation_kind is invalid")
-        if (
-            not isinstance(self.manifest_sha256, str)
-            or len(self.manifest_sha256) != 64
-            or any(char not in "0123456789abcdef" for char in self.manifest_sha256)
-        ):
-            raise ValueError("staged manifest SHA256 is invalid")
+        for name in ("identity_manifest_sha256", "manifest_sha256"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError(f"staged {name} SHA256 is invalid")
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -348,6 +351,12 @@ def preview_staging_manifest(scene: ResolvedScene) -> tuple[dict[str, object], s
     if scene.evaluation_kind is EvaluationKind.POINTCLOUD:
         payload["pointcloud_dependencies"] = _pointcloud_dependency_records(scene)
     return payload, _canonical_sha256(payload)
+
+
+def identity_manifest_sha256(scene: ResolvedScene) -> str:
+    """Return the source-only digest used by run identity seeds."""
+
+    return preview_staging_manifest(scene)[1]
 
 
 def _validate_external_gt(
@@ -773,6 +782,7 @@ def load_valid_staging(
     pointcloud_path = directory / "ground_truth.npz"
     poses = pose_path if pose_path.is_file() else None
     gt = pointcloud_path if pointcloud_path.is_file() else None
+    identity_digest = _canonical_sha256(actual_base)
     digest = _canonical_sha256(manifest)
     return StagedScene(
         scene_id=scene_id,
@@ -786,6 +796,7 @@ def load_valid_staging(
         poses_path=poses,
         pointcloud_gt_path=gt,
         manifest_path=manifest_path,
+        identity_manifest_sha256=identity_digest,
         manifest_sha256=digest,
     )
 
@@ -959,6 +970,7 @@ __all__ = [
     "STAGING_SCHEMA_VERSION",
     "StagedScene",
     "guarded_remove",
+    "identity_manifest_sha256",
     "load_valid_staging",
     "prepare_pointcloud_gt",
     "preview_staging_manifest",

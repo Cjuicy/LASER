@@ -27,6 +27,7 @@
 - One scene and one run execute at a time on one GPU. `runtime.jobs` is reserved but must equal `1` in version 1.
 - The default cache policy is `auto`: the first pending run uses `auto`, a deliberately requested refresh uses `refresh` for that first pending run only, and a complete shared cache forces `readonly` for the remaining runs. Explicit `readonly` and `off` retain their literal meanings.
 - Resume skips only a schema-valid successful compact record whose complete identity equals the expected identity seed completed with that record's SHA-256 prediction key and whose required metrics are finite.
+- The staged identity digest is the canonical source-only `identity_manifest_sha256` preview (the `staged_manifest_sha256` identity field); the full published staging manifest digest remains a validation/integrity value and is never used to derive run seeds, preflight identities, or summaries.
 - A failed run preserves its numbered attempt directory and log. Evaluation may resume from a validated artifact without repeating reconstruction.
 - `--fail-fast` stops after the first failure; `--keep-going` continues independent runs/scenes. Either mode returns non-zero while any requested run is invalid.
 - Disabled refinement aggregates use JSON `null` plus `refinement_state="not_applicable"`; they never masquerade as fallback, zero-keyframe performance, or successful refinement.
@@ -1546,6 +1547,7 @@ def run_directory(campaign_root: Path, planned: PlannedRun) -> Path:
         campaign_root
         / "runs"
         / planned.dataset.value
+        / planned.scene_id
         / planned.slice_id
         / planned.variant.run_id
     )
@@ -1564,6 +1566,14 @@ def next_attempt(run_dir: Path) -> tuple[int, Path]:
     target.mkdir(exist_ok=False)
     return number, target
 ```
+
+The scene-id namespace change is not a migration. Legacy prepared or cache
+directories under `<dataset>/<slice_id>` are not reused, migrated, or deleted
+by this campaign; they may remain orphaned and require deliberate manual
+cleanup of the exact old path. A new namespace starts at the first pending run
+and follows the normal `auto` then `readonly` cache transition. No real cloud
+campaign relied on the legacy layout, so no historical run is implicitly
+resumed from it.
 
 `cache_entry_complete()` reads only `{cache_root}/v2/{prediction_key}/complete.json`, requires `{schema_version: 2, key: prediction_key, window_count: expected_window_count}`, and requires `manifest.json`, `sequence.json`, and `windows/%06d.pt` for every integer in `range(expected_window_count)`. Malformed JSON returns `False`, not a hit. The existing store remains authoritative during execution and records corruptions; the campaign probe never repairs or deletes it.
 

@@ -181,6 +181,17 @@ def test_staging_uses_one_vector_for_images_pose_rows_and_manifest(tmp_path):
     assert manifest["pipeline_sample_stride"] == 1
 
 
+def test_staging_separates_identity_manifest_from_full_integrity_digest(tmp_path):
+    scene = _kitti_scene(tmp_path)
+    _, identity_digest = staging_module.preview_staging_manifest(scene)
+
+    staged = stage_scene(scene, tmp_path / "campaign")
+
+    assert staged.identity_manifest_sha256 == identity_digest
+    assert staged.manifest_sha256 != staged.identity_manifest_sha256
+    assert len(staged.manifest_sha256) == 64
+
+
 def test_staging_reuses_only_matching_hashes(tmp_path):
     scene = _kitti_scene(tmp_path)
     first = stage_scene(scene, tmp_path / "campaign")

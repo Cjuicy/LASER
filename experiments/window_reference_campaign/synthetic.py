@@ -341,7 +341,7 @@ def execute_synthetic(
         enabled=request.planned.variant.window_reference_enabled,
     )
     prediction_key = hashlib.sha256(
-        f"synthetic-v1:{request.staged.manifest_sha256}:75:30:pi3:bfloat16".encode()
+        f"synthetic-v1:{request.staged.identity_manifest_sha256}:75:30:pi3:bfloat16".encode()
     ).hexdigest()
     request.artifact_dir.mkdir(parents=True, exist_ok=False)
     manifest = atomic_json(

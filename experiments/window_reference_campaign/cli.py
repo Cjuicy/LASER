@@ -391,7 +391,7 @@ def _expected_summary_seeds(loaded, plan):
     from .matrix import build_identity_seed, identity_slice_id
     from .runner import _source_metadata
     from .scenes import resolve_scene
-    from .staging import preview_staging_manifest
+    from .staging import identity_manifest_sha256
     from .synthetic import synthetic_checkpoint_sha256
 
     commit, dirty = _source_metadata(loaded.config.repository_root)
@@ -412,20 +412,20 @@ def _expected_summary_seeds(loaded, plan):
         if synthetic:
             from .runner import synthetic_staging_manifest_sha256
 
-            manifest_sha = synthetic_staging_manifest_sha256(resolved)
+            identity_digest = synthetic_staging_manifest_sha256(resolved)
         else:
-            _, manifest_sha = preview_staging_manifest(resolved)
-        scene_info[scene_id] = (resolved, manifest_sha)
+            identity_digest = identity_manifest_sha256(resolved)
+        scene_info[scene_id] = (resolved, identity_digest)
     expected: dict[tuple[str, str, str, str], object] = {}
     for planned in plan.runs:
-        resolved, manifest_sha = scene_info[planned.scene_id]
+        resolved, identity_digest = scene_info[planned.scene_id]
         seed = build_identity_seed(
             loaded=loaded,
             planned=planned,
             frame_start=resolved.selection.start,
             frame_stop=resolved.selection.stop,
             frame_stride=resolved.selection.stride,
-            staged_manifest_sha256=manifest_sha,
+            staged_manifest_sha256=identity_digest,
             source_commit=commit,
             source_dirty=dirty,
             checkpoint_sha256=checkpoint,

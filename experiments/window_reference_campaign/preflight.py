@@ -7,6 +7,7 @@ Torch, and staging import is kept inside the check that needs it.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib
 import json
@@ -86,6 +87,196 @@ def _inside(root: Path, candidate: Path) -> bool:
     return True
 
 
+def _absolute_owned_path(root: Path, path: str | Path, label: str) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = Path(os.path.abspath(candidate))
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes repository: {candidate}") from exc
+    return candidate
+
+
+def _reject_symlink_components(root: Path, path: Path, label: str) -> None:
+    current = root
+    for component in path.relative_to(root).parts:
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            if current == path:
+                raise ValueError(f"{label} must not be a symlink: {current}")
+            raise ValueError(f"{label} path component must not be a symlink: {current}")
+
+
+def _same_checkpoint(source: Path, target: Path, source_digest: str) -> bool:
+    try:
+        if os.path.samefile(source, target):
+            return True
+    except OSError:
+        pass
+    try:
+        return _sha256_file(target) == source_digest
+    except OSError:
+        return False
+
+
+def _copy_checkpoint_exdev(source: Path, target: Path) -> None:
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        )
+        temporary = Path(temporary_name)
+        with (
+            os.fdopen(descriptor, "wb") as destination,
+            source.open("rb") as source_stream,
+        ):
+            shutil.copyfileobj(source_stream, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            return
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IMODE(source.stat().st_mode),
+            )
+            try:
+                with (
+                    os.fdopen(descriptor, "wb") as destination,
+                    temporary.open("rb") as source_stream,
+                ):
+                    shutil.copyfileobj(source_stream, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+            except Exception:
+                Path(target).unlink(missing_ok=True)
+                raise
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _replace_checkpoint_copy(source: Path, target: Path) -> None:
+    """Replace one verified target with an independent atomic copy."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with (
+            os.fdopen(descriptor, "wb") as destination,
+            source.open("rb") as source_stream,
+        ):
+            shutil.copyfileobj(source_stream, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def bridge_checkpoint_path(
+    source: str | Path,
+    target: str | Path,
+    *,
+    repository: str | Path,
+) -> Path:
+    """Safely satisfy the campaign's default PI3 checkpoint path contract."""
+
+    root = Path(repository).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"repository is not a directory: {root}")
+    source_path = _absolute_owned_path(root, source, "source checkpoint")
+    target_path = _absolute_owned_path(root, target, "target checkpoint")
+    _reject_symlink_components(root, source_path, "source checkpoint")
+    _reject_symlink_components(root, target_path, "target checkpoint")
+    try:
+        source_mode = source_path.lstat().st_mode
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"source checkpoint is missing: {source_path}") from exc
+    if stat.S_ISLNK(source_mode) or not stat.S_ISREG(source_mode):
+        raise ValueError("source checkpoint must be a regular non-symlink file")
+    source_digest = _sha256_file(source_path)
+
+    if target_path.exists() or target_path.is_symlink():
+        try:
+            target_mode = target_path.lstat().st_mode
+        except OSError as exc:
+            raise ValueError(f"target checkpoint cannot be inspected: {target_path}") from exc
+        if stat.S_ISLNK(target_mode):
+            raise ValueError("target checkpoint must not be a symlink")
+        if not stat.S_ISREG(target_mode):
+            raise ValueError(f"target checkpoint is not a regular file: {target_path}")
+        if _same_checkpoint(source_path, target_path, source_digest):
+            return target_path
+        raise ValueError(f"target checkpoint differs from source: {target_path}")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(root, target_path, "target checkpoint")
+    try:
+        # Copy into a temporary inode first.  The target must not share the
+        # source inode: the public download script may later truncate source.
+        _copy_checkpoint_exdev(source_path, target_path)
+    except FileExistsError:
+        if not _same_checkpoint(source_path, target_path, source_digest):
+            raise ValueError(f"target checkpoint differs from source: {target_path}")
+    if not _same_checkpoint(source_path, target_path, source_digest):
+        raise ValueError(f"target checkpoint differs from source: {target_path}")
+    return target_path
+
+
+def guard_checkpoint_paths(
+    source: str | Path,
+    target: str | Path,
+    *,
+    repository: str | Path,
+) -> Path:
+    """Validate bootstrap paths before any public weight download runs."""
+
+    root = Path(repository).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"repository is not a directory: {root}")
+    source_path = _absolute_owned_path(root, source, "source checkpoint")
+    target_path = _absolute_owned_path(root, target, "target checkpoint")
+    _reject_symlink_components(root, source_path, "source checkpoint")
+    _reject_symlink_components(root, target_path, "target checkpoint")
+
+    source_exists = source_path.exists() or source_path.is_symlink()
+    source_digest: str | None = None
+    if source_exists:
+        source_mode = source_path.lstat().st_mode
+        if stat.S_ISLNK(source_mode) or not stat.S_ISREG(source_mode):
+            raise ValueError("source checkpoint must be a regular non-symlink file")
+        source_digest = _sha256_file(source_path)
+
+    if target_path.exists() or target_path.is_symlink():
+        target_mode = target_path.lstat().st_mode
+        if stat.S_ISLNK(target_mode):
+            raise ValueError("target checkpoint must not be a symlink")
+        if not stat.S_ISREG(target_mode):
+            raise ValueError(f"target checkpoint is not a regular file: {target_path}")
+        if source_digest is not None:
+            if not _same_checkpoint(source_path, target_path, source_digest):
+                raise ValueError(f"target checkpoint differs from source: {target_path}")
+            if os.path.samefile(source_path, target_path):
+                _replace_checkpoint_copy(source_path, target_path)
+    return target_path
+
+
 def build_bootstrap_actions(
     repository: str | Path,
     *,
@@ -131,6 +322,29 @@ def build_bootstrap_actions(
         ),
     ]
     if external_checkpoint is None:
+        module_root = Path(__file__).resolve().parents[2]
+        actions.append(
+            BootstrapAction(
+                "pi3-default-guard",
+                (
+                    python_executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        f"sys.path.insert(0, {str(module_root)!r}); "
+                        "from pathlib import Path; "
+                        "from experiments.window_reference_campaign.preflight "
+                        "import guard_checkpoint_paths; "
+                        "guard_checkpoint_paths("
+                        "Path('weights/model.safetensors'), "
+                        "Path('weights/PI3/model.safetensors'), "
+                        "repository=Path.cwd())"
+                    ),
+                ),
+                root,
+                True,
+            )
+        )
         actions.append(
             BootstrapAction(
                 "public-pi3-weight",
@@ -143,18 +357,18 @@ def build_bootstrap_actions(
             BootstrapAction(
                 "pi3-default-path",
                 (
-                    "bash",
+                    python_executable,
                     "-c",
                     (
-                        "set -eu; "
-                        "mkdir -p weights/PI3; "
-                        "if test -L weights/PI3/model.safetensors; then "
-                        "echo 'weights/PI3/model.safetensors must not be a symlink' >&2; exit 1; "
-                        "elif test -e weights/PI3/model.safetensors; then "
-                        "test -f weights/PI3/model.safetensors; "
-                        "elif test -f weights/model.safetensors; then "
-                        "ln weights/model.safetensors weights/PI3/model.safetensors; "
-                        "else echo 'weights/model.safetensors is missing' >&2; exit 1; fi"
+                        "import sys; "
+                        f"sys.path.insert(0, {str(module_root)!r}); "
+                        "from pathlib import Path; "
+                        "from experiments.window_reference_campaign.preflight "
+                        "import bridge_checkpoint_path; "
+                        "bridge_checkpoint_path("
+                        "Path('weights/model.safetensors'), "
+                        "Path('weights/PI3/model.safetensors'), "
+                        "repository=Path.cwd())"
                     ),
                 ),
                 root,
@@ -632,7 +846,7 @@ def _check_scenes_and_identities(
     try:
         from .matrix import build_identity_seed
         from .scenes import resolve_scene
-        from .staging import preview_staging_manifest
+        from .staging import identity_manifest_sha256
     except Exception as exc:
         for selected in tuple(loaded.config.selected_scenes):
             scene_name = f"scene:{selected.scene_id}"
@@ -708,7 +922,7 @@ def _check_scenes_and_identities(
                     )
             else:
                 pointmap_detail = None
-            _manifest_payload, manifest_sha = preview_staging_manifest(resolved)
+            manifest_sha = identity_manifest_sha256(resolved)
             detail: dict[str, object] = {
                 "dataset": resolved.dataset.value,
                 "scene": resolved.scene,
@@ -719,7 +933,7 @@ def _check_scenes_and_identities(
                     "stop": resolved.selection.stop,
                     "stride": resolved.selection.stride,
                 },
-                "staging_manifest_sha256": manifest_sha,
+                "identity_manifest_sha256": manifest_sha,
                 "staging_preview_only": True,
             }
             if resolved.dataset.value == "kitti":
@@ -1007,6 +1221,7 @@ def preflight_campaign(
                     "dataset": "synthetic",
                     "scene": resolved.scene,
                     "source_image_count": len(resolved.source_images),
+                    "identity_manifest_sha256": manifest_digest,
                     "staging_preview_only": True,
                     "synthetic": True,
                 },
@@ -1128,6 +1343,7 @@ __all__ = [
     "PreflightReport",
     "build_bootstrap_actions",
     "default_preflight_dependencies",
+    "guard_checkpoint_paths",
     "preflight_campaign",
     "run_bootstrap",
     "write_preflight_report",

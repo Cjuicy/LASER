@@ -27,6 +27,7 @@ from experiments.window_reference_campaign.preflight import (
     PreflightDependencies,
     _default_cuda_state,
     _validate_pointmap,
+    bridge_checkpoint_path,
     build_bootstrap_actions,
     preflight_campaign,
     run_bootstrap,
@@ -148,6 +149,157 @@ def test_bootstrap_default_weight_path_bridges_public_download_to_pi3_contract(t
     assert target.is_file()
     assert not target.is_symlink()
     assert target.read_bytes() == source.read_bytes()
+    assert not os.path.samefile(source, target)
+
+
+@pytest.mark.parametrize("bad_layout", ("source", "pi3-parent"))
+def test_bootstrap_path_guard_rejects_bad_layout_before_download(tmp_path, bad_layout):
+    weights = tmp_path / "weights"
+    source = weights / "model.safetensors"
+    target = weights / "PI3" / "model.safetensors"
+    weights.mkdir()
+    if bad_layout == "source":
+        external = tmp_path / "external-model.safetensors"
+        external.write_bytes(b"outside")
+        source.symlink_to(external)
+    else:
+        source.write_bytes(b"fixture-weight")
+        external_parent = tmp_path / "external-PI3"
+        external_parent.mkdir()
+        (weights / "PI3").symlink_to(external_parent, target_is_directory=True)
+
+    actions = build_bootstrap_actions(
+        tmp_path,
+        python_executable=sys.executable,
+        external_checkpoint=None,
+    )
+    by_argv = {action.argv: action.label for action in actions}
+    labels = []
+
+    def run(argv, *, cwd, check):
+        label = by_argv[tuple(argv)]
+        labels.append(label)
+        if label == "pi3-default-guard":
+            return subprocess.run(argv, cwd=cwd, check=check)
+        return subprocess.CompletedProcess(argv, 0)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        run_bootstrap(actions, execute=True, run=run)
+    assert labels[-1] == "pi3-default-guard"
+    assert "public-pi3-weight" not in labels
+
+
+def test_bootstrap_repeat_guard_detaches_target_before_interrupted_download(tmp_path):
+    source = tmp_path / "weights" / "model.safetensors"
+    target = tmp_path / "weights" / "PI3" / "model.safetensors"
+    target.parent.mkdir(parents=True)
+    source.write_bytes(b"stable-checkpoint")
+    os.link(source, target)
+    actions = build_bootstrap_actions(
+        tmp_path,
+        python_executable=sys.executable,
+        external_checkpoint=None,
+    )
+    by_argv = {action.argv: action.label for action in actions}
+    labels = []
+
+    def run(argv, *, cwd, check):
+        label = by_argv[tuple(argv)]
+        labels.append(label)
+        if label == "pi3-default-guard":
+            return subprocess.run(argv, cwd=cwd, check=check)
+        if label == "public-pi3-weight":
+            source.write_bytes(b"interrupted-download")
+            raise RuntimeError("download interrupted")
+        return subprocess.CompletedProcess(argv, 0)
+
+    with pytest.raises(RuntimeError, match="download interrupted"):
+        run_bootstrap(actions, execute=True, run=run)
+    assert labels.index("pi3-default-guard") < labels.index("public-pi3-weight")
+    assert source.read_bytes() == b"interrupted-download"
+    assert target.read_bytes() == b"stable-checkpoint"
+
+
+def test_checkpoint_bridge_reuses_identical_target_without_clobber(tmp_path):
+    source = tmp_path / "weights" / "model.safetensors"
+    target = tmp_path / "weights" / "PI3" / "model.safetensors"
+    source.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    source.write_bytes(b"fixture-weight")
+    target.write_bytes(source.read_bytes())
+    before = target.stat().st_ino
+
+    result = bridge_checkpoint_path(source, target, repository=tmp_path)
+
+    assert result == target
+    assert target.stat().st_ino == before
+    assert target.read_bytes() == source.read_bytes()
+
+
+def test_checkpoint_bridge_rejects_mismatched_target(tmp_path):
+    source = tmp_path / "weights" / "model.safetensors"
+    target = tmp_path / "weights" / "PI3" / "model.safetensors"
+    source.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    target.write_bytes(b"different")
+
+    with pytest.raises(ValueError, match="target checkpoint differs"):
+        bridge_checkpoint_path(source, target, repository=tmp_path)
+
+
+def test_checkpoint_bridge_rejects_source_and_parent_symlinks(tmp_path):
+    source = tmp_path / "weights" / "model.safetensors"
+    source.parent.mkdir(parents=True)
+    real_source = tmp_path / "real-model.safetensors"
+    real_source.write_bytes(b"source")
+    source.symlink_to(real_source)
+    target = tmp_path / "weights" / "PI3" / "model.safetensors"
+
+    with pytest.raises(ValueError, match="source checkpoint must not be a symlink"):
+        bridge_checkpoint_path(source, target, repository=tmp_path)
+
+    source.unlink()
+    source.write_bytes(b"source")
+    real_parent = tmp_path / "real-PI3"
+    real_parent.mkdir()
+    (tmp_path / "weights" / "PI3").symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        bridge_checkpoint_path(source, target, repository=tmp_path)
+
+
+def test_checkpoint_bridge_rejects_target_symlink(tmp_path):
+    source = tmp_path / "weights" / "model.safetensors"
+    target = tmp_path / "weights" / "PI3" / "model.safetensors"
+    source.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    target_link = tmp_path / "target.safetensors"
+    target_link.write_bytes(b"source")
+    target.symlink_to(target_link)
+
+    with pytest.raises(ValueError, match="target checkpoint must not be a symlink"):
+        bridge_checkpoint_path(source, target, repository=tmp_path)
+
+
+def test_checkpoint_bridge_rechecks_racing_exdev_target(monkeypatch, tmp_path):
+    source = tmp_path / "weights" / "model.safetensors"
+    target = tmp_path / "weights" / "PI3" / "model.safetensors"
+    source.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    calls = 0
+
+    def race_link(source_path, target_path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            target.write_bytes(b"raced-different")
+            raise FileExistsError(target_path)
+
+    monkeypatch.setattr(preflight.os, "link", race_link)
+    with pytest.raises(ValueError, match="target checkpoint differs"):
+        bridge_checkpoint_path(source, target, repository=tmp_path)
 
 
 def test_run_bootstrap_prints_shell_quoted_commands_and_executes_in_order(tmp_path, capsys):

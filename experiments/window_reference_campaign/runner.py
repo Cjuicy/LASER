@@ -64,8 +64,8 @@ from .scenes import ResolvedScene
 from .staging import (
     StagedScene,
     guarded_remove,
+    identity_manifest_sha256,
     require_descendant,
-    preview_staging_manifest,
     stage_scene as default_stage_scene,
 )
 
@@ -191,9 +191,10 @@ def _stage_synthetic_scene(scene: ResolvedScene, campaign_root: Path) -> StagedS
         poses_path=None,
         pointcloud_gt_path=None,
         manifest_path=manifest_path,
+        identity_manifest_sha256=synthetic_staging_manifest_sha256(scene),
         manifest_sha256=sha256_file(manifest_path),
     )
-    if staged.manifest_sha256 != synthetic_staging_manifest_sha256(scene):
+    if staged.identity_manifest_sha256 != synthetic_staging_manifest_sha256(scene):
         raise ValueError("synthetic staging manifest digest is unstable")
     return staged
 
@@ -712,10 +713,9 @@ def _staging_failure_manifest_sha256(scene: ResolvedScene) -> str:
     try:
         if scene.dataset is DatasetKind.SYNTHETIC:
             return synthetic_staging_manifest_sha256(scene)
-        _, digest = preview_staging_manifest(scene)
-        return digest
+        return identity_manifest_sha256(scene)
     except Exception:
-        # A malformed source can fail before ``preview_staging_manifest`` can
+        # A malformed source can fail before the staging preview can
         # canonicalize it.  Failed records still need a typed, deterministic
         # identity so the staging error is publishable and auditable.
         payload = {
@@ -1104,25 +1104,15 @@ def run_campaign(
                 run_dir = _run_directory(root, planned)
                 require_descendant(run_dir, root)
                 prior_path = run_dir / "run.json"
+                preserve_success = False
                 if prior_path.is_file():
                     try:
                         prior = read_run_record(prior_path)
                     except ValueError:
                         prior = None
-                    if (
-                        prior is not None
-                        and prior.status is RunStatus.SUCCEEDED
-                        and prior.identity_seed == seed
-                    ):
-                        if not resume:
-                            raise ValueError(
-                                f"completed run already exists at {prior_path}; "
-                                "use a new output root or campaign ID"
-                            )
-                        existing[seed_key] = prior
-                        records.append(prior)
-                        skipped_ids.append(planned.variant.run_id)
-                        continue
+                    preserve_success = (
+                        prior is not None and prior.status is RunStatus.SUCCEEDED
+                    )
 
                 attempt, attempt_dir = next_attempt(run_dir)
                 failed = _failed_staging_record(
@@ -1135,7 +1125,8 @@ def run_campaign(
                     _format_timestamp(deps.utc_now()),
                     exc,
                 )
-                write_run_record(run_dir / "run.json", failed)
+                failure_path = attempt_dir / "run.json" if preserve_success else prior_path
+                write_run_record(failure_path, failed)
                 records = [
                     item
                     for item in records
@@ -1163,7 +1154,7 @@ def run_campaign(
                 frame_start=staged.selection.start,
                 frame_stop=staged.selection.stop,
                 frame_stride=staged.selection.stride,
-                staged_manifest_sha256=staged.manifest_sha256,
+                staged_manifest_sha256=staged.identity_manifest_sha256,
                 source_commit=source_commit,
                 source_dirty=source_dirty,
                 checkpoint_sha256=checkpoint_sha256,
