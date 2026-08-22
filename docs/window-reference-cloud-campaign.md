@@ -14,12 +14,13 @@ git clone --recursive --branch codex/laser-paper-pointmap-eval \
 cd /root/autodl-tmp/LASER-Window-Reference
 ```
 
-Create or activate the supported Python 3.11 environment and run the checked-in
-bootstrap command list. Supply the PI3 checkpoint from its separately managed
-location; bootstrap does not download KITTI, 7-Scenes, or NeuralRGBD.
+Create or activate the supported Python 3.11 environment and execute the
+checked-in bootstrap actions. Supply the PI3 checkpoint from its separately
+managed location; bootstrap does not download KITTI, 7-Scenes, or NeuralRGBD.
 
 ```bash
 conda run -n vggt python run_window_reference_campaign.py bootstrap \
+  --execute \
   --repository /root/autodl-tmp/LASER-Window-Reference \
   --checkpoint /root/autodl-tmp/LASER-Paper-Pointmap-Eval/weights/PI3/model.safetensors
 ```
