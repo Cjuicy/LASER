@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
+import pytest
 import torch
+from omegaconf import OmegaConf
 
 from experiments.window_reference_campaign.config import (
     CampaignOverrides,
@@ -11,7 +15,11 @@ from experiments.window_reference_campaign.config import (
 from experiments.window_reference_campaign.matrix import build_identity_seed, build_plan
 from experiments.window_reference_campaign.runner import validate_artifact_for_seed
 from inference_engine.prediction_cache.fingerprint import sha256_file
-from pipeline.artifacts import ReconstructionArtifact, ReconstructionDiagnostics, write_reconstruction_artifact
+from pipeline.artifacts import (
+    ReconstructionArtifact,
+    ReconstructionDiagnostics,
+    write_reconstruction_artifact,
+)
 from pipeline.config import ReconstructionMode, SegmentationMethod, load_pipeline_config
 
 
@@ -19,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CAMPAIGN_CONFIG = ROOT / "configs/experiments/window_reference_campaign.yaml"
 
 
-def test_real_artifact_validator_accepts_canonical_pipeline_enum_names(tmp_path):
+def _build_real_artifact(tmp_path):
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"real-artifact-validator-checkpoint")
     loaded_campaign = load_campaign_config(
@@ -57,10 +65,6 @@ def test_real_artifact_validator_accepts_canonical_pipeline_enum_names(tmp_path)
             "reconstruction.mode=no_loop",
         ),
     )
-    assert "\n  name: PI3\n" in loaded_pipeline.resolved_yaml
-    assert "\n  method: DEPTH\n" in loaded_pipeline.resolved_yaml
-    assert "\n    split_mode: CONSERVATIVE\n" in loaded_pipeline.resolved_yaml
-    assert "\n  mode: NO_LOOP\n" in loaded_pipeline.resolved_yaml
 
     frame_ids = (0, 1)
     points = torch.zeros((2, 1, 1, 3), dtype=torch.float32)
@@ -90,8 +94,78 @@ def test_real_artifact_validator_accepts_canonical_pipeline_enum_names(tmp_path)
         checkpoint_sha256=seed.checkpoint_sha256,
         git_commit=seed.source_commit,
     )
+    return artifact_dir, seed, artifact, loaded_pipeline.resolved_yaml
+
+
+def _rewrite_resolved_config(artifact_dir, updates):
+    resolved_path = artifact_dir / "resolved_reconstruction.yaml"
+    config = OmegaConf.load(resolved_path)
+    for path, value in updates.items():
+        OmegaConf.update(config, path, value, merge=False)
+    resolved_yaml = OmegaConf.to_yaml(config, resolve=True, sort_keys=True)
+    resolved_path.write_text(resolved_yaml, encoding="utf-8")
+    resolved_digest = hashlib.sha256(resolved_yaml.encode("utf-8")).hexdigest()
+
+    manifest_path = artifact_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["config_sha256"] = resolved_digest
+    manifest["resolved_yaml_sha256"] = resolved_digest
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_real_artifact_validator_accepts_canonical_pipeline_enum_names(tmp_path):
+    artifact_dir, seed, artifact, resolved_yaml = _build_real_artifact(tmp_path)
+    assert "\n  name: PI3\n" in resolved_yaml
+    assert "\n  method: DEPTH\n" in resolved_yaml
+    assert "\n    split_mode: CONSERVATIVE\n" in resolved_yaml
+    assert "\n  mode: NO_LOOP\n" in resolved_yaml
 
     assert validate_artifact_for_seed(artifact_dir, seed) == (
         artifact.prediction_key,
         sha256_file(artifact_dir / "manifest.json"),
     )
+
+
+def test_real_artifact_validator_accepts_lowercase_pipeline_enum_values(tmp_path):
+    artifact_dir, seed, artifact, _ = _build_real_artifact(tmp_path)
+    _rewrite_resolved_config(
+        artifact_dir,
+        {
+            "model.name": "pi3",
+            "segmentation.method": "depth",
+            "segmentation.atomic.split_mode": "conservative",
+            "reconstruction.mode": "no_loop",
+        },
+    )
+
+    assert validate_artifact_for_seed(artifact_dir, seed) == (
+        artifact.prediction_key,
+        sha256_file(artifact_dir / "manifest.json"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        ("model.name", "not-a-model"),
+        ("model.name", "DEPTH"),
+        ("segmentation.method", "not-a-method"),
+        ("segmentation.method", "GEOMETRY"),
+        ("segmentation.atomic.split_mode", "not-a-split-mode"),
+        ("segmentation.atomic.split_mode", "NONE"),
+        ("reconstruction.mode", "not-a-mode"),
+        ("reconstruction.mode", "TRADITIONAL"),
+    ),
+)
+def test_real_artifact_validator_rejects_malformed_or_wrong_enum_values(
+    tmp_path, path, value
+):
+    artifact_dir, seed, _, _ = _build_real_artifact(tmp_path)
+    _rewrite_resolved_config(artifact_dir, {path: value})
+
+    with pytest.raises(ValueError) as error:
+        validate_artifact_for_seed(artifact_dir, seed)
+    assert str(error.value) == f"resolved config {path} does not match identity"
