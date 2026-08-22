@@ -15,6 +15,7 @@ import subprocess
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -25,7 +26,11 @@ from inference_engine.prediction_cache.store import OrdinaryPredictionStore
 from inference_engine.prediction_cache.types import build_window_specs
 from pipeline.artifacts import load_reconstruction_artifact
 from pipeline.config import (
+    AtomicSplitMode,
+    ModelName,
     PredictionCacheMode,
+    ReconstructionMode,
+    SegmentationMethod,
     load_pipeline_config,
 )
 from pipeline.runner import PipelineDependencies, PipelineRunner
@@ -500,6 +505,24 @@ def _mapping_value(mapping: Mapping[str, object], path: str) -> object:
     return current
 
 
+def _matches_pipeline_enum(
+    actual: object,
+    expected: str,
+    enum_type: type[Enum],
+) -> bool:
+    """Accept enum values and OmegaConf's canonical member-name strings."""
+
+    if not isinstance(actual, str):
+        return False
+    try:
+        return enum_type(actual).value == expected
+    except ValueError:
+        try:
+            return enum_type[actual].value == expected
+        except KeyError:
+            return False
+
+
 def _resolved_config_payload(path: Path) -> Mapping[str, object]:
     try:
         loaded = OmegaConf.load(path)
@@ -572,8 +595,21 @@ def _validate_real_artifact_for_seed(
         "segmentation.window_reference.enabled": seed.window_reference_enabled,
         "reconstruction.mode": "no_loop",
     }
+    enum_types = {
+        "model.name": ModelName,
+        "segmentation.method": SegmentationMethod,
+        "segmentation.atomic.split_mode": AtomicSplitMode,
+        "reconstruction.mode": ReconstructionMode,
+    }
     for path, expected in expected_values.items():
-        if _mapping_value(resolved, path) != expected:
+        actual = _mapping_value(resolved, path)
+        enum_type = enum_types.get(path)
+        matches = (
+            _matches_pipeline_enum(actual, expected, enum_type)
+            if enum_type is not None
+            else actual == expected
+        )
+        if not matches:
             raise ValueError(f"resolved config {path} does not match identity")
     for name, expected in seed.window_reference_config.items():
         actual = _mapping_value(resolved, f"segmentation.window_reference.{name}")
