@@ -1,0 +1,17 @@
+version: 2
+reconstruction_config: configs/reconstruction/pi3_laser.yaml
+output_root: outputs/experiments/keyframe-metrics
+dataset:
+  name: fixture
+  sequence: sequence-0
+  trajectory_ground_truth:
+    path: data/groundtruth.txt
+    format: tum
+  pointcloud_ground_truth:
+    path: data/groundtruth_pointmaps.npz
+evaluation:
+  trajectory_config: configs/evaluation/ate.yaml
+  pointcloud_config: configs/evaluation/pointcloud.yaml
+matrix:
+  segmentation: [depth, geometry, atomic]
+  refinement: [false, true]

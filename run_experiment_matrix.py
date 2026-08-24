@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
-from experiments.config import load_experiment_config
+from experiments.config import CapabilityExperimentConfig, load_experiment_config
+from experiments.evaluation_bundle import EvaluatorStatus
 from experiments.runner import run_matrix
 
 
@@ -29,6 +30,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         overrides=tuple(arguments.overrides),
         dry_run=arguments.dry_run,
     )
+    if isinstance(experiment, CapabilityExperimentConfig):
+        evaluations = tuple(
+            evaluation
+            for record in records
+            for evaluation in record.evaluations
+        )
+        counts = {
+            status: sum(
+                evaluation.status is status for evaluation in evaluations
+            )
+            for status in EvaluatorStatus
+        }
+        print(
+            f"entries={len(records)} evaluators={len(evaluations)} "
+            f"passed={counts[EvaluatorStatus.PASSED]} "
+            f"skipped={counts[EvaluatorStatus.SKIPPED]} "
+            f"failed={counts[EvaluatorStatus.FAILED]} "
+            f"blocked={counts[EvaluatorStatus.BLOCKED]}"
+        )
+        return int(
+            counts[EvaluatorStatus.FAILED] > 0
+            or counts[EvaluatorStatus.BLOCKED] > 0
+        )
     print(f"entries={len(records)} evaluation={experiment.evaluation.value}")
     return 0
 
