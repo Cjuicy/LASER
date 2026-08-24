@@ -144,6 +144,20 @@ def _capability_runner_setup(tmp_path):
     return experiment, overrides
 
 
+def test_evaluator_source_revision_hashes_source_contents(tmp_path):
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("FIRST = 1\n", encoding="utf-8")
+    second.write_text("SECOND = 1\n", encoding="utf-8")
+
+    initial = experiment_runner._source_revision((first, second))
+    second.write_text("SECOND = 2\n", encoding="utf-8")
+    changed = experiment_runner._source_revision((first, second))
+
+    assert len(initial) == 64
+    assert initial != changed
+
+
 def test_version_two_dual_capability_config_normalizes_inputs(tmp_path):
     config = _load_yaml(tmp_path, DUAL_CAPABILITY_YAML)
 
@@ -455,6 +469,42 @@ def test_capability_runner_blocks_failed_reconstruction_and_keeps_going(
         evaluation["status"]
         for evaluation in summary["entries"][0]["evaluations"]
     ] == ["blocked", "blocked"]
+
+
+def test_capability_dry_run_preserves_execution_summary_and_reports_schedule(
+    tmp_path,
+    monkeypatch,
+):
+    experiment, overrides = _capability_runner_setup(tmp_path)
+    entry = experiment_matrix.CapabilityMatrixEntry(
+        SegmentationMethod.DEPTH,
+        ReconstructionMode.NO_LOOP,
+        False,
+        (EvaluationKind.ATE, EvaluationKind.POINTCLOUD),
+    )
+    monkeypatch.setattr(
+        experiment_matrix,
+        "build_capability_matrix",
+        lambda config: (entry,),
+    )
+    summary_path = Path(experiment.output_root) / "evaluation_summary.json"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text("previous execution\n", encoding="utf-8")
+
+    def unexpected_source_revision():
+        raise AssertionError("dry-run must not fingerprint evaluator sources")
+
+    records = experiment_runner.run_capability_matrix(
+        experiment,
+        overrides=overrides,
+        dry_run=True,
+        source_revision_provider=unexpected_source_revision,
+    )
+
+    assert len(records) == 1
+    assert records[0].evaluations == ()
+    assert records[0].scheduled_evaluator_count == 2
+    assert summary_path.read_text(encoding="utf-8") == "previous execution\n"
 
 
 def test_run_matrix_dispatches_version_two_to_capability_runner(

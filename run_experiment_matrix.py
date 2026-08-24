@@ -42,8 +42,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             for status in EvaluatorStatus
         }
+        evaluator_count = (
+            sum(record.scheduled_evaluator_count for record in records)
+            if arguments.dry_run
+            else len(evaluations)
+        )
         print(
-            f"entries={len(records)} evaluators={len(evaluations)} "
+            f"entries={len(records)} evaluators={evaluator_count} "
             f"passed={counts[EvaluatorStatus.PASSED]} "
             f"skipped={counts[EvaluatorStatus.SKIPPED]} "
             f"failed={counts[EvaluatorStatus.FAILED]} "

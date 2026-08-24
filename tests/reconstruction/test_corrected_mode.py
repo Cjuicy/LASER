@@ -183,6 +183,20 @@ def test_corrected_uses_corrected_window_as_next_registration_source():
 
 
 def test_corrected_composes_residual_after_coarse_and_rebuilds_edge():
+    coarse_rotation = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    coarse_translation = torch.tensor([1.0, 0.0, 0.0])
+    coarse_sim3 = (2.0, coarse_rotation, coarse_translation)
+    residual_rotation = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
+    )
+    residual_translation = torch.tensor([0.0, 2.0, 0.0])
+    residual_sim3 = (4.0, residual_rotation, residual_translation)
+    expected_rotation = torch.tensor(
+        [[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]]
+    )
+    expected_translation = torch.tensor([4.0, 2.0, 0.0])
     context, optimizer_config = _context(
         SequencedAnchor(scales=(3.0,)),
         iter_window_predictions(
@@ -210,7 +224,7 @@ def test_corrected_composes_residual_after_coarse_and_rebuilds_edge():
         return ResidualAlignmentResult(
             local_points=4.0 * values["current_points"],
             camera_poses=poses,
-            sim3=identity_sim3(4.0),
+            sim3=residual_sim3,
             correspondence_count=1,
             abs_log_scale=math.log(4.0),
             rotation_rad=0.0,
@@ -220,8 +234,10 @@ def test_corrected_composes_residual_after_coarse_and_rebuilds_edge():
     class InspectingProcessor(CorrectedLoopProcessor):
         def optimize(self, states, constraints):
             del constraints
-            assert torch.as_tensor(states[1].sim3_abs[0]).item() == 8.0
-            assert torch.as_tensor(states[1].sim3_edge[0]).item() == 8.0
+            for transform in (states[1].sim3_abs, states[1].sim3_edge):
+                assert torch.as_tensor(transform[0]).item() == 8.0
+                torch.testing.assert_close(transform[1], expected_rotation)
+                torch.testing.assert_close(transform[2], expected_translation)
             return LoopSolution(
                 optimized_transforms=tuple(state.sim3_abs for state in states),
                 constraints=(),
@@ -237,7 +253,7 @@ def test_corrected_composes_residual_after_coarse_and_rebuilds_edge():
             optimizer=FailingOptimizer(),
             apply_pose_sim3=lambda poses, *arguments: poses,
         ),
-        register_adjacent=lambda *arguments: identity_sim3(2.0),
+        register_adjacent=lambda *arguments: coarse_sim3,
         apply_pose_sim3=lambda poses, *arguments: poses,
         build_graphs=lambda results, threshold: (tuple(results), threshold),
         residual_align=residual_align,

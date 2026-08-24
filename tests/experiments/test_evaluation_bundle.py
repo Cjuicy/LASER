@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -185,6 +186,7 @@ def test_dual_evaluators_isolate_failure_and_resume_passed_sibling(tmp_path):
     output_root = tmp_path / "evaluation"
     first = runner.run(
         artifact_dir=artifact_dir,
+        reconstruction_identity="a" * 64,
         entry=_entry(EvaluationKind.ATE, EvaluationKind.POINTCLOUD),
         experiment=experiment,
         output_root=output_root,
@@ -202,6 +204,7 @@ def test_dual_evaluators_isolate_failure_and_resume_passed_sibling(tmp_path):
     pointcloud_fails[0] = False
     second = runner.run(
         artifact_dir=artifact_dir,
+        reconstruction_identity="a" * 64,
         entry=_entry(EvaluationKind.ATE, EvaluationKind.POINTCLOUD),
         experiment=experiment,
         output_root=output_root,
@@ -233,6 +236,7 @@ def test_declared_missing_input_fails_while_omitted_capability_skips(tmp_path):
 
     records = runner.run(
         artifact_dir=artifact_dir,
+        reconstruction_identity="a" * 64,
         entry=_entry(EvaluationKind.ATE),
         experiment=experiment,
         output_root=tmp_path / "evaluation",
@@ -305,11 +309,15 @@ def test_evaluator_identity_changes_invalidate_only_affected_passes(tmp_path):
         pointcloud_evaluator=evaluator(EvaluationKind.POINTCLOUD),
     )
 
+    current_experiment = [experiment]
+    current_reconstruction_identity = ["a" * 64]
+
     def run(source_revision="revision-1"):
         return runner.run(
             artifact_dir=artifact_dir,
+            reconstruction_identity=current_reconstruction_identity[0],
             entry=_entry(EvaluationKind.ATE, EvaluationKind.POINTCLOUD),
-            experiment=experiment,
+            experiment=current_experiment[0],
             output_root=tmp_path / "evaluation",
             source_revision=source_revision,
         )
@@ -325,8 +333,35 @@ def test_evaluator_identity_changes_invalidate_only_affected_passes(tmp_path):
     run()
     assert calls == {EvaluationKind.ATE: 2, EvaluationKind.POINTCLOUD: 2}
 
-    run(source_revision="revision-2")
+    current_experiment[0] = replace(
+        current_experiment[0],
+        evaluator_inputs={
+            **current_experiment[0].evaluator_inputs,
+            EvaluationKind.ATE: EvaluationInputConfig(
+                EvaluationKind.ATE,
+                str(files["ate_config"]),
+                str(files["ate_gt"]),
+                "replica",
+            ),
+        },
+    )
+    run()
+    assert calls == {EvaluationKind.ATE: 3, EvaluationKind.POINTCLOUD: 2}
+
+    current_experiment[0] = replace(
+        current_experiment[0],
+        dataset_name="changed-fixture",
+        sequence="changed-sequence",
+    )
+    run()
     assert calls == {EvaluationKind.ATE: 3, EvaluationKind.POINTCLOUD: 3}
+
+    current_reconstruction_identity[0] = "b" * 64
+    run()
+    assert calls == {EvaluationKind.ATE: 4, EvaluationKind.POINTCLOUD: 4}
+
+    run(source_revision="revision-2")
+    assert calls == {EvaluationKind.ATE: 5, EvaluationKind.POINTCLOUD: 5}
 
 
 def test_evaluator_errors_redact_url_credentials_and_control_characters(tmp_path):
@@ -343,6 +378,7 @@ def test_evaluator_errors_redact_url_credentials_and_control_characters(tmp_path
 
     records = bundle_module.EvaluationBundleRunner(ate_evaluator=fail).run(
         artifact_dir=artifact_dir,
+        reconstruction_identity="a" * 64,
         entry=_entry(EvaluationKind.ATE),
         experiment=experiment,
         output_root=tmp_path / "evaluation",

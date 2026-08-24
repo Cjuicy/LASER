@@ -147,6 +147,29 @@ def test_version_two_cli_reports_evaluator_status_counts(
     assert status == expected_status
 
 
+def test_version_two_dry_run_reports_scheduled_evaluators(monkeypatch, capsys):
+    record = _capability_record(
+        0,
+        (EvaluatorStatus.PASSED, EvaluatorStatus.PASSED),
+    )
+    planned = CapabilityExperimentRunRecord(
+        entry=record.entry,
+        reconstruction_identity=record.reconstruction_identity,
+        artifact_dir=record.artifact_dir,
+        evaluations=(),
+        prediction_cache_mode=record.prediction_cache_mode,
+    )
+    monkeypatch.setattr(cli, "load_experiment_config", lambda path: _capability_config())
+    monkeypatch.setattr(cli, "run_matrix", lambda *args, **values: (planned,))
+
+    status = cli.main(["--config", "experiment.yaml", "--dry-run"])
+
+    assert capsys.readouterr().out.strip() == (
+        "entries=1 evaluators=2 passed=0 skipped=0 failed=0 blocked=0"
+    )
+    assert status == 0
+
+
 def test_version_one_cli_output_is_unchanged(monkeypatch, capsys):
     experiment = ExperimentConfig(
         version=1,

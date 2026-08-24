@@ -34,14 +34,18 @@ class EvaluatorStatus(str, Enum):
 
 @dataclass(frozen=True)
 class EvaluatorIdentity:
+    reconstruction_identity: str
     artifact_manifest_sha256: str
+    capability_declaration_sha256: str
     evaluator_config_sha256: str
     ground_truth_sha256: str
     source_revision: str
 
     def __post_init__(self) -> None:
         for name in (
+            "reconstruction_identity",
             "artifact_manifest_sha256",
+            "capability_declaration_sha256",
             "evaluator_config_sha256",
             "ground_truth_sha256",
         ):
@@ -253,6 +257,32 @@ def _sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _capability_declaration_sha256(
+    kind: EvaluationKind,
+    experiment: CapabilityExperimentConfig,
+    evaluator_input: EvaluationInputConfig,
+) -> str:
+    declaration = {
+        "kind": kind.value,
+        "config_path": evaluator_input.config_path,
+        "ground_truth_path": evaluator_input.ground_truth_path,
+    }
+    if kind is EvaluationKind.ATE:
+        declaration["ground_truth_format"] = (
+            evaluator_input.ground_truth_format
+        )
+    else:
+        declaration["dataset_name"] = experiment.dataset_name
+        declaration["sequence"] = experiment.sequence
+    payload = json.dumps(
+        declaration,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _output_exists(path: str | Path) -> bool:
     output = Path(path)
     if output.is_file():
@@ -295,12 +325,23 @@ class EvaluationBundleRunner:
     @staticmethod
     def _identity(
         artifact_dir: str | Path,
+        reconstruction_identity: str,
+        kind: EvaluationKind,
+        experiment: CapabilityExperimentConfig,
         evaluator_input: EvaluationInputConfig,
         source_revision: str,
     ) -> EvaluatorIdentity:
         return EvaluatorIdentity(
+            reconstruction_identity=reconstruction_identity,
             artifact_manifest_sha256=_sha256_file(
                 Path(artifact_dir) / "manifest.json"
+            ),
+            capability_declaration_sha256=(
+                _capability_declaration_sha256(
+                    kind,
+                    experiment,
+                    evaluator_input,
+                )
             ),
             evaluator_config_sha256=_sha256_file(
                 evaluator_input.config_path
@@ -365,6 +406,7 @@ class EvaluationBundleRunner:
         self,
         *,
         artifact_dir: str | Path,
+        reconstruction_identity: str,
         entry: CapabilityMatrixEntry,
         experiment: CapabilityExperimentConfig,
         output_root: str | Path,
@@ -394,6 +436,9 @@ class EvaluationBundleRunner:
                 evaluator_input = experiment.evaluator_inputs[kind]
                 identity = self._identity(
                     artifact_dir,
+                    reconstruction_identity,
+                    kind,
+                    experiment,
                     evaluator_input,
                     source_revision,
                 )

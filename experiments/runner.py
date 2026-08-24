@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +50,10 @@ class CapabilityExperimentRunRecord:
     artifact_dir: Path | None
     evaluations: tuple[EvaluatorRecord, ...]
     prediction_cache_mode: PredictionCacheMode
+
+    @property
+    def scheduled_evaluator_count(self) -> int:
+        return len(self.entry.evaluator_kinds)
 
     @property
     def succeeded(self) -> bool:
@@ -125,17 +128,57 @@ def _capability_entry_overrides(
     return tuple(values), cache_mode
 
 
-def _source_revision() -> str:
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
+def _evaluator_source_paths() -> tuple[Path, ...]:
+    root = Path(__file__).resolve().parents[1]
+    return tuple(
+        sorted(
+            {
+                Path(__file__).resolve(),
+                (root / "experiments" / "evaluation_bundle.py").resolve(),
+                (root / "experiments" / "ate.py").resolve(),
+                (root / "experiments" / "pointcloud.py").resolve(),
+                (root / "pipeline" / "artifacts.py").resolve(),
+                *(
+                    path.resolve()
+                    for path in (root / "evaluation").rglob("*.py")
+                ),
+            },
+            key=lambda path: path.as_posix(),
         )
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
-    return completed.stdout.strip() or "unknown"
+    )
+
+
+def _source_revision(
+    source_paths: Sequence[str | Path] | None = None,
+) -> str:
+    root = Path(__file__).resolve().parents[1]
+    sources = tuple(
+        Path(path).resolve()
+        for path in (
+            _evaluator_source_paths()
+            if source_paths is None
+            else source_paths
+        )
+    )
+    if not sources:
+        raise ValueError("evaluator source set must not be empty")
+    digest = hashlib.sha256()
+    for source in sorted(sources, key=lambda path: path.as_posix()):
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"evaluator source does not exist: {source}"
+            )
+        try:
+            label = source.relative_to(root).as_posix()
+        except ValueError:
+            label = source.as_posix()
+        label_bytes = label.encode("utf-8")
+        content = source.read_bytes()
+        digest.update(len(label_bytes).to_bytes(8, "big"))
+        digest.update(label_bytes)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 def _atomic_json(path: str | Path, payload: object) -> Path:
@@ -235,9 +278,11 @@ def run_capability_matrix(
         raise ValueError("capability runner requires version-2 config")
     repository = ArtifactRepository(Path(experiment.output_root) / "artifacts")
     bundle = bundle_runner or EvaluationBundleRunner()
-    source_revision = source_revision_provider()
-    if not isinstance(source_revision, str) or not source_revision:
-        raise ValueError("source revision provider returned invalid value")
+    source_revision = None
+    if not dry_run:
+        source_revision = source_revision_provider()
+        if not isinstance(source_revision, str) or not source_revision:
+            raise ValueError("source revision provider returned invalid value")
     records = []
     for entry_index, entry in enumerate(experiment.entries):
         entry_overrides, cache_mode = _capability_entry_overrides(
@@ -299,6 +344,7 @@ def run_capability_matrix(
                 continue
             evaluations = bundle.run(
                 artifact_dir=artifact_dir,
+                reconstruction_identity=identity,
                 entry=entry,
                 experiment=experiment,
                 output_root=evaluation_root,
@@ -314,7 +360,8 @@ def run_capability_matrix(
             )
         )
     result = tuple(records)
-    _write_capability_summary(experiment, result)
+    if not dry_run:
+        _write_capability_summary(experiment, result)
     return result
 
 
