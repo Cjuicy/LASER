@@ -13,6 +13,10 @@ from pipeline.artifacts import (
 )
 from pipeline.config import ReconstructionMode
 from reconstruction.modes.base import ReconstructionContext
+from reconstruction.residual_alignment import (
+    align_post_anchor_window,
+    summarize_residual_alignments,
+)
 from reconstruction.shared import (
     as_numpy,
     mutual_confidence_mask,
@@ -30,11 +34,13 @@ class NoLoopReconstructionMode:
         apply_pose_sim3: Callable = apply_sim3_to_pose,
         build_graphs: Callable = build_temporal_graphs,
         segment_window: Callable = segment_and_refine_window,
+        residual_align: Callable = align_post_anchor_window,
     ) -> None:
         self._register_adjacent = register_adjacent
         self._apply_pose_sim3 = apply_pose_sim3
         self._build_graphs = build_graphs
         self._segment_window = segment_window
+        self._residual_align = residual_align
 
     def run(self, context: ReconstructionContext) -> ReconstructionArtifact:
         if context.reconstruction_mode is not ReconstructionMode.NO_LOOP:
@@ -50,6 +56,7 @@ class NoLoopReconstructionMode:
         segmentation_summaries = []
         prediction_key = None
         window_count = 0
+        residual_results = []
 
         for expected_index, prediction in enumerate(context.predictions):
             spec = prediction.spec
@@ -135,6 +142,23 @@ class NoLoopReconstructionMode:
                 if not torch.isfinite(scale_mask).all():
                     raise ValueError("no_loop anchor scale mask must be finite")
                 local_points = local_points * scale_mask
+                residual = self._residual_align(
+                    previous_points=previous["local_points"],
+                    previous_poses=previous["camera_poses"],
+                    previous_confidence=previous["confidence"],
+                    current_points=local_points,
+                    current_poses=camera_poses,
+                    current_confidence=confidence,
+                    overlap=overlap,
+                    confidence_keep_ratio=(
+                        context.registration_config.confidence_keep_ratio
+                    ),
+                    register_adjacent=self._register_adjacent,
+                    apply_pose_sim3=self._apply_pose_sim3,
+                )
+                local_points = residual.local_points
+                camera_poses = residual.camera_poses
+                residual_results.append(residual)
 
             trim = 0
             if previous_frame_end is not None:
@@ -177,6 +201,12 @@ class NoLoopReconstructionMode:
                 segmentation_summaries=tuple(segmentation_summaries),
                 candidate_count=0,
                 constraint_count=0,
-                mode_scalars={"window_count": window_count},
+                mode_scalars={
+                    "window_count": window_count,
+                    **summarize_residual_alignments(
+                        residual_results,
+                        window_count,
+                    ),
+                },
             ),
         )

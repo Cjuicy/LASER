@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from pipeline.config import (
 from reconstruction.modes.base import ReconstructionContext
 from reconstruction.modes.no_loop import NoLoopReconstructionMode
 from reconstruction.prediction_stream import iter_window_predictions
+from reconstruction.residual_alignment import ResidualAlignmentResult
 from reconstruction.shared import (
     as_numpy,
     reference_intrinsic,
@@ -32,13 +34,15 @@ from tests.reconstruction.fixtures import (
 )
 
 
-def _context(anchor, predictions, *, segmenter=None):
+def _context(anchor, predictions, *, segmenter=None, anchor_enabled=True):
     config = load_pipeline_config(
         "configs/reconstruction/pi3_laser_no_loop.yaml",
         (
             "window.size=2",
             "window.overlap=1",
             "model.process_device=cpu",
+            "anchor_propagation.enabled="
+            f"{str(anchor_enabled).lower()}",
         ),
     ).config
     return ReconstructionContext(
@@ -92,6 +96,18 @@ def _write_test_artifact(artifact, path):
     )
 
 
+def _passthrough_residual(**values):
+    return ResidualAlignmentResult(
+        local_points=values["current_points"],
+        camera_poses=values["current_poses"],
+        sim3=identity_sim3(),
+        correspondence_count=1,
+        abs_log_scale=0.0,
+        rotation_rad=0.0,
+        translation_norm=0.0,
+    )
+
+
 def test_no_loop_dependencies_contain_no_loop_services():
     parameters = inspect.signature(NoLoopReconstructionMode).parameters
     assert "loop_detector" not in parameters
@@ -124,6 +140,7 @@ def test_no_loop_matches_table_four_incremental_order():
         register_adjacent=register,
         apply_pose_sim3=lambda poses, scale, rotation, translation: poses,
         build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=_passthrough_residual,
     )
 
     artifact = mode.run(_context(anchor, predictions))
@@ -144,6 +161,113 @@ def test_no_loop_matches_table_four_incremental_order():
         10.0,
         21.0,
     ]
+
+
+def test_no_loop_residual_runs_after_anchor_and_reaches_both_artifacts(tmp_path):
+    observed_anchor_depths = []
+    observed_previous_depths = []
+
+    def residual_align(**values):
+        observed_previous_depths.append(
+            float(values["previous_points"][-1, 0, 0, 2])
+        )
+        observed_anchor_depths.append(
+            float(values["current_points"][0, 0, 0, 2])
+        )
+        poses = values["current_poses"].clone()
+        poses[:, 0, 3] += 9.0
+        return ResidualAlignmentResult(
+            local_points=2.0 * values["current_points"],
+            camera_poses=poses,
+            sim3=identity_sim3(2.0),
+            correspondence_count=1,
+            abs_log_scale=math.log(2.0),
+            rotation_rad=0.0,
+            translation_norm=9.0,
+        )
+
+    artifact = NoLoopReconstructionMode(
+        register_adjacent=lambda *arguments: identity_sim3(),
+        apply_pose_sim3=lambda poses, *arguments: poses,
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=residual_align,
+    ).run(
+        _context(
+            SequencedAnchor(scales=(3.0, 4.0)),
+            iter_window_predictions(
+                LiteralProvider(),
+                SPECS,
+                torch.zeros((4, 3, 1, 1)),
+                "cpu",
+            ),
+        )
+    )
+
+    assert observed_anchor_depths == [3.0, 4.0]
+    assert observed_previous_depths == [1.0, 6.0]
+    assert artifact.local_points[:, 0, 0, 2].tolist() == [1.0, 1.0, 6.0, 8.0]
+    assert artifact.camera_poses[:, 0, 3].tolist() == [0.0, 0.0, 9.0, 9.0]
+    assert artifact.diagnostics.mode_scalars["residual_applied_window_count"] == 2
+    assert artifact.diagnostics.mode_scalars["residual_skipped_window_count"] == 1
+
+    artifact_dir = _write_test_artifact(artifact, tmp_path / "artifact")
+    trajectory = torch.load(
+        artifact_dir / "trajectory.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    pointmap = torch.load(
+        artifact_dir / "pointmap.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert trajectory["camera_poses"][:, 0, 3].tolist() == [0.0, 0.0, 9.0, 9.0]
+    assert pointmap["local_points"][:, 0, 0, 2].tolist() == [1.0, 1.0, 6.0, 8.0]
+    assert torch.equal(pointmap["global_points"], artifact.global_points)
+
+
+def test_no_loop_anchor_disabled_skips_residual_and_serializes_exact_state(tmp_path):
+    def fail_if_called(**values):
+        del values
+        raise AssertionError("residual alignment must be disabled with anchors")
+
+    artifact = NoLoopReconstructionMode(
+        register_adjacent=lambda *arguments: identity_sim3(),
+        apply_pose_sim3=lambda poses, *arguments: poses,
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=fail_if_called,
+    ).run(
+        _context(
+            SequencedAnchor(),
+            iter_window_predictions(
+                LiteralProvider(),
+                SPECS,
+                torch.zeros((4, 3, 1, 1)),
+                "cpu",
+            ),
+            anchor_enabled=False,
+        )
+    )
+
+    assert artifact.local_points[:, 0, 0, 2].tolist() == [1.0, 1.0, 1.0, 1.0]
+    assert artifact.camera_poses[:, 0, 3].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert artifact.diagnostics.mode_scalars["residual_applied_window_count"] == 0
+    assert artifact.diagnostics.mode_scalars["residual_skipped_window_count"] == 3
+
+    artifact_dir = _write_test_artifact(artifact, tmp_path / "artifact")
+    trajectory = torch.load(
+        artifact_dir / "trajectory.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    pointmap = torch.load(
+        artifact_dir / "pointmap.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert torch.equal(trajectory["camera_poses"], artifact.camera_poses)
+    assert torch.equal(pointmap["local_points"], artifact.local_points)
+    assert torch.equal(pointmap["global_points"], artifact.global_points)
 
 
 def test_no_loop_disabled_wrapper_matches_segment_only_artifact_contract(tmp_path):
@@ -328,6 +452,7 @@ def test_no_loop_segments_refines_graphs_and_anchors_current_window_state():
             events.append("graph") or (tuple(results), threshold)
         ),
         segment_window=segment_window,
+        residual_align=_passthrough_residual,
     )
 
     mode.run(context)
