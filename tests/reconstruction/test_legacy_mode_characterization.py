@@ -25,6 +25,7 @@ from reconstruction.modes.no_loop import NoLoopReconstructionMode
 from reconstruction.modes.traditional import TraditionalWindowState
 from reconstruction.modes.base import ReconstructionContext
 from reconstruction.prediction_stream import iter_window_predictions
+from reconstruction.residual_alignment import ResidualAlignmentResult
 
 
 def _optimizer_config():
@@ -73,10 +74,23 @@ def test_legacy_no_loop_uses_corrected_predecessor_for_next_registration():
         return identity_sim3(next(registration_scales))
 
     anchor = SequencedAnchor()
+
+    def preserve_coarse_state(**values):
+        return ResidualAlignmentResult(
+            local_points=values["current_points"],
+            camera_poses=values["current_poses"],
+            sim3=identity_sim3(),
+            correspondence_count=1,
+            abs_log_scale=0.0,
+            rotation_rad=0.0,
+            translation_norm=0.0,
+        )
+
     result = NoLoopReconstructionMode(
         register_adjacent=register,
         apply_pose_sim3=lambda poses, scale, rotation, translation: poses,
         build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=preserve_coarse_state,
     ).run(_no_loop_context(anchor))
 
     assert registration_sources == [(1.0, 1.0), (10.0, 1.0)]
