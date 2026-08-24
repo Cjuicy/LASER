@@ -24,6 +24,10 @@ from loop_closure.utils.sim3loop import Sim3LoopOptimizer
 from pipeline.artifacts import ReconstructionArtifact, ReconstructionDiagnostics
 from pipeline.config import OptimizerConfig, ReconstructionMode
 from reconstruction.modes.base import ReconstructionContext
+from reconstruction.residual_alignment import (
+    align_post_anchor_window,
+    summarize_residual_alignments,
+)
 from reconstruction.shared import (
     as_numpy,
     mutual_confidence_mask,
@@ -59,6 +63,7 @@ class CorrectedReconstructionMode:
         apply_pose_sim3: Callable = apply_sim3_to_pose,
         build_graphs: Callable = build_temporal_graphs,
         segment_window: Callable = segment_and_refine_window,
+        residual_align: Callable = align_post_anchor_window,
     ) -> None:
         self.detector = detector
         self.evidence = evidence
@@ -71,6 +76,7 @@ class CorrectedReconstructionMode:
         self._apply_pose_sim3 = apply_pose_sim3
         self._build_graphs = build_graphs
         self._segment_window = segment_window
+        self._residual_align = residual_align
         self.trace: tuple[CorrectedWindowState, ...] = ()
 
     def run(self, context: ReconstructionContext) -> ReconstructionArtifact:
@@ -88,6 +94,7 @@ class CorrectedReconstructionMode:
         previous_graph = None
         prediction_key = None
         segmentation_summaries: list[Mapping[str, object]] = []
+        residual_results = []
 
         for expected_index, prediction in enumerate(context.predictions):
             spec = prediction.spec
@@ -113,23 +120,18 @@ class CorrectedReconstructionMode:
                     context.registration_config.confidence_keep_ratio,
                     context="corrected sequential registration",
                 )
-                sim3_abs = self._register_adjacent(
+                coarse_sim3_abs = self._register_adjacent(
                     previous.local_points[-overlap:],
                     local_points[:overlap],
                     previous.camera_poses[-overlap:],
                     camera_poses[:overlap],
                     mask,
                 )
-                validate_sim3(sim3_abs, context="corrected absolute Sim(3)")
-                sim3_edge = accumulate_sim3(
-                    closed_form_inverse_sim3(*previous.sim3_abs),
-                    sim3_abs,
-                )
                 validate_sim3(
-                    sim3_edge,
-                    context="corrected sequential Sim(3) edge",
+                    coarse_sim3_abs,
+                    context="corrected coarse absolute Sim(3)",
                 )
-                scale, rotation, translation = sim3_abs
+                scale, rotation, translation = coarse_sim3_abs
                 local_points = (
                     torch.as_tensor(
                         scale,
@@ -145,8 +147,7 @@ class CorrectedReconstructionMode:
                     translation.to(camera_poses),
                 )
             else:
-                sim3_abs = identity_sim3_like()
-                sim3_edge = None
+                coarse_sim3_abs = identity_sim3_like()
 
             results = self._segment_window(
                 strategy=context.segmentation_strategy,
@@ -190,6 +191,42 @@ class CorrectedReconstructionMode:
                 if not torch.isfinite(anchor_scale_mask).all():
                     raise ValueError("corrected anchor scale mask must be finite")
                 local_points = anchor_scale_mask * local_points
+
+            sim3_abs = coarse_sim3_abs
+            if states and context.anchor_config.enabled:
+                residual = self._residual_align(
+                    previous_points=states[-1].local_points,
+                    previous_poses=states[-1].camera_poses,
+                    previous_confidence=states[-1].confidence,
+                    current_points=local_points,
+                    current_poses=camera_poses,
+                    current_confidence=confidence,
+                    overlap=overlap,
+                    confidence_keep_ratio=(
+                        context.registration_config.confidence_keep_ratio
+                    ),
+                    register_adjacent=self._register_adjacent,
+                    apply_pose_sim3=self._apply_pose_sim3,
+                )
+                local_points = residual.local_points
+                camera_poses = residual.camera_poses
+                sim3_abs = accumulate_sim3(residual.sim3, coarse_sim3_abs)
+                residual_results.append(residual)
+            validate_sim3(
+                sim3_abs,
+                context="corrected refined absolute Sim(3)",
+            )
+
+            sim3_edge = None
+            if states:
+                sim3_edge = accumulate_sim3(
+                    closed_form_inverse_sim3(*states[-1].sim3_abs),
+                    sim3_abs,
+                )
+                validate_sim3(
+                    sim3_edge,
+                    context="corrected refined sequential Sim(3) edge",
+                )
 
             states.append(
                 CorrectedWindowState(
@@ -244,7 +281,14 @@ class CorrectedReconstructionMode:
                 segmentation_summaries=tuple(segmentation_summaries),
                 candidate_count=len(candidates),
                 constraint_count=len(constraints),
-                mode_scalars=aggregate.mode_scalars,
+                mode_scalars={
+                    **dict(aggregate.mode_scalars),
+                    **summarize_residual_alignments(
+                        residual_results,
+                        len(states),
+                    ),
+                    "refined_edge_count": len(states) - 1,
+                },
             ),
         )
 

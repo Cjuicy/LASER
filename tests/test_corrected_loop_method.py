@@ -106,6 +106,23 @@ def test_corrected_converts_joint_evidence_to_local_measurement():
     )
 
 
+def test_corrected_constraints_use_refined_absolute_transforms():
+    states = (
+        corrected_state(0),
+        corrected_state(1, absolute_scale=8.0, edge_scale=8.0),
+    )
+
+    constraint = processor_fixture().build_constraints(
+        states,
+        (LoopCandidate(frame_a=2, frame_b=0, similarity=0.8),),
+        FixedEvidence(sim3(scale=2.0), sim3(scale=6.0)),
+    )[0]
+
+    assert torch.as_tensor(constraint.measurement[0]).item() == pytest.approx(
+        24.0
+    )
+
+
 def test_corrected_aggregation_applies_only_optimization_delta_once():
     solution = LoopSolution(
         optimized_transforms=(sim3(), sim3(4.0)),
@@ -140,7 +157,10 @@ def test_corrected_optimizer_receives_one_edge_per_window_transition():
             return edges
 
     optimizer = RecordingOptimizer()
-    states = corrected_states()
+    states = (
+        corrected_state(0),
+        corrected_state(1, absolute_scale=8.0, edge_scale=8.0),
+    )
     constraint = LoopConstraint(
         window_a=1,
         window_b=0,
@@ -151,6 +171,7 @@ def test_corrected_optimizer_receives_one_edge_per_window_transition():
     processor_fixture(optimizer).optimize(states, [constraint])
 
     assert len(optimizer.edges) == len(states) - 1
+    assert torch.as_tensor(optimizer.edges[0][0]).item() == pytest.approx(8.0)
 
 
 def test_corrected_aggregate_rejects_state_count_mismatch():

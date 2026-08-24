@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -15,6 +16,7 @@ from pipeline.manifest import ImageManifest
 from reconstruction.modes.base import ReconstructionContext
 from reconstruction.modes.corrected import CorrectedReconstructionMode
 from reconstruction.prediction_stream import iter_window_predictions
+from reconstruction.residual_alignment import ResidualAlignmentResult
 from reconstruction.shared import as_numpy, segment_and_refine_window
 from tests.reconstruction.fixtures import (
     LiteralProvider,
@@ -46,7 +48,7 @@ class FailingOptimizer:
         raise AssertionError("empty constraints must not invoke optimizer")
 
 
-def _context(anchor, predictions, *, refiner=None):
+def _context(anchor, predictions, *, refiner=None, anchor_enabled=True):
     config = load_pipeline_config(
         "configs/reconstruction/pi3_laser.yaml",
         (
@@ -55,6 +57,8 @@ def _context(anchor, predictions, *, refiner=None):
             "window.overlap=1",
             "model.process_device=cpu",
             "loop.optimizer.implementation=python",
+            "anchor_propagation.enabled="
+            f"{str(anchor_enabled).lower()}",
         ),
     ).config
     images = torch.zeros((4, 3, 1, 1))
@@ -128,6 +132,18 @@ def _write_test_artifact(artifact, path):
     )
 
 
+def _passthrough_residual(**values):
+    return ResidualAlignmentResult(
+        local_points=values["current_points"],
+        camera_poses=values["current_poses"],
+        sim3=identity_sim3(),
+        correspondence_count=1,
+        abs_log_scale=0.0,
+        rotation_rad=0.0,
+        translation_norm=0.0,
+    )
+
+
 def test_corrected_uses_corrected_window_as_next_registration_source():
     registration_sources = []
     registration_scales = iter((2.0, 3.0))
@@ -151,6 +167,7 @@ def test_corrected_uses_corrected_window_as_next_registration_source():
         register_adjacent=register,
         apply_pose_sim3=lambda poses, *arguments: poses,
         build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=_passthrough_residual,
     )
 
     artifact = mode.run(context)
@@ -163,6 +180,77 @@ def test_corrected_uses_corrected_window_as_next_registration_source():
         10.0,
         21.0,
     ]
+
+
+def test_corrected_composes_residual_after_coarse_and_rebuilds_edge():
+    context, optimizer_config = _context(
+        SequencedAnchor(scales=(3.0,)),
+        iter_window_predictions(
+            LiteralProvider(),
+            SPECS[:2],
+            torch.zeros((3, 3, 1, 1)),
+            "cpu",
+        ),
+    )
+    context = ReconstructionContext(
+        **{
+            **context.__dict__,
+            "frame_ids": (0, 1, 2),
+            "image_manifest": ImageManifest(
+                paths=tuple(Path(f"frame-{index}.png") for index in range(3))
+            ),
+            "images": torch.zeros((3, 3, 1, 1)),
+        }
+    )
+
+    def residual_align(**values):
+        assert values["current_points"][0, 0, 0, 2].item() == 6.0
+        poses = values["current_poses"].clone()
+        poses[:, 0, 3] += 9.0
+        return ResidualAlignmentResult(
+            local_points=4.0 * values["current_points"],
+            camera_poses=poses,
+            sim3=identity_sim3(4.0),
+            correspondence_count=1,
+            abs_log_scale=math.log(4.0),
+            rotation_rad=0.0,
+            translation_norm=9.0,
+        )
+
+    class InspectingProcessor(CorrectedLoopProcessor):
+        def optimize(self, states, constraints):
+            del constraints
+            assert torch.as_tensor(states[1].sim3_abs[0]).item() == 8.0
+            assert torch.as_tensor(states[1].sim3_edge[0]).item() == 8.0
+            return LoopSolution(
+                optimized_transforms=tuple(state.sim3_abs for state in states),
+                constraints=(),
+                used_no_loop_path=True,
+            )
+
+    mode = CorrectedReconstructionMode(
+        detector=EmptyDetector(),
+        evidence=UnusedEvidence(),
+        optimizer_config=optimizer_config,
+        processor=InspectingProcessor(
+            optimizer_config,
+            optimizer=FailingOptimizer(),
+            apply_pose_sim3=lambda poses, *arguments: poses,
+        ),
+        register_adjacent=lambda *arguments: identity_sim3(2.0),
+        apply_pose_sim3=lambda poses, *arguments: poses,
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=residual_align,
+    )
+
+    artifact = mode.run(context)
+
+    assert mode.trace[1].local_points[-1, 0, 0, 2].item() == 24.0
+    assert artifact.local_points[-1, 0, 0, 2].item() == 24.0
+    assert artifact.camera_poses[-1, 0, 3].item() == 9.0
+    assert artifact.diagnostics.mode_scalars["residual_applied_window_count"] == 1
+    assert artifact.diagnostics.mode_scalars["residual_skipped_window_count"] == 1
+    assert artifact.diagnostics.mode_scalars["refined_edge_count"] == 1
 
 
 def test_corrected_disabled_wrapper_matches_segment_only_artifact_contract(
@@ -306,6 +394,7 @@ def test_corrected_segments_refines_graphs_and_anchors_adjusted_state():
         apply_pose_sim3=apply_pose,
         build_graphs=build_graphs,
         segment_window=segment_window,
+        residual_align=_passthrough_residual,
     )
 
     mode.run(context)
@@ -433,12 +522,23 @@ def test_corrected_applies_optimized_original_delta_exactly_once():
 
     class DeltaProcessor(CorrectedLoopProcessor):
         def optimize(self, states, constraints):
-            assert states[1].sim3_abs[0] == 2.0
+            assert states[1].sim3_abs[0] == 8.0
             return LoopSolution(
-                optimized_transforms=(identity_sim3(), identity_sim3(4.0)),
+                optimized_transforms=(identity_sim3(), identity_sim3(16.0)),
                 constraints=(),
                 used_no_loop_path=False,
             )
+
+    def residual_align(**values):
+        return ResidualAlignmentResult(
+            local_points=4.0 * values["current_points"],
+            camera_poses=values["current_poses"],
+            sim3=identity_sim3(4.0),
+            correspondence_count=1,
+            abs_log_scale=math.log(4.0),
+            rotation_rad=0.0,
+            translation_norm=0.0,
+        )
 
     processor = DeltaProcessor(
         optimizer_config,
@@ -453,12 +553,42 @@ def test_corrected_applies_optimized_original_delta_exactly_once():
         register_adjacent=lambda *arguments: identity_sim3(2.0),
         apply_pose_sim3=lambda poses, *arguments: poses,
         build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=residual_align,
     )
 
     artifact = mode.run(context)
 
-    assert mode.trace[1].local_points[-1, 0, 0, 2].item() == 6.0
-    assert artifact.local_points[-1, 0, 0, 2].item() == 12.0
+    assert mode.trace[1].local_points[-1, 0, 0, 2].item() == 24.0
+    assert artifact.local_points[-1, 0, 0, 2].item() == 48.0
+
+
+def test_corrected_anchor_disabled_skips_residual_and_keeps_coarse_edges():
+    def fail_if_called(**values):
+        del values
+        raise AssertionError("residual alignment must be disabled with anchors")
+
+    context, optimizer_config = _context(
+        SequencedAnchor(),
+        _predictions(),
+        anchor_enabled=False,
+    )
+    mode = CorrectedReconstructionMode(
+        detector=EmptyDetector(),
+        evidence=UnusedEvidence(),
+        optimizer_config=optimizer_config,
+        optimizer=FailingOptimizer(),
+        register_adjacent=lambda *arguments: identity_sim3(2.0),
+        apply_pose_sim3=lambda poses, *arguments: poses,
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=fail_if_called,
+    )
+
+    artifact = mode.run(context)
+
+    assert torch.as_tensor(mode.trace[1].sim3_abs[0]).item() == 2.0
+    assert torch.as_tensor(mode.trace[1].sim3_edge[0]).item() == 2.0
+    assert artifact.diagnostics.mode_scalars["residual_applied_window_count"] == 0
+    assert artifact.diagnostics.mode_scalars["residual_skipped_window_count"] == 3
 
 
 def test_corrected_detects_after_windows_and_applies_delta_last():
