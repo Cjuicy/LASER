@@ -28,13 +28,30 @@ def evaluate_ate_artifact(
 ) -> Path:
     if experiment.dataset.ground_truth_format is None:
         raise ValueError("ATE dataset requires ground_truth_format")
-    estimate = load_trajectory_estimate(artifact_dir)
-    ground_truth = load_ground_truth_trajectory(
-        experiment.dataset.ground_truth,
-        experiment.dataset.ground_truth_format,
+    return evaluate_ate_inputs(
+        artifact_dir,
+        ground_truth=experiment.dataset.ground_truth,
+        ground_truth_format=experiment.dataset.ground_truth_format,
+        evaluation_config=experiment.evaluation_config,
+        output_dir=output_dir,
     )
-    config = load_trajectory_evaluation_config(experiment.evaluation_config)
-    metrics = evaluate_trajectory(estimate, ground_truth, config)
+
+
+def evaluate_ate_inputs(
+    artifact_dir: str | Path,
+    *,
+    ground_truth: str | Path,
+    ground_truth_format: str,
+    evaluation_config: str | Path,
+    output_dir: str | Path,
+) -> Path:
+    estimate = load_trajectory_estimate(artifact_dir)
+    truth = load_ground_truth_trajectory(
+        ground_truth,
+        ground_truth_format,
+    )
+    config = load_trajectory_evaluation_config(evaluation_config)
+    metrics = evaluate_trajectory(estimate, truth, config)
     return write_trajectory_metrics(
         metrics,
         output_dir,

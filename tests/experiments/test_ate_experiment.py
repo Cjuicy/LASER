@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+import experiments.ate as ate_experiment
 from experiments.ate import evaluate_ate_artifact
 from experiments.config import EvaluationKind, ExperimentConfig, ExperimentDatasetConfig
 from experiments.matrix import (
@@ -139,13 +140,22 @@ def test_ate_result_records_real_artifact_manifest_digest(tmp_path):
         encoding="utf-8",
     )
 
-    output = evaluate_ate_artifact(
+    output = ate_experiment.evaluate_ate_inputs(
         artifact_dir,
-        experiment,
-        tmp_path / "evaluation",
+        ground_truth=experiment.dataset.ground_truth,
+        ground_truth_format="tum",
+        evaluation_config=experiment.evaluation_config,
+        output_dir=tmp_path / "evaluation",
     )
     payload = json.loads(output.read_text(encoding="utf-8"))
 
     assert payload["artifact_manifest_sha256"] == hashlib.sha256(
         (artifact_dir / "manifest.json").read_bytes()
     ).hexdigest()
+
+    legacy_output = evaluate_ate_artifact(
+        artifact_dir,
+        experiment,
+        tmp_path / "legacy-evaluation",
+    )
+    assert json.loads(legacy_output.read_text(encoding="utf-8")) == payload

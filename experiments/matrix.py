@@ -13,7 +13,7 @@ from pipeline.config import (
 )
 from pipeline.artifacts import load_reconstruction_artifact
 
-from .config import EvaluationKind
+from .config import CapabilityExperimentConfig, EvaluationKind
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,50 @@ class MatrixEntry:
     @property
     def name(self) -> str:
         return f"{self.segmentation_method.value}-{self.reconstruction_mode.value}"
+
+
+@dataclass(frozen=True)
+class CapabilityMatrixEntry:
+    segmentation_method: SegmentationMethod
+    reconstruction_mode: ReconstructionMode
+    window_reference_enabled: bool
+    evaluator_kinds: tuple[EvaluationKind, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.segmentation_method, SegmentationMethod):
+            raise ValueError("capability matrix segmentation method is invalid")
+        if not isinstance(self.reconstruction_mode, ReconstructionMode):
+            raise ValueError("capability matrix reconstruction mode is invalid")
+        if not isinstance(self.window_reference_enabled, bool):
+            raise ValueError("capability matrix refinement state must be boolean")
+        if not self.evaluator_kinds or any(
+            not isinstance(kind, EvaluationKind) for kind in self.evaluator_kinds
+        ):
+            raise ValueError("capability matrix evaluators are invalid")
+        if tuple(
+            kind for kind in EvaluationKind if kind in self.evaluator_kinds
+        ) != self.evaluator_kinds:
+            raise ValueError("capability matrix evaluators must be canonical")
+        if (
+            self.reconstruction_mode is not ReconstructionMode.NO_LOOP
+            and EvaluationKind.POINTCLOUD in self.evaluator_kinds
+        ):
+            raise ValueError("pointcloud evaluation only supports no_loop")
+        if (
+            self.reconstruction_mode is ReconstructionMode.TRADITIONAL
+            and self.window_reference_enabled
+        ):
+            raise ValueError("traditional refinement must be disabled")
+
+    @property
+    def name(self) -> str:
+        if self.reconstruction_mode is ReconstructionMode.TRADITIONAL:
+            return f"{self.segmentation_method.value}-traditional-baseline"
+        state = "on" if self.window_reference_enabled else "off"
+        return (
+            f"{self.segmentation_method.value}-"
+            f"{self.reconstruction_mode.value}-wr-{state}"
+        )
 
 
 def validate_matrix_entry(kind: EvaluationKind, entry: MatrixEntry) -> None:
@@ -52,6 +96,58 @@ def build_matrix(kind: EvaluationKind) -> tuple[MatrixEntry, ...]:
     for entry in entries:
         validate_matrix_entry(kind, entry)
     return entries
+
+
+def build_capability_matrix(
+    config: CapabilityExperimentConfig,
+) -> tuple[CapabilityMatrixEntry, ...]:
+    if not isinstance(config, CapabilityExperimentConfig):
+        raise ValueError("capability matrix requires version-2 config")
+    capabilities = frozenset(config.evaluator_inputs)
+    has_ate = EvaluationKind.ATE in capabilities
+    has_pointcloud = EvaluationKind.POINTCLOUD in capabilities
+    entries: list[CapabilityMatrixEntry] = []
+    for segmentation_name in config.segmentation_methods:
+        segmentation = SegmentationMethod(segmentation_name)
+        no_loop_evaluators = tuple(
+            kind
+            for kind in EvaluationKind
+            if (
+                (kind is EvaluationKind.ATE and has_ate)
+                or (kind is EvaluationKind.POINTCLOUD and has_pointcloud)
+            )
+        )
+        for enabled in config.refinement_states:
+            entries.append(
+                CapabilityMatrixEntry(
+                    segmentation_method=segmentation,
+                    reconstruction_mode=ReconstructionMode.NO_LOOP,
+                    window_reference_enabled=enabled,
+                    evaluator_kinds=no_loop_evaluators,
+                )
+            )
+        if has_ate:
+            entries.append(
+                CapabilityMatrixEntry(
+                    segmentation_method=segmentation,
+                    reconstruction_mode=ReconstructionMode.TRADITIONAL,
+                    window_reference_enabled=False,
+                    evaluator_kinds=(EvaluationKind.ATE,),
+                )
+            )
+            for enabled in config.refinement_states:
+                entries.append(
+                    CapabilityMatrixEntry(
+                        segmentation_method=segmentation,
+                        reconstruction_mode=ReconstructionMode.CORRECTED,
+                        window_reference_enabled=enabled,
+                        evaluator_kinds=(EvaluationKind.ATE,),
+                    )
+                )
+    names = [entry.name for entry in entries]
+    if len(set(names)) != len(names):
+        raise ValueError("capability matrix entry names must be unique")
+    return tuple(entries)
 
 
 def reconstruction_identity(
