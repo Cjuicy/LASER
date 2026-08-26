@@ -140,6 +140,50 @@ its ground truth, and the source revision all match and the recorded output
 still exists. Changing only point-cloud ground truth therefore reruns only the
 point-cloud evaluator; it does not reconstruct the artifact or rerun ATE.
 
+### Low-disk ATE for long KITTI sequences
+
+Use the bounded-storage runner when keeping 15 full reconstruction artifacts
+would exceed the available disk space. It runs the same 15 ATE variants one at
+a time and shares one PI3 prediction cache:
+
+```bash
+python tools/keyframe_ate_low_disk.py \
+  --config configs/experiments/keyframe_metrics_kitti00_s1_w75_o30.local.yaml \
+  --work-root outputs/low-disk/keyframe-ate-kitti00-s1-w75-o30
+```
+
+The configuration still owns the input stride, window size, overlap, image
+directory, checkpoint, trajectory ground truth, and trajectory format. For the
+command above those values should be `1`, `75`, `30`, the KITTI `00/image_2`
+directory, the PI3 checkpoint, `00/poses.txt`, and `replica`, respectively.
+
+After each successful ATE evaluation, the runner validates and records the
+metrics before deleting that entry's large reconstruction artifact. It keeps
+the shared prediction cache, compact metrics, loop-candidate sidecars, and the
+top-level summary. A failed entry does not block later entries. By default, the
+newest failed artifact is retained for diagnosis, so peak storage is one
+retained failure plus the current artifact. If another entry fails, compact
+metadata and sidecars from the older failure remain, while its large tensors
+are evicted. Set `--max-retained-failures N` to raise this bound. Rerunning the
+exact command validates result hashes, resumes valid entries, reuses a complete
+artifact when only ATE failed, recovers complete interrupted attempts, and
+retries missing, failed, or tampered results. Use only one runner process per
+work root; concurrent writers to the same work root are not supported.
+
+```text
+outputs/low-disk/keyframe-ate-kitti00-s1-w75-o30/
+  prediction-cache/
+  metrics/<entry-name>/trajectory_metrics.json
+  metrics/<entry-name>/low_disk_record.json
+  scratch/<entry-name>/<run-identity>/<attempt>/attempt_record.json
+  scratch/<failed-entry>/<run-identity>/<attempt>/artifact/
+  scratch/evicted-failure-metadata/<artifact-path-digest>/
+  summary.json
+```
+
+The command exits with status 1 if any entry failed. Successful runs report
+`entries=15 passed=15 failed=0`; resumed entries are also counted separately.
+
 ## Single reconstruction examples
 
 ```bash
