@@ -159,7 +159,9 @@ def _build_services(
         raise ValueError(f"{mode.value} requires loop configuration")
     detector = dependencies.build_loop_detector(
         loop.detection,
-        output_path=output_dir / "loop_candidates.json",
+        output_path=(
+            output_dir.parent / f"{output_dir.name}.loop_candidates.json"
+        ),
     )
     evidence = dependencies.build_loop_evidence(
         model=model,

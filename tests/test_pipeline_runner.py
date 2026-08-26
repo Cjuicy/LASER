@@ -10,9 +10,19 @@ import torch
 from inference_engine.models.lazy import ModelExecutionStats
 from inference_engine.prediction_cache.fingerprint import PredictionFingerprint
 from inference_engine.prediction_cache.store import PredictionStoreStats
-from pipeline.artifacts import ReconstructionArtifact, ReconstructionDiagnostics
+from pipeline.artifacts import (
+    ReconstructionArtifact,
+    ReconstructionDiagnostics,
+    write_reconstruction_artifact,
+)
 from pipeline.config import ReconstructionMode, SegmentationMethod, load_pipeline_config
-from pipeline.runner import PipelineDependencies, PipelineRunner, run_from_config
+from pipeline.manifest import ImageManifest
+from pipeline.runner import (
+    PipelineDependencies,
+    PipelineRunner,
+    _build_services,
+    run_from_config,
+)
 
 
 @dataclass
@@ -218,3 +228,49 @@ def test_run_from_config_returns_typed_artifact(tmp_path):
     )
 
     assert isinstance(result, ReconstructionArtifact)
+
+
+def test_loop_diagnostics_do_not_precreate_final_artifact_directory(tmp_path):
+    loaded = _loaded(tmp_path, "traditional")
+    artifact_dir = tmp_path / "artifacts" / "identity"
+    diagnostic_path = tmp_path / "artifacts" / "identity.loop_candidates.json"
+
+    class WritingDetector:
+        def __init__(self, output_path):
+            self.output_path = Path(output_path)
+
+        def detect(self, *arguments):
+            del arguments
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            self.output_path.write_text("[]\n", encoding="utf-8")
+            return ()
+
+    dependencies = PipelineDependencies(
+        build_loop_detector=(
+            lambda config, *, output_path: WritingDetector(output_path)
+        ),
+        build_loop_evidence=lambda **values: object(),
+    )
+    services = _build_services(
+        ReconstructionMode.TRADITIONAL,
+        loaded=loaded,
+        dependencies=dependencies,
+        model=object(),
+        manifest=ImageManifest(paths=()),
+        images=torch.empty((0, 3, 2, 2)),
+        output_dir=artifact_dir,
+    )
+
+    services.detector.detect()
+    written = write_reconstruction_artifact(
+        _artifact(ReconstructionMode.TRADITIONAL),
+        artifact_dir,
+        resolved_yaml=loaded.resolved_yaml,
+        config_sha256=loaded.sha256,
+        checkpoint_sha256="a" * 64,
+        git_commit="test-commit",
+    )
+
+    assert diagnostic_path.read_text(encoding="utf-8") == "[]\n"
+    assert written == artifact_dir
+    assert (artifact_dir / "manifest.json").is_file()
