@@ -532,7 +532,7 @@ def test_enabled_refiner_accepts_direct_weighted_edge_with_weak_dissent(
         coverage_ratio=1.0,
     )
     monkeypatch.setattr(
-        "inference_engine.segmentation.window_reference._select_references",
+        "inference_engine.segmentation.window_selection._select_references",
         lambda **kwargs: selected,
     )
 
@@ -626,7 +626,7 @@ def test_enabled_refiner_accepts_weighted_direct_merge_with_weak_separate_vote(
         coverage_ratio=1.0,
     )
     monkeypatch.setattr(
-        "inference_engine.segmentation.window_reference._select_references",
+        "inference_engine.segmentation.window_selection._select_references",
         lambda **kwargs: selected,
     )
 
@@ -712,7 +712,7 @@ def test_enabled_refiner_blocks_transitive_conflict_after_weighted_direct_merge(
         coverage_ratio=1.0,
     )
     monkeypatch.setattr(
-        "inference_engine.segmentation.window_reference._select_references",
+        "inference_engine.segmentation.window_selection._select_references",
         lambda **kwargs: selected,
     )
 

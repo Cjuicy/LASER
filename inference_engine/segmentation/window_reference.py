@@ -1109,6 +1109,21 @@ def _project_pair(
     )
 
 
+from .window_selection import (  # noqa: E402 - compatibility aliases follow helpers.
+    PairProjection as _PairProjection,
+    PairSummary as _PairSummary,
+    WindowReferenceSelection as _ReferenceSelection,
+    WindowReferenceSelector,
+    _centered_axis,
+    _confidence_mask_and_quality,
+    _confidence_probability,
+    _projection_score,
+    _select_references,
+    _tensor_numpy,
+    project_pair as _project_pair,
+)
+
+
 class WindowReferenceRefinement(Protocol):
     enabled: bool
 
@@ -1146,6 +1161,7 @@ class WindowReferenceRefiner:
     def __init__(self, config: SegmentationConfig) -> None:
         self.config = config
         self.window_reference = config.window_reference
+        self.selector = WindowReferenceSelector(config)
 
     def refine(
         self,
@@ -1162,47 +1178,33 @@ class WindowReferenceRefiner:
             camera_poses,
             confidence,
         )
-        if frame_count == 1:
-            return _fallback_results(results, "single_frame")
-        if reference_intrinsic is None:
-            return _fallback_results(results, "missing_intrinsic")
-
-        intrinsic = _validate_intrinsic(reference_intrinsic)
-        if intrinsic is None:
-            return _fallback_results(results, "invalid_intrinsic")
+        selection = self.selector.select(
+            point_maps=point_maps,
+            camera_poses=camera_poses,
+            confidence=confidence,
+            reference_intrinsic=reference_intrinsic,
+        )
+        if selection.fallback_reason is not None:
+            return _fallback_results(results, selection.fallback_reason)
 
         points = _tensor_numpy(point_maps, dtype=np.float32)
         poses = _tensor_numpy(camera_poses, dtype=np.float64)
         logits = _tensor_numpy(confidence, dtype=np.float32)
-        valid_points = np.all(np.isfinite(points), axis=-1) & (
-            points[..., 2] > 1e-6
-        )
-        if not np.any(valid_points):
-            return _fallback_results(results, "invalid_geometry")
-        if not _validate_pose_geometry(poses):
-            return _fallback_results(results, "invalid_geometry")
-        if not _intrinsic_compatible(
-            points,
-            intrinsic,
-            self.window_reference.sampling_stride,
-        ):
-            return _fallback_results(results, "intrinsic_incompatible")
+        if reference_intrinsic is None:  # Guarded by successful selection.
+            raise RuntimeError("successful reference selection requires an intrinsic")
+        intrinsic = _tensor_numpy(reference_intrinsic, dtype=np.float64)
 
         selected_masks = []
-        qualities = []
         probabilities = []
         for frame_index in range(frame_count):
-            mask, quality = _confidence_mask_and_quality(
+            mask, _ = _confidence_mask_and_quality(
                 points[frame_index],
                 logits[frame_index],
                 keep_ratio=self.config.confidence_keep_ratio,
                 method=self.config.confidence_quantile_method,
             )
             selected_masks.append(mask)
-            qualities.append(quality)
             probabilities.append(_confidence_probability(logits[frame_index]))
-        if not any(quality > 0.0 for quality in qualities):
-            return _fallback_results(results, "no_reference")
 
         height, width = points.shape[1:3]
         source_rows = _centered_axis(
@@ -1232,15 +1234,6 @@ class WindowReferenceRefiner:
                     self.window_reference.relative_depth_tolerance
                 ),
             )
-
-        selection = _select_references(
-            qualities=np.asarray(qualities, dtype=np.float64),
-            frame_count=frame_count,
-            evaluate=evaluate,
-            config=self.window_reference,
-        )
-        if not selection.indices:
-            return _fallback_results(results, "no_reference")
 
         selected_indices = set(selection.indices)
         keyframes = ",".join(str(index) for index in selection.indices)
