@@ -1032,40 +1032,12 @@ git commit -m "feat: persist staged global optimization artifacts"
 **Files:**
 - Modify: `README.md`
 - Create: `docs/traditional-second-global-cloud-validation.md`
-- Modify: `tests/test_cloud_validation_commands.py`
 
 **Interfaces:**
 - Consumes: the new mode, root Stage 2 artifact, nested Stage 1 artifact, and existing `evaluate_ate.py` CLI.
 - Produces: copy-paste cloud clone/setup/reconstruction/dual-ATE commands and a final regression record.
 
-- [ ] **Step 1: Write the failing documentation command test**
-
-Require the validation guide to contain the exact public mode and both artifact
-paths:
-
-```python
-def test_second_global_cloud_guide_has_dual_ate_commands():
-    text = Path(
-        "docs/traditional-second-global-cloud-validation.md"
-    ).read_text(encoding="utf-8")
-    assert "--branch codex/keyframe-selection" in text
-    assert "reconstruction.mode=traditional_second_global" in text
-    assert "--artifact \"$RESULT_DIR/stage1\"" in text
-    assert "--artifact \"$RESULT_DIR\"" in text
-    assert "cmp_stage1_trajectory.py" not in text
-```
-
-- [ ] **Step 2: Run the documentation test and verify missing guide failure**
-
-Run:
-
-```bash
-pytest -q tests/test_cloud_validation_commands.py -k second_global
-```
-
-Expected: FAIL because the guide is missing.
-
-- [ ] **Step 3: Add concise README and cloud validation commands**
+- [ ] **Step 1: Add concise README and cloud validation commands**
 
 Document:
 
@@ -1100,20 +1072,20 @@ one-liner that uses `torch.load(path, weights_only=True)["camera_poses"]` and
 `torch.equal` to compare a standalone Traditional trajectory with the nested
 Stage 1 trajectory.
 
-- [ ] **Step 4: Run documentation and CLI help checks**
+- [ ] **Step 2: Run CLI help and real configuration parsing checks**
 
 Run:
 
 ```bash
-pytest -q tests/test_cloud_validation_commands.py
 python run_reconstruction.py --help
 python evaluate_ate.py --help
 python run_experiment_matrix.py --help
+python -c 'from pipeline.config import ReconstructionMode; assert ReconstructionMode("traditional_second_global") is ReconstructionMode.TRADITIONAL_SECOND_GLOBAL'
 ```
 
 Expected: all commands exit 0.
 
-- [ ] **Step 5: Run focused feature regression**
+- [ ] **Step 3: Run focused feature regression**
 
 Run:
 
@@ -1131,7 +1103,7 @@ pytest -q \
 
 Expected: PASS.
 
-- [ ] **Step 6: Run the full suite from a clean command invocation**
+- [ ] **Step 4: Run the full suite from a clean command invocation**
 
 Run:
 
@@ -1142,7 +1114,7 @@ pytest -q
 Expected: 0 failures. Record the exact pass count and warnings in the final
 handoff.
 
-- [ ] **Step 7: Verify source invariants and working-tree hygiene**
+- [ ] **Step 5: Verify source invariants and working-tree hygiene**
 
 Run:
 
@@ -1154,17 +1126,17 @@ git status --short
 ```
 
 Expected: the first two commands exit 0. `git status --short` lists only the
-planned documentation changes before the final documentation commit.
+planned README and validation-guide changes before the final documentation
+commit.
 
-- [ ] **Step 8: Commit documentation**
+- [ ] **Step 6: Commit documentation**
 
 ```bash
-git add README.md docs/traditional-second-global-cloud-validation.md \
-  tests/test_cloud_validation_commands.py
+git add README.md docs/traditional-second-global-cloud-validation.md
 git commit -m "docs: add second global cloud validation"
 ```
 
-- [ ] **Step 9: Re-run final verification after the last commit**
+- [ ] **Step 7: Re-run final verification after the last commit**
 
 Run:
 
