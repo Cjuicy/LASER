@@ -13,6 +13,7 @@ from inference_engine.prediction_cache.store import PredictionStoreStats
 from pipeline.artifacts import (
     ReconstructionArtifact,
     ReconstructionDiagnostics,
+    StagedReconstructionArtifacts,
     write_reconstruction_artifact,
 )
 from pipeline.config import ReconstructionMode, SegmentationMethod, load_pipeline_config
@@ -82,7 +83,14 @@ def _loaded(tmp_path, mode="no_loop"):
     return load_pipeline_config(config, overrides)
 
 
-def _dependencies(events, mode, *, refiner_builder=None, context_sink=None):
+def _dependencies(
+    events,
+    mode,
+    *,
+    refiner_builder=None,
+    context_sink=None,
+    mode_result=None,
+):
     def preflight(*arguments):
         events.values.append("preflight")
 
@@ -133,7 +141,7 @@ def _dependencies(events, mode, *, refiner_builder=None, context_sink=None):
             events.values.append(mode)
             if context_sink is not None:
                 context_sink(context)
-            return _artifact(ReconstructionMode(mode))
+            return mode_result or _artifact(ReconstructionMode(mode))
 
     def build_mode(selected, services):
         assert selected is ReconstructionMode(mode)
@@ -145,9 +153,31 @@ def _dependencies(events, mode, *, refiner_builder=None, context_sink=None):
         assert metadata["config_sha256"]
         return Path(output_dir)
 
+    def write_staged_artifacts(staged, output_dir, **metadata):
+        events.values.append("write_staged_artifacts")
+        assert staged.stage1 is mode_result.stage1
+        assert staged.stage2.reconstruction_mode is (
+            ReconstructionMode.TRADITIONAL_SECOND_GLOBAL
+        )
+        assert "reconstruction" in staged.stage2.diagnostics.stage_timings_ms
+        assert metadata["config_sha256"]
+        output = Path(output_dir)
+        return {"stage1": output / "stage1", "stage2": output}
+
     def forbidden(*arguments, **keywords):
         raise AssertionError("no_loop constructed loop services")
 
+    loop_builder_kwargs = (
+        {
+            "build_loop_detector": lambda *arguments, **keywords: object(),
+            "build_loop_evidence": lambda **values: object(),
+        }
+        if mode != "no_loop"
+        else {
+            "build_loop_detector": forbidden,
+            "build_loop_evidence": forbidden,
+        }
+    )
     dependency_kwargs = dict(
         validate_preflight=preflight,
         load_images=images,
@@ -158,11 +188,11 @@ def _dependencies(events, mode, *, refiner_builder=None, context_sink=None):
         build_segmentation_strategy=segmenter,
         build_anchor_propagator=anchor,
         build_reconstruction_mode=build_mode,
-        build_loop_detector=forbidden,
-        build_loop_evidence=forbidden,
         write_artifact=write_artifact,
+        write_staged_artifacts=write_staged_artifacts,
         cuda_available=lambda: False,
         git_commit=lambda: "test-commit",
+        **loop_builder_kwargs,
     )
     if refiner_builder is not None:
         dependency_kwargs["build_window_reference_refiner"] = refiner_builder
@@ -228,6 +258,33 @@ def test_run_from_config_returns_typed_artifact(tmp_path):
     )
 
     assert isinstance(result, ReconstructionArtifact)
+
+
+def test_runner_writes_staged_result_and_returns_stage2(tmp_path):
+    events = Events()
+    stage1 = _artifact(ReconstructionMode.TRADITIONAL)
+    stage2 = _artifact(ReconstructionMode.TRADITIONAL_SECOND_GLOBAL)
+    staged = StagedReconstructionArtifacts(stage1=stage1, stage2=stage2)
+    runner = PipelineRunner(
+        _loaded(tmp_path, "traditional_second_global"),
+        dependencies=_dependencies(
+            events,
+            "traditional_second_global",
+            mode_result=staged,
+        ),
+    )
+
+    result = runner.run()
+
+    assert result.reconstruction_mode is (
+        ReconstructionMode.TRADITIONAL_SECOND_GLOBAL
+    )
+    assert events.values.count("write_staged_artifacts") == 1
+    assert events.values.count("write_artifact") == 0
+    assert dict(runner.stage_artifact_dirs) == {
+        "stage1": runner.artifact_dir / "stage1",
+        "stage2": runner.artifact_dir,
+    }
 
 
 def test_loop_diagnostics_do_not_precreate_final_artifact_directory(tmp_path):

@@ -400,6 +400,51 @@ def write_reconstruction_artifact(
     return output
 
 
+def write_staged_reconstruction_artifacts(
+    staged: StagedReconstructionArtifacts,
+    output_dir: str | Path,
+    *,
+    resolved_yaml: str,
+    config_sha256: str,
+    checkpoint_sha256: str,
+    git_commit: str,
+) -> Mapping[str, Path]:
+    if not isinstance(staged, StagedReconstructionArtifacts):
+        raise ValueError("staged result must be StagedReconstructionArtifacts")
+    output = Path(output_dir)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"artifact directory already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "resolved_yaml": resolved_yaml,
+        "config_sha256": config_sha256,
+        "checkpoint_sha256": checkpoint_sha256,
+        "git_commit": git_commit,
+    }
+    with tempfile.TemporaryDirectory(
+        dir=output.parent,
+        prefix=f".{output.name}.staged.",
+    ) as temporary:
+        staged_root = Path(temporary) / "artifact"
+        write_reconstruction_artifact(
+            staged.stage2,
+            staged_root,
+            **metadata,
+        )
+        write_reconstruction_artifact(
+            staged.stage1,
+            staged_root / "stage1",
+            **metadata,
+        )
+        staged_root.replace(output)
+    return MappingProxyType(
+        {
+            "stage1": output / "stage1",
+            "stage2": output,
+        }
+    )
+
+
 def _load_manifest(output: Path) -> Mapping[str, object]:
     try:
         manifest = json.loads((output / "manifest.json").read_text("utf-8"))

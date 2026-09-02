@@ -16,6 +16,7 @@ from pipeline.artifacts import (
     load_reconstruction_artifact,
     load_trajectory_estimate,
     write_reconstruction_artifact,
+    write_staged_reconstruction_artifacts,
 )
 from pipeline.config import ReconstructionMode, SegmentationMethod
 
@@ -60,6 +61,19 @@ def assert_artifacts_equal(actual, expected):
         assert torch.equal(getattr(actual, name), getattr(expected, name))
 
 
+def make_staged_artifacts() -> StagedReconstructionArtifacts:
+    return StagedReconstructionArtifacts(
+        stage1=make_artifact(
+            reconstruction_mode=ReconstructionMode.TRADITIONAL,
+        ),
+        stage2=make_artifact(
+            reconstruction_mode=(
+                ReconstructionMode.TRADITIONAL_SECOND_GLOBAL
+            ),
+        ),
+    )
+
+
 def test_artifact_requires_one_consistent_finite_frame_axis():
     with pytest.raises(ValueError, match="frame count"):
         make_artifact(camera_poses=torch.eye(4).repeat(2, 1, 1))
@@ -90,6 +104,69 @@ def test_staged_result_requires_exact_stage_modes():
             ),
             stage2=result.stage2,
         )
+
+
+def test_staged_writer_atomically_writes_two_standard_artifacts(tmp_path):
+    staged = make_staged_artifacts()
+    output = tmp_path / "run"
+
+    paths = write_staged_reconstruction_artifacts(
+        staged,
+        output,
+        resolved_yaml="version: 2\n",
+        config_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+        git_commit="c" * 40,
+    )
+
+    assert dict(paths) == {
+        "stage1": output / "stage1",
+        "stage2": output,
+    }
+    assert_artifacts_equal(
+        load_reconstruction_artifact(paths["stage1"]),
+        staged.stage1,
+    )
+    assert_artifacts_equal(
+        load_reconstruction_artifact(paths["stage2"]),
+        staged.stage2,
+    )
+
+
+def test_staged_writer_leaves_no_destination_when_nested_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    import pipeline.artifacts as artifacts_module
+
+    output = tmp_path / "run"
+    real_writer = artifacts_module.write_reconstruction_artifact
+    call_count = 0
+
+    def fail_stage1(*arguments, **keywords):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("injected Stage 1 write failure")
+        return real_writer(*arguments, **keywords)
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "write_reconstruction_artifact",
+        fail_stage1,
+    )
+
+    with pytest.raises(RuntimeError, match="Stage 1 write failure"):
+        write_staged_reconstruction_artifacts(
+            make_staged_artifacts(),
+            output,
+            resolved_yaml="version: 2\n",
+            config_sha256="a" * 64,
+            checkpoint_sha256="b" * 64,
+            git_commit="c" * 40,
+        )
+
+    assert not output.exists()
 
 
 def test_artifact_views_expose_only_evaluator_fields():

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import run_reconstruction
@@ -52,3 +54,43 @@ def test_reconstruction_cli_rejects_legacy_flags():
         run_reconstruction.build_parser().parse_args(
             ["--config", "config.yaml", "--loop-method", "corrected"]
         )
+
+
+def test_reconstruction_cli_reports_both_staged_artifact_paths(
+    monkeypatch,
+    capsys,
+):
+    loaded = load_pipeline_config(
+        "configs/reconstruction/pi3_laser.yaml",
+        (
+            "reconstruction.mode=traditional_second_global",
+            "loop.optimizer.implementation=python",
+        ),
+    )
+
+    class Runner:
+        artifact_dir = Path("results/artifact")
+        stage_artifact_dirs = {
+            "stage1": artifact_dir / "stage1",
+            "stage2": artifact_dir,
+        }
+
+        def __init__(self, value):
+            assert value is loaded
+
+        def run(self):
+            return _artifact(
+                ReconstructionMode.TRADITIONAL_SECOND_GLOBAL
+            )
+
+    monkeypatch.setattr(
+        run_reconstruction,
+        "load_pipeline_config",
+        lambda *arguments: loaded,
+    )
+    monkeypatch.setattr(run_reconstruction, "PipelineRunner", Runner)
+
+    assert run_reconstruction.main(["--config", "config.yaml"]) == 0
+    output = capsys.readouterr().out
+    assert "stage1_artifact_dir=results/artifact/stage1" in output
+    assert "stage2_artifact_dir=results/artifact" in output

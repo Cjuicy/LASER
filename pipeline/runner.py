@@ -5,6 +5,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Sequence
 
 import torch
@@ -28,7 +29,9 @@ from loop_closure.detection import SaladLoopDetector
 from pipeline.artifacts import (
     ReconstructionArtifact,
     ReconstructionDiagnostics,
+    StagedReconstructionArtifacts,
     write_reconstruction_artifact,
+    write_staged_reconstruction_artifacts,
 )
 from pipeline.config import (
     LoadedPipelineConfig,
@@ -138,6 +141,7 @@ class PipelineDependencies:
     build_loop_detector: Callable = SaladLoopDetector
     build_loop_evidence: Callable = _loop_evidence
     write_artifact: Callable = write_reconstruction_artifact
+    write_staged_artifacts: Callable = write_staged_reconstruction_artifacts
     cuda_available: Callable = torch.cuda.is_available
     git_commit: Callable = _git_commit
 
@@ -195,6 +199,7 @@ class PipelineRunner:
             None if artifact_output_dir is None else Path(artifact_output_dir)
         )
         self.artifact_dir: Path | None = None
+        self.stage_artifact_dirs = MappingProxyType({})
 
     def run(self) -> ReconstructionArtifact:
         config = self.loaded.config
@@ -298,8 +303,13 @@ class PipelineRunner:
         lock = lock_factory() if callable(lock_factory) else nullcontext()
         reconstruction_started = time.perf_counter()
         with lock:
-            artifact = mode.run(context)
+            result = mode.run(context)
         reconstruction_ms = (time.perf_counter() - reconstruction_started) * 1000
+        artifact = (
+            result.primary
+            if isinstance(result, StagedReconstructionArtifacts)
+            else result
+        )
         if artifact.reconstruction_mode is not config.reconstruction.mode:
             raise ValueError("reconstruction mode returned the wrong artifact mode")
         if artifact.segmentation_method is not config.segmentation.method:
@@ -317,14 +327,30 @@ class PipelineRunner:
                 },
             ),
         )
-        self.artifact_dir = dependencies.write_artifact(
-            artifact,
-            output_dir,
-            resolved_yaml=self.loaded.resolved_yaml,
-            config_sha256=self.loaded.sha256,
-            checkpoint_sha256=fingerprint.checkpoint_sha256,
-            git_commit=dependencies.git_commit(),
-        )
+        metadata = {
+            "resolved_yaml": self.loaded.resolved_yaml,
+            "config_sha256": self.loaded.sha256,
+            "checkpoint_sha256": fingerprint.checkpoint_sha256,
+            "git_commit": dependencies.git_commit(),
+        }
+        if isinstance(result, StagedReconstructionArtifacts):
+            staged = replace(result, stage2=artifact)
+            paths = dependencies.write_staged_artifacts(
+                staged,
+                output_dir,
+                **metadata,
+            )
+            self.stage_artifact_dirs = MappingProxyType(dict(paths))
+            self.artifact_dir = self.stage_artifact_dirs["stage2"]
+        else:
+            self.artifact_dir = dependencies.write_artifact(
+                artifact,
+                output_dir,
+                **metadata,
+            )
+            self.stage_artifact_dirs = MappingProxyType(
+                {"stage2": self.artifact_dir}
+            )
         return artifact
 
 
