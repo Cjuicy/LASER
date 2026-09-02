@@ -6,6 +6,9 @@ from pipeline.config import ReconstructionMode, load_pipeline_config
 from reconstruction.modes.corrected import CorrectedReconstructionMode
 from reconstruction.modes.no_loop import NoLoopReconstructionMode
 from reconstruction.modes.traditional import TraditionalReconstructionMode
+from reconstruction.modes.traditional_second_global import (
+    TraditionalSecondGlobalReconstructionMode,
+)
 from reconstruction.registry import (
     ReconstructionServices,
     build_reconstruction_mode,
@@ -35,6 +38,10 @@ def _optimizer_config():
         (ReconstructionMode.NO_LOOP, NoLoopReconstructionMode),
         (ReconstructionMode.TRADITIONAL, TraditionalReconstructionMode),
         (ReconstructionMode.CORRECTED, CorrectedReconstructionMode),
+        (
+            ReconstructionMode.TRADITIONAL_SECOND_GLOBAL,
+            TraditionalSecondGlobalReconstructionMode,
+        ),
     ),
 )
 def test_registry_builds_exact_mode(mode, expected):
@@ -65,7 +72,11 @@ def test_no_loop_registry_rejects_accidental_loop_services():
 
 @pytest.mark.parametrize(
     "mode",
-    (ReconstructionMode.TRADITIONAL, ReconstructionMode.CORRECTED),
+    (
+        ReconstructionMode.TRADITIONAL,
+        ReconstructionMode.CORRECTED,
+        ReconstructionMode.TRADITIONAL_SECOND_GLOBAL,
+    ),
 )
 def test_loop_registry_requires_complete_services(mode):
     with pytest.raises(ValueError, match=f"{mode.value}.*loop services"):

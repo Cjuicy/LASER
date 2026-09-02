@@ -9,7 +9,10 @@ import torch
 from inference_engine.anchor_propagation import AnchorPropagator
 from inference_engine.segmentation.base import SegmentationStrategy
 from inference_engine.segmentation.window_reference import WindowReferenceRefinement
-from pipeline.artifacts import ReconstructionArtifact
+from pipeline.artifacts import (
+    ReconstructionArtifact,
+    StagedReconstructionArtifacts,
+)
 from pipeline.config import (
     AnchorPropagationConfig,
     ReconstructionMode,
@@ -47,5 +50,8 @@ class ReconstructionTensors:
 
 
 class ReconstructionModeRunner(Protocol):
-    def run(self, context: ReconstructionContext) -> ReconstructionArtifact:
+    def run(
+        self,
+        context: ReconstructionContext,
+    ) -> ReconstructionArtifact | StagedReconstructionArtifacts:
         raise NotImplementedError

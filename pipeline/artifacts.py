@@ -235,6 +235,36 @@ class ReconstructionArtifact:
         )
 
 
+@dataclass(frozen=True)
+class StagedReconstructionArtifacts:
+    stage1: ReconstructionArtifact
+    stage2: ReconstructionArtifact
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage1, ReconstructionArtifact) or not isinstance(
+            self.stage2,
+            ReconstructionArtifact,
+        ):
+            raise ValueError("staged results require reconstruction artifacts")
+        if self.stage1.reconstruction_mode is not ReconstructionMode.TRADITIONAL:
+            raise ValueError("stage1 artifact must use traditional mode")
+        if (
+            self.stage2.reconstruction_mode
+            is not ReconstructionMode.TRADITIONAL_SECOND_GLOBAL
+        ):
+            raise ValueError(
+                "stage2 artifact must use traditional_second_global mode"
+            )
+        if self.stage1.frame_ids != self.stage2.frame_ids:
+            raise ValueError("staged artifact frame_ids must match")
+        if self.stage1.prediction_key != self.stage2.prediction_key:
+            raise ValueError("staged artifact prediction keys must match")
+
+    @property
+    def primary(self) -> ReconstructionArtifact:
+        return self.stage2
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:

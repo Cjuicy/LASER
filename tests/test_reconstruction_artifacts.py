@@ -10,6 +10,7 @@ from pipeline.artifacts import (
     PointMapEstimate,
     ReconstructionArtifact,
     ReconstructionDiagnostics,
+    StagedReconstructionArtifacts,
     TrajectoryEstimate,
     load_pointmap_estimate,
     load_reconstruction_artifact,
@@ -66,6 +67,29 @@ def test_artifact_requires_one_consistent_finite_frame_axis():
     nonfinite[0, 0, 0, 0] = torch.nan
     with pytest.raises(ValueError, match="global_points.*finite"):
         make_artifact(global_points=nonfinite)
+
+
+def test_staged_result_requires_exact_stage_modes():
+    result = StagedReconstructionArtifacts(
+        stage1=make_artifact(
+            reconstruction_mode=ReconstructionMode.TRADITIONAL,
+        ),
+        stage2=make_artifact(
+            reconstruction_mode=(
+                ReconstructionMode.TRADITIONAL_SECOND_GLOBAL
+            ),
+        ),
+    )
+
+    assert result.primary is result.stage2
+
+    with pytest.raises(ValueError, match="stage1.*traditional"):
+        StagedReconstructionArtifacts(
+            stage1=make_artifact(
+                reconstruction_mode=ReconstructionMode.NO_LOOP,
+            ),
+            stage2=result.stage2,
+        )
 
 
 def test_artifact_views_expose_only_evaluator_fields():

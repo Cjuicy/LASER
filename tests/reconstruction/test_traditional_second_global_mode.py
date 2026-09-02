@@ -2,24 +2,42 @@ from __future__ import annotations
 
 import math
 import numpy as np
+from pathlib import Path
 import pytest
 import torch
 
+from inference_engine.segmentation import DisabledWindowReferenceRefiner
 from inference_engine.utils.geometry import (
     accumulate_sim3,
     apply_sim3_to_pose,
     closed_form_inverse_sim3,
     homogenize_points,
 )
+from loop_closure.methods.second_global import SecondGlobalLoopProcessor
 from loop_closure.methods.traditional import TraditionalLoopProcessor
-from loop_closure.types import LoopSolution
-from pipeline.config import load_pipeline_config
+from loop_closure.types import LoopCandidate, LoopSolution
+from pipeline.artifacts import StagedReconstructionArtifacts
+from pipeline.config import ReconstructionMode, load_pipeline_config
+from pipeline.manifest import ImageManifest
+from reconstruction.modes.base import ReconstructionContext
+from reconstruction.modes.traditional import (
+    TraditionalReconstructionMode,
+    TraditionalWindowState,
+)
 from reconstruction.residual_alignment import ResidualAlignmentResult
-from reconstruction.modes.traditional import TraditionalWindowState
 from reconstruction.modes.traditional_second_global import (
     MaterializedTraditionalWindow,
+    SecondGlobalWindowState,
+    TraditionalSecondGlobalReconstructionMode,
     build_second_global_states,
     materialize_traditional_stage1_windows,
+)
+from reconstruction.prediction_stream import iter_window_predictions
+from tests.reconstruction.fixtures import (
+    LiteralProvider,
+    OneRegionSegmenter,
+    SPECS,
+    SequencedAnchor,
 )
 
 
@@ -197,3 +215,193 @@ def test_second_global_states_keep_one_window_at_identity():
     assert states[0].sim3_edge is None
     _assert_sim3_equal(states[0].sim3_abs, _identity_sim3())
     assert results == ()
+
+
+def _predictions():
+    return iter_window_predictions(
+        LiteralProvider(),
+        SPECS,
+        torch.zeros((4, 3, 1, 1)),
+        "cpu",
+    )
+
+
+def _context(predictions, mode, anchor):
+    config = load_pipeline_config(
+        "configs/reconstruction/pi3_laser.yaml",
+        (
+            f"reconstruction.mode={mode.value}",
+            "window.size=2",
+            "window.overlap=1",
+            "model.process_device=cpu",
+            "loop.optimizer.implementation=python",
+        ),
+    ).config
+    return (
+        ReconstructionContext(
+            predictions=predictions,
+            frame_ids=(0, 1, 2, 3),
+            segmentation_strategy=OneRegionSegmenter(),
+            window_reference_refiner=DisabledWindowReferenceRefiner(),
+            anchor_propagator=anchor,
+            segmentation_config=config.segmentation,
+            anchor_config=config.anchor_propagation,
+            registration_config=config.registration,
+            window_config=config.window,
+            reconstruction_mode=mode,
+            image_manifest=ImageManifest(
+                paths=tuple(
+                    Path(f"frame-{index}.png")
+                    for index in range(4)
+                )
+            ),
+            images=torch.zeros((4, 3, 1, 1)),
+        ),
+        config.loop.optimizer,
+    )
+
+
+class _OneCandidateDetector:
+    def __init__(self):
+        self.call_count = 0
+
+    def detect(self, manifest, images):
+        assert len(manifest) == images.shape[0] == 4
+        self.call_count += 1
+        return (LoopCandidate(frame_a=3, frame_b=0, similarity=0.8),)
+
+
+class _RecordingEvidence:
+    def __init__(self, *, reject_first: bool = False):
+        self.reject_first = reject_first
+        self.window_types = []
+
+    def estimate(self, window_a, window_b, candidate):
+        del candidate
+        self.window_types.append((type(window_a), type(window_b)))
+        if self.reject_first and len(self.window_types) == 1:
+            raise ValueError("synthetic Stage 1 rejection")
+        return _identity_sim3(), _identity_sim3()
+
+
+class _PassThroughOptimizer:
+    def optimize(self, edges, constraints):
+        assert constraints
+        return edges
+
+
+def _identity_residual(recorder):
+    def residual_align(**values):
+        recorder.append(values)
+        return ResidualAlignmentResult(
+            local_points=values["current_points"],
+            camera_poses=values["current_poses"],
+            sim3=_identity_sim3(),
+            correspondence_count=1,
+            abs_log_scale=0.0,
+            rotation_rad=0.0,
+            translation_norm=0.0,
+        )
+
+    return residual_align
+
+
+def _build_stage_processors(optimizer_config):
+    return (
+        TraditionalLoopProcessor(
+            optimizer_config,
+            optimizer=_PassThroughOptimizer(),
+        ),
+        SecondGlobalLoopProcessor(
+            optimizer_config,
+            optimizer=_PassThroughOptimizer(),
+        ),
+    )
+
+
+def test_new_mode_preserves_stage1_and_rebuilds_from_corrected_geometry():
+    baseline_context, optimizer_config = _context(
+        _predictions(),
+        ReconstructionMode.TRADITIONAL,
+        SequencedAnchor(scales=(3.0, 3.0)),
+    )
+    baseline = TraditionalReconstructionMode(
+        detector=_OneCandidateDetector(),
+        evidence=_RecordingEvidence(),
+        optimizer_config=optimizer_config,
+        optimizer=_PassThroughOptimizer(),
+        register_adjacent=lambda *arguments: _identity_sim3(),
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+    ).run(baseline_context)
+
+    staged_context, optimizer_config = _context(
+        _predictions(),
+        ReconstructionMode.TRADITIONAL_SECOND_GLOBAL,
+        SequencedAnchor(scales=(3.0, 3.0)),
+    )
+    detector = _OneCandidateDetector()
+    evidence = _RecordingEvidence()
+    residual_inputs = []
+    stage1_processor, stage2_processor = _build_stage_processors(
+        optimizer_config
+    )
+    staged = TraditionalSecondGlobalReconstructionMode(
+        detector=detector,
+        evidence=evidence,
+        optimizer_config=optimizer_config,
+        stage1_processor=stage1_processor,
+        stage2_processor=stage2_processor,
+        register_adjacent=lambda *arguments: _identity_sim3(),
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=_identity_residual(residual_inputs),
+    ).run(staged_context)
+
+    assert isinstance(staged, StagedReconstructionArtifacts)
+    for name in ("local_points", "global_points", "camera_poses", "confidence"):
+        assert torch.equal(
+            getattr(staged.stage1, name),
+            getattr(baseline, name),
+        )
+    assert staged.stage1.diagnostics == baseline.diagnostics
+    assert detector.call_count == 1
+    assert evidence.window_types == [
+        (TraditionalWindowState, TraditionalWindowState),
+        (SecondGlobalWindowState, SecondGlobalWindowState),
+    ]
+    assert residual_inputs[0]["current_points"][..., 2].tolist() == [
+        [[3.0]],
+        [[3.0]],
+    ]
+    expected_global = torch.einsum(
+        "nij,nhwj->nhwi",
+        staged.stage2.camera_poses,
+        homogenize_points(staged.stage2.local_points),
+    )[..., :3]
+    assert torch.equal(staged.stage2.global_points, expected_global)
+
+
+def test_stage2_retries_detector_candidate_rejected_by_stage1_geometry():
+    context, optimizer_config = _context(
+        _predictions(),
+        ReconstructionMode.TRADITIONAL_SECOND_GLOBAL,
+        SequencedAnchor(scales=(3.0, 3.0)),
+    )
+    evidence = _RecordingEvidence(reject_first=True)
+    stage1_processor, stage2_processor = _build_stage_processors(
+        optimizer_config
+    )
+
+    staged = TraditionalSecondGlobalReconstructionMode(
+        detector=_OneCandidateDetector(),
+        evidence=evidence,
+        optimizer_config=optimizer_config,
+        stage1_processor=stage1_processor,
+        stage2_processor=stage2_processor,
+        register_adjacent=lambda *arguments: _identity_sim3(),
+        build_graphs=lambda results, threshold: (tuple(results), threshold),
+        residual_align=_identity_residual([]),
+    ).run(context)
+
+    assert len(evidence.window_types) == 2
+    assert staged.stage1.diagnostics.constraint_count == 0
+    assert staged.stage2.diagnostics.constraint_count == 1

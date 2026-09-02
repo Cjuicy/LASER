@@ -9,6 +9,9 @@ from reconstruction.modes.base import ReconstructionModeRunner
 from reconstruction.modes.corrected import CorrectedReconstructionMode
 from reconstruction.modes.no_loop import NoLoopReconstructionMode
 from reconstruction.modes.traditional import TraditionalReconstructionMode
+from reconstruction.modes.traditional_second_global import (
+    TraditionalSecondGlobalReconstructionMode,
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,8 @@ def build_reconstruction_mode(
         return TraditionalReconstructionMode(**arguments)
     if mode is ReconstructionMode.CORRECTED:
         return CorrectedReconstructionMode(**arguments)
+    if mode is ReconstructionMode.TRADITIONAL_SECOND_GLOBAL:
+        return TraditionalSecondGlobalReconstructionMode(**arguments)
     raise ValueError(f"unsupported reconstruction mode: {mode!r}")
 
 
