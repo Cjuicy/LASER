@@ -13,13 +13,10 @@ from pipeline.config import (
 )
 from pipeline.artifacts import load_reconstruction_artifact
 
-from .config import CapabilityExperimentConfig, EvaluationKind
-
-
-CANONICAL_RECONSTRUCTION_MODES = (
-    ReconstructionMode.NO_LOOP,
-    ReconstructionMode.TRADITIONAL,
-    ReconstructionMode.CORRECTED,
+from .config import (
+    CANONICAL_RECONSTRUCTION_MODES,
+    CapabilityExperimentConfig,
+    EvaluationKind,
 )
 
 

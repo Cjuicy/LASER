@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from experiments.config import CANONICAL_RECONSTRUCTION_MODES
 from inference_engine.prediction_cache.fingerprint import build_prediction_fingerprint
 from inference_engine.prediction_cache.types import build_window_specs
-from pipeline.config import ReconstructionMode, SegmentationMethod, load_pipeline_config
+from pipeline.config import SegmentationMethod, load_pipeline_config
 from pipeline.manifest import ImageManifest
 
 
@@ -21,7 +22,7 @@ def test_all_nine_ate_reconstructions_share_one_ordinary_prediction_key(tmp_path
     keys = []
 
     for segmentation in SegmentationMethod:
-        for mode in ReconstructionMode:
+        for mode in CANONICAL_RECONSTRUCTION_MODES:
             loaded = load_pipeline_config(
                 "configs/reconstruction/pi3_laser.yaml",
                 (

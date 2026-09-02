@@ -61,7 +61,8 @@ The evaluator boundary is strict: evaluators load artifact views and calculate
 metrics; they never run PI3, segmentation, anchor propagation, registration, or
 loop closure.
 
-The three reconstruction modes preserve their original operation order:
+The original three reconstruction modes preserve their operation order, and
+the second-global mode is an opt-in extension of Traditional:
 
 - `no_loop`: incremental adjacent registration, segmentation, anchor
   propagation, and point-map assembly. No loop service is constructed.
@@ -70,6 +71,9 @@ The three reconstruction modes preserve their original operation order:
 - `corrected`: apply adjacent alignment and anchor correction online, detect
   loops after all windows, optimize sequential edges, then apply one final
   correction delta.
+- `traditional_second_global`: run Traditional unchanged as Stage 1, rebuild
+  residual adjacent and loop constraints from its corrected geometry, then
+  apply one second global Sim(3) optimization delta.
 
 ## One reconstruction
 
@@ -99,6 +103,44 @@ outputs/reconstruction/<scene>/<segmentation>-<mode>/
   pointmap.pt
   confidence.pt
 ```
+
+### Traditional second-global optimization
+
+Select `traditional_second_global` to preserve the original Traditional result
+as Stage 1 and rebuild a second residual Sim(3) graph from the corrected Stage
+1 window geometry:
+
+```bash
+python run_reconstruction.py \
+  --config configs/reconstruction/pi3_laser.yaml \
+  --set input.image_dir=/data/sequence/images \
+  --set output.scene_name=my-sequence \
+  --set segmentation.method=geometry \
+  --set reconstruction.mode=traditional_second_global \
+  --set window.size=20 \
+  --set window.overlap=5
+```
+
+The result root is the Stage 2 artifact. The exact Traditional Stage 1
+artifact is nested below it:
+
+```text
+outputs/reconstruction/my-sequence/geometry-traditional_second_global/
+  manifest.json
+  trajectory.pt
+  pointmap.pt
+  confidence.pt
+  stage1/
+    manifest.json
+    trajectory.pt
+    pointmap.pt
+    confidence.pt
+```
+
+Both directories use the standard artifact contract, so evaluate Stage 1 at
+`<result>/stage1` and Stage 2 at `<result>` with the existing ATE command. See
+[`docs/traditional-second-global-cloud-validation.md`](docs/traditional-second-global-cloud-validation.md)
+for a complete cloud setup, baseline equality check, and dual-ATE workflow.
 
 Ordinary PI3 predictions are cached independently of segmentation,
 reconstruction mode, anchor, loop, and evaluation settings.
