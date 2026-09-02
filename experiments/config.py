@@ -11,6 +11,13 @@ from omegaconf import OmegaConf
 from pipeline.config import ReconstructionMode, SegmentationMethod
 
 
+CANONICAL_RECONSTRUCTION_MODES = (
+    ReconstructionMode.NO_LOOP,
+    ReconstructionMode.TRADITIONAL,
+    ReconstructionMode.CORRECTED,
+)
+
+
 class EvaluationKind(str, Enum):
     ATE = "ate"
     POINTCLOUD = "pointcloud"
@@ -58,7 +65,7 @@ class ExperimentConfig:
                 "[depth, geometry, atomic]"
             )
         expected_modes = (
-            tuple(item.value for item in ReconstructionMode)
+            tuple(item.value for item in CANONICAL_RECONSTRUCTION_MODES)
             if self.evaluation is EvaluationKind.ATE
             else (ReconstructionMode.NO_LOOP.value,)
         )

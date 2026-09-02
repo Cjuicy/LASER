@@ -16,6 +16,13 @@ from pipeline.artifacts import load_reconstruction_artifact
 from .config import CapabilityExperimentConfig, EvaluationKind
 
 
+CANONICAL_RECONSTRUCTION_MODES = (
+    ReconstructionMode.NO_LOOP,
+    ReconstructionMode.TRADITIONAL,
+    ReconstructionMode.CORRECTED,
+)
+
+
 @dataclass(frozen=True)
 class MatrixEntry:
     segmentation_method: SegmentationMethod
@@ -84,7 +91,7 @@ def build_matrix(kind: EvaluationKind) -> tuple[MatrixEntry, ...]:
     if not isinstance(kind, EvaluationKind):
         raise ValueError("evaluation kind is invalid")
     modes = (
-        tuple(ReconstructionMode)
+        CANONICAL_RECONSTRUCTION_MODES
         if kind is EvaluationKind.ATE
         else (ReconstructionMode.NO_LOOP,)
     )

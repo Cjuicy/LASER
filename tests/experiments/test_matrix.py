@@ -21,6 +21,17 @@ def test_ate_matrix_is_exact_three_by_three_product():
     assert len(entries) == 9
 
 
+def test_ate_matrix_excludes_opt_in_second_global_mode():
+    entries = build_matrix(EvaluationKind.ATE)
+
+    assert len(entries) == 9
+    assert all(
+        entry.reconstruction_mode
+        is not ReconstructionMode.TRADITIONAL_SECOND_GLOBAL
+        for entry in entries
+    )
+
+
 def test_pointcloud_matrix_is_exact_three_no_loop_entries():
     entries = build_matrix(EvaluationKind.POINTCLOUD)
 

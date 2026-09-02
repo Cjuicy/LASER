@@ -34,6 +34,21 @@ def test_version_two_selects_exact_reconstruction_mode():
     )
 
 
+def test_second_global_mode_is_explicitly_selectable():
+    loaded = load_pipeline_config(
+        RECONSTRUCTION,
+        (
+            "reconstruction.mode=traditional_second_global",
+            "loop.optimizer.implementation=python",
+        ),
+    )
+
+    assert (
+        loaded.config.reconstruction.mode
+        is ReconstructionMode.TRADITIONAL_SECOND_GLOBAL
+    )
+
+
 def test_retired_loop_enable_and_method_are_rejected(tmp_path):
     path = tmp_path / "legacy.yaml"
     source = RECONSTRUCTION.read_text(encoding="utf-8")

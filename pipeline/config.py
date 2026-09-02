@@ -27,6 +27,7 @@ class ReconstructionMode(str, Enum):
     NO_LOOP = "no_loop"
     TRADITIONAL = "traditional"
     CORRECTED = "corrected"
+    TRADITIONAL_SECOND_GLOBAL = "traditional_second_global"
 
 
 class ConfidenceQuantileMethod(str, Enum):
